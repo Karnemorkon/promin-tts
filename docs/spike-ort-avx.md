@@ -13,12 +13,29 @@
 
 Висновок прямо підтверджує документацію ONNX Runtime: **офіційні prebuilt-бінарники ORT ≥1.18 вимагають AVX2**; остання лінійка, що працює на AVX-only — ORT ≤1.17.
 
-## Рішення (v0.1)
+## Рішення (v0.1) — фінальне
 
 - Залежність: `ort = { git = "https://github.com/pykeio/ort", tag = "v1.16.3" }`.
   - Усі версії `ort` 1.x зі *crates.io* **yanked** — тому пін саме через git-тег (він не зникне після yanked).
   - `ort` 1.16.x API відрізняється від 2.0-rc: `Environment` + `SessionBuilder::new(&env)` + `Value::from_array(allocator, &cow_array)`; `ndarray` **0.15** (не 0.16).
-- Динамічна бібліотека `libonnxruntime.so` завантажується під час `cargo build` у `target/.../ort-sys-*/out/`; **без `LD_LIBRARY_PATH` бінарник не стартує**. У продакшен-Docker копіюємо `.so` в образ і виставляємо `LD_LIBRARY_PATH` або rpath.
+- **Вбудовані бінарники `download-binaries` (ORT 1.16.0) не годяться**: модель `holos_cpu_int8.onnx` використовує **ONNX opset 20**, який офіційно підтримується лише ORT ≥1.17.
+- **Робоча конфігурація (перевірено на E5-2650, модель 321 MB завантажилась, тест `load_holos_model` — PASS)**:
+
+```bash
+# один раз: офіційний ORT 1.17.3 (остання AVX-безпечна версія, підтримка opset 20)
+curl -fL -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.17.3/onnxruntime-linux-x64-1.17.3.tgz
+tar xf ort.tgz && mv onnxruntime-linux-x64-1.17.3 /opt/ort/current
+
+# збірка та запуск
+export ORT_STRATEGY=system
+export ORT_LIB_LOCATION=/opt/ort/current/lib
+export LD_LIBRARY_PATH=/opt/ort/current/lib
+export PROMIN_MODELS_DIR=/root/models
+cargo test -p speech-inference -- --ignored
+```
+
+- `ORT_STRATEGY=system` обов'язковий: з увімкненим дефолтним `download-binaries` змінна `ORT_LIB_LOCATION` ігнорується (див. build.rs ort v1.16.3).
+- У продакшен-Docker копіюємо `libonnxruntime.so.1.17.3` в образ і виставляємо `LD_LIBRARY_PATH`.
 
 ## Довгострокова стратегія (міграція на ort 2.x)
 
@@ -35,4 +52,13 @@
 ```bash
 cd /root/spike/ort-avx && LD_LIBRARY_PATH=target/release ./target/release/ort-avx
 # SPIKE-A-PASS inference OK on AVX-only CPU (E5-2650)
+```
+
+Завантаження реальної моделі TTS (перевірка opset 20 + AVX):
+
+```bash
+cd /root/promin-tts
+ORT_STRATEGY=system ORT_LIB_LOCATION=/opt/ort/current/lib LD_LIBRARY_PATH=/opt/ort/current/lib \
+  PROMIN_MODELS_DIR=/root/models cargo test -p speech-inference -- --ignored
+# test engine::tests::load_holos_model ... ok
 ```
