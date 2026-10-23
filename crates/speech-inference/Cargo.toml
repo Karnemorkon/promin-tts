@@ -9,5 +9,7 @@ description = "ONNX Runtime inference bindings: TTS generator, verbalizer, accen
 
 [dependencies]
 anyhow.workspace = true
+ndarray.workspace = true
+ort.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
