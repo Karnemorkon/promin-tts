@@ -1,0 +1,13 @@
+[package]
+name = "speech-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "DSP, crossfade, LUFS normalization, export helpers"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

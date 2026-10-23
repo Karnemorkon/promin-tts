@@ -1,0 +1,11 @@
+.git
+target
+desktop/node_modules
+desktop/dist
+models
+*.wav
+*.pcm
+*.mp3
+*.m4b
+README.md
+LICENSE

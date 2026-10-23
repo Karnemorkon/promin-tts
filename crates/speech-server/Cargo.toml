@@ -1,0 +1,22 @@
+[package]
+name = "speech-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Axum HTTP server: REST, WebSocket, OpenAI-compatible API"
+
+[[bin]]
+name = "speech-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }

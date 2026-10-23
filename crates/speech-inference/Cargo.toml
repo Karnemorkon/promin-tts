@@ -1,0 +1,13 @@
+[package]
+name = "speech-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ONNX Runtime inference bindings: TTS generator, verbalizer, accentor, voice encoder"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
