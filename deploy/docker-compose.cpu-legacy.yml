@@ -1,0 +1,26 @@
+# CPU legacy profile: x86_64 with baseline AVX only (no AVX2 / FMA / BMI2).
+# Primary target: Intel Xeon E5-2650 (Sandy Bridge-EP) and similar servers.
+services:
+  promin-tts:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: morkon06/promin-tts:cpu-legacy
+    container_name: promin-tts
+    ports:
+      - "8010:8010"
+    environment:
+      - PROMIN_HTTP_ADDR=0.0.0.0:8010
+      - PROMIN_MODELS_DIR=/data/models
+      - RUST_LOG=info
+    volumes:
+      - promin_models:/data/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  promin_models:

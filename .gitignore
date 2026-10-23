@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.wav
+*.pcm
+*.mp3
+*.m4b
+/models
+/desktop/node_modules
+/desktop/dist
+/.idea
+/.vscode
+.env

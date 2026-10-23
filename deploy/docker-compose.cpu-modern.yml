@@ -1,0 +1,20 @@
+# CPU modern profile: x86_64 with AVX2 / AVX-512 / VNNI.
+services:
+  promin-tts:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: morkon06/promin-tts:cpu-modern
+    container_name: promin-tts
+    ports:
+      - "8010:8010"
+    environment:
+      - PROMIN_HTTP_ADDR=0.0.0.0:8010
+      - PROMIN_MODELS_DIR=/data/models
+      - RUST_LOG=info
+    volumes:
+      - promin_models:/data/models
+    restart: unless-stopped
+
+volumes:
+  promin_models:
