@@ -1,6 +1,6 @@
 pub mod engine;
 
-pub use engine::TtsEngine;
+pub use engine::{TtsEngine, VOICE_DIM};
 
 pub fn crate_name() -> &'static str {
     "speech-inference"
