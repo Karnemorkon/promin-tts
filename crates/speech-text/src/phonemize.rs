@@ -84,6 +84,12 @@ mod tests {
     }
 
     #[test]
+    fn phonemizer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Phonemizer>();
+    }
+
+    #[test]
     fn word_chars() {
         assert!(is_word_cp('п'));
         assert!(is_word_cp('\''));

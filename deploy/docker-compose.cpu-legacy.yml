@@ -14,13 +14,11 @@ services:
       - PROMIN_MODELS_DIR=/data/models
       - RUST_LOG=info
     volumes:
-      - promin_models:/data/models
+      # Host directory with tts/ + stress/ (or flat layout). Read-only.
+      - ${PROMIN_MODELS_HOST:-../models}:/data/models:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
-
-volumes:
-  promin_models:
