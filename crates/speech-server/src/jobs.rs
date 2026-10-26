@@ -113,6 +113,13 @@ impl From<&JobRecord> for JobSummary {
     }
 }
 
+/// Результат збереження глави проєкту після синтезу.
+enum ChapterSaveOutcome {
+    Saved,
+    /// Главу вже перевела на новий job; старий результат відкидаємо.
+    Superseded,
+}
+
 /// Черга завдань.
 pub struct JobManager {
     store: Arc<JobStore>,
@@ -490,22 +497,35 @@ impl JobManager {
             self.fail_job(&mut job, "chapter does not exist");
             return;
         };
+        if chapter.job_id.as_deref() != Some(id.as_str()) {
+            self.discard_job(&mut job, "chapter generation was superseded by a newer job");
+            return;
+        }
         if chapter.text != job.request.text {
-            self.update_project_chapter(project_id, chapter_index, |chapter| chapter.mark_stale())
-                .await;
+            self.update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
+                chapter.mark_stale()
+            })
+            .await;
             self.fail_job(&mut job, "chapter text changed after job was queued");
             return;
         }
 
-        self.update_project_chapter(project_id, chapter_index, |chapter| chapter.mark_running())
-            .await;
+        if !self
+            .update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
+                chapter.mark_running()
+            })
+            .await
+        {
+            self.discard_job(&mut job, "chapter generation was superseded by a newer job");
+            return;
+        }
 
         let pronouncer = match self.pronunciation.merged_pronouncer(&job.pronunciation) {
             Ok(pronouncer) => pronouncer,
             Err(error) => {
                 let message = format!("pronunciation dictionary: {error}");
                 self.fail_job(&mut job, message.clone());
-                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                self.update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
                     chapter.mark_failed(message)
                 })
                 .await;
@@ -559,7 +579,7 @@ impl JobManager {
             job.mark_cancelled();
             self.persist(&job);
             self.broadcast(&job);
-            self.update_project_chapter(project_id, chapter_index, |chapter| {
+            self.update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
                 chapter.mark_cancelled()
             })
             .await;
@@ -573,9 +593,12 @@ impl JobManager {
                     Err(error) => {
                         let message = format!("WAV export failed: {error}");
                         self.fail_job(&mut job, message.clone());
-                        self.update_project_chapter(project_id, chapter_index, |chapter| {
-                            chapter.mark_failed(message)
-                        })
+                        self.update_project_chapter_if_current(
+                            project_id,
+                            chapter_index,
+                            &id,
+                            |chapter| chapter.mark_failed(message),
+                        )
                         .await;
                         return;
                     }
@@ -584,7 +607,7 @@ impl JobManager {
                     .complete_project_chapter(&job, project_id, chapter_index, &wav, &output)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(ChapterSaveOutcome::Saved) => {
                         let audio_url = format!(
                             "{}/v1/projects/{project_id}/chapters/{chapter_index}/audio",
                             self.public_url
@@ -601,6 +624,12 @@ impl JobManager {
                         self.broadcast(&job);
                         self.fire_webhook(&job);
                     }
+                    Ok(ChapterSaveOutcome::Superseded) => {
+                        self.discard_job(
+                            &mut job,
+                            "chapter generation was superseded by a newer job",
+                        );
+                    }
                     Err(error) => {
                         if self.is_cancelled(&id) {
                             job.mark_cancelled();
@@ -610,9 +639,12 @@ impl JobManager {
                         }
                         let message = format!("cannot save chapter: {error}");
                         self.fail_job(&mut job, message.clone());
-                        self.update_project_chapter(project_id, chapter_index, |chapter| {
-                            chapter.mark_failed(message)
-                        })
+                        self.update_project_chapter_if_current(
+                            project_id,
+                            chapter_index,
+                            &id,
+                            |chapter| chapter.mark_failed(message),
+                        )
                         .await;
                     }
                 }
@@ -621,7 +653,7 @@ impl JobManager {
                 job.mark_cancelled();
                 self.persist(&job);
                 self.broadcast(&job);
-                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                self.update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
                     chapter.mark_cancelled()
                 })
                 .await;
@@ -629,7 +661,7 @@ impl JobManager {
             Ok(Err(error)) => {
                 let message = error.to_string();
                 self.fail_job(&mut job, message.clone());
-                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                self.update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
                     chapter.mark_failed(message)
                 })
                 .await;
@@ -637,7 +669,7 @@ impl JobManager {
             Err(join_error) => {
                 let message = format!("synthesis task failed: {join_error}");
                 self.fail_job(&mut job, message.clone());
-                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                self.update_project_chapter_if_current(project_id, chapter_index, &id, |chapter| {
                     chapter.mark_failed(message)
                 })
                 .await;
@@ -654,7 +686,7 @@ impl JobManager {
         chapter_index: usize,
         wav: &[u8],
         output: &crate::service::SynthChapterOutput,
-    ) -> Result<(), String> {
+    ) -> Result<ChapterSaveOutcome, String> {
         let _guard = self.project_lock.lock().await;
         let mut project = self
             .projects
@@ -664,6 +696,9 @@ impl JobManager {
         let Some(chapter) = project.chapter(chapter_index) else {
             return Err("chapter does not exist".to_string());
         };
+        if chapter.job_id.as_deref() != Some(job.id.as_str()) {
+            return Ok(ChapterSaveOutcome::Superseded);
+        }
         let text_changed = chapter.text != job.request.text;
         let settings_changed = job.project_settings.as_ref() != Some(&project.settings);
         let pronunciation_changed = job.pronunciation != project.pronunciation;
@@ -690,10 +725,20 @@ impl JobManager {
         self.projects
             .save(&mut project)
             .map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(ChapterSaveOutcome::Saved)
     }
 
-    async fn update_project_chapter<F>(&self, project_id: &str, chapter_index: usize, update: F)
+    /// Оновити главу, лише якщо вона досі належить цьому job-у.
+    ///
+    /// Повертає `false`, якщо главу вже перевела на новий job або проєкт
+    /// зник; у такому разі результат старого job-а не застосовується.
+    async fn update_project_chapter_if_current<F>(
+        &self,
+        project_id: &str,
+        chapter_index: usize,
+        job_id: &str,
+        update: F,
+    ) -> bool
     where
         F: FnOnce(&mut speech_core::projects::Chapter),
     {
@@ -701,20 +746,35 @@ impl JobManager {
         match self.projects.load(project_id) {
             Ok(Some(mut project)) => {
                 let Some(chapter) = project.chapter_mut(chapter_index) else {
-                    return;
+                    return false;
                 };
+                if chapter.job_id.as_deref() != Some(job_id) {
+                    return false;
+                }
                 update(chapter);
                 if let Err(error) = self.projects.save(&mut project) {
                     tracing::error!(project_id, error = %error, "cannot save project chapter");
                 }
+                true
             }
             Ok(None) => {
                 tracing::warn!(project_id, "project disappeared while updating chapter");
+                false
             }
             Err(error) => {
                 tracing::error!(project_id, error = %error, "cannot load project");
+                false
             }
         }
+    }
+
+    /// Позначити job скасованим, не чіпаючи главу (наприклад, її вже
+    /// перевела на новий job).
+    fn discard_job(&self, job: &mut JobRecord, reason: &str) {
+        job.mark_cancelled();
+        job.error = Some(reason.to_string());
+        self.persist(job);
+        self.broadcast(job);
     }
 
     fn fail_job(&self, job: &mut JobRecord, error: impl Into<String>) {
