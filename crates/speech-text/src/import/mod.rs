@@ -127,6 +127,9 @@ fn sniff_format(bytes: &[u8]) -> Option<BookFormat> {
         }
         return None;
     }
+    if has_binary_magic(bytes) {
+        return None;
+    }
     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
     if head.contains("<FictionBook") {
         return Some(BookFormat::Fb2);
@@ -134,7 +137,70 @@ fn sniff_format(bytes: &[u8]) -> Option<BookFormat> {
     if head.contains("<?xml") {
         return None;
     }
-    Some(BookFormat::Txt)
+    if looks_like_text(bytes) {
+        Some(BookFormat::Txt)
+    } else {
+        None
+    }
+}
+
+/// Магічні числа форматів, які ми не підтримуємо (щоб не приймати їх за TXT).
+fn has_binary_magic(bytes: &[u8]) -> bool {
+    const MAGICS: &[&[u8]] = &[
+        b"%PDF-",
+        b"\x7fELF",
+        b"\x89PNG\r\n\x1a\n",
+        b"\xff\xd8\xff",
+        b"GIF87a",
+        b"GIF89a",
+        b"RIFF",
+        b"OggS",
+        b"ID3",
+        b"fLaC",
+        b"\x1f\x8b",
+        b"Rar!\x1a\x07",
+        b"7z\xbc\xaf\x27\x1c",
+        b"SQLite format 3\0",
+        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
+        b"BOOKMOBI",
+    ];
+    MAGICS.iter().any(|magic| bytes.starts_with(magic))
+}
+
+/// Чи схожий вміст на текст: без NUL і майже без керуючих символів.
+///
+/// UTF-16 визначається за BOM; для інших кодувань приймаємо UTF-8, а якщо
+/// він невалідний — перевіряємо декодування CP1251 (типове для старих TXT).
+fn looks_like_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return bytes.len() > 2;
+    }
+    let sample = &bytes[..bytes.len().min(8_192)];
+    if sample.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(sample) {
+        Ok(text) => text_is_printable(text),
+        Err(_) => {
+            let decoded = encoding_rs::WINDOWS_1251.decode(sample).0;
+            text_is_printable(&decoded)
+        }
+    }
+}
+
+fn text_is_printable(text: &str) -> bool {
+    let mut total = 0usize;
+    let mut control = 0usize;
+    for ch in text.chars() {
+        total += 1;
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            control += 1;
+        }
+    }
+    total > 0 && control * 100 <= total * 2
 }
 
 /// Імпортувати книгу, визначивши формат.

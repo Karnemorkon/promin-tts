@@ -233,6 +233,52 @@ fn imports_docx_with_heading_styles() {
 }
 
 #[test]
+fn rejects_unsupported_binary_content() {
+    assert_eq!(
+        speech_text::import::detect_format("book.pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"),
+        None
+    );
+    assert_eq!(
+        speech_text::import::detect_format("book", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
+        None
+    );
+    assert_eq!(
+        speech_text::import::detect_format("book", b"\x7fELF\x02\x01\x01\0"),
+        None
+    );
+    assert_eq!(
+        speech_text::import::detect_format("book", b"PK\x03\x04not-a-real-zip"),
+        None
+    );
+    assert_eq!(
+        speech_text::import::detect_format("book", b"\x01\x02\x03\0\x04\x05"),
+        None
+    );
+    assert!(matches!(
+        import_book("book.pdf", b"%PDF-1.7\n"),
+        Err(ImportError::UnsupportedFormat)
+    ));
+}
+
+#[test]
+fn sniffs_utf8_and_cp1251_plain_text() {
+    assert_eq!(
+        speech_text::import::detect_format("book", "Просто текст\n".as_bytes()),
+        Some(BookFormat::Txt)
+    );
+    let cp1251 = [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2, b'\n'];
+    assert_eq!(
+        speech_text::import::detect_format("book", &cp1251),
+        Some(BookFormat::Txt)
+    );
+    let utf16 = [0xFF, 0xFE, b'T', 0x00, b'e', 0x00, b'x', 0x00, b't', 0x00];
+    assert_eq!(
+        speech_text::import::detect_format("book", &utf16),
+        Some(BookFormat::Txt)
+    );
+}
+
+#[test]
 fn imports_plain_text_and_markdown() {
     let txt = "Передмова.\n\nРОЗДІЛ 1\n\nПерший текст.\n\nРОЗДІЛ 2\n\nДругий текст.\n";
     let book = import_book("book.txt", txt.as_bytes()).unwrap();
