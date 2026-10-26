@@ -42,6 +42,20 @@ pub fn float_to_pcm16(samples: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+/// float32 (довільна амплітуда) -> int16 **без** пікової нормалізації.
+///
+/// Використовується після LUFS-нормалізації, коли рівень уже виставлений і
+/// повторна нормалізація зруйнувала б цільову гучність.
+pub fn float_to_pcm16_clipped(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|&v| {
+            let x = v.clamp(-1.0, 1.0);
+            (x * 32767.0).round() as i16
+        })
+        .collect()
+}
+
 /// PCM16 mono -> байти WAV (44-байтний RIFF-заголовок + data).
 pub fn wav_bytes(pcm: &[i16], sample_rate: u32) -> Result<Vec<u8>> {
     let spec = hound::WavSpec {
@@ -86,6 +100,13 @@ mod tests {
         // Після нормалізації пік завжди 1.0; перевіряємо, що знак збережено.
         let pcm = float_to_pcm16(&[-2.0, 1.0]);
         assert_eq!(pcm, vec![-32767, 16384]);
+    }
+
+    #[test]
+    fn clipped_conversion_preserves_level() {
+        let pcm = float_to_pcm16_clipped(&[0.0, 0.5, -0.25, 2.0, -2.0]);
+        assert_eq!(pcm, vec![0, 16384, -8192, 32767, -32767]);
+        assert_eq!(float_to_pcm16_clipped(&[]), Vec::<i16>::new());
     }
 
     #[test]

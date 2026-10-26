@@ -10,6 +10,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::projects::{ProjectSettings, PronunciationRule};
+
 /// Стан завдання.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,6 +41,36 @@ impl JobStatus {
 
 fn default_speed() -> f32 {
     1.0
+}
+
+/// Де зберігається аудіо завдання.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AudioLocation {
+    /// Звичайне завдання: `<jobs>/<id>.wav`.
+    #[default]
+    Job,
+    /// Глава проєкту: `<projects>/<project_id>/chapters/<index>.wav`.
+    ProjectChapter {
+        project_id: String,
+        chapter_index: usize,
+    },
+}
+
+impl AudioLocation {
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            Self::Job => None,
+            Self::ProjectChapter { project_id, .. } => Some(project_id),
+        }
+    }
+
+    pub fn chapter_index(&self) -> Option<usize> {
+        match self {
+            Self::Job => None,
+            Self::ProjectChapter { chapter_index, .. } => Some(*chapter_index),
+        }
+    }
 }
 
 /// Параметри одного завдання (зберігаються разом із записом).
@@ -91,6 +123,15 @@ pub struct JobRecord {
     pub verbalizer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vb_ms: Option<u64>,
+    /// Куди писати аудіо (job або глава проєкту).
+    #[serde(default)]
+    pub audio_location: AudioLocation,
+    /// Знімок налаштувань проєкту на момент постановки.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_settings: Option<ProjectSettings>,
+    /// Знімок проєктних правил вимови на момент постановки.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pronunciation: Vec<PronunciationRule>,
 }
 
 impl JobRecord {
@@ -110,7 +151,37 @@ impl JobRecord {
             chunks: None,
             verbalizer: None,
             vb_ms: None,
+            audio_location: AudioLocation::Job,
+            project_settings: None,
+            pronunciation: Vec::new(),
         }
+    }
+
+    /// Завдання для глави проєкту зі знімком налаштувань.
+    pub fn for_project_chapter(
+        id: String,
+        request: JobRequest,
+        project_id: impl Into<String>,
+        chapter_index: usize,
+        project_settings: Option<ProjectSettings>,
+        pronunciation: Vec<PronunciationRule>,
+    ) -> Self {
+        let mut job = Self::new(id, request);
+        job.audio_location = AudioLocation::ProjectChapter {
+            project_id: project_id.into(),
+            chapter_index,
+        };
+        job.project_settings = project_settings;
+        job.pronunciation = pronunciation;
+        job
+    }
+
+    pub fn project_id(&self) -> Option<&str> {
+        self.audio_location.project_id()
+    }
+
+    pub fn chapter_index(&self) -> Option<usize> {
+        self.audio_location.chapter_index()
     }
 
     pub fn mark_running(&mut self) {
@@ -368,5 +439,38 @@ mod tests {
         assert!(JobStatus::Cancelled.is_terminal());
         assert!(!JobStatus::Queued.is_terminal());
         assert!(!JobStatus::Running.is_terminal());
+    }
+
+    #[test]
+    fn project_chapter_jobs_keep_location_and_snapshot() {
+        let job = JobRecord::for_project_chapter(
+            "job-1".into(),
+            sample_request(),
+            "book-1",
+            3,
+            Some(ProjectSettings::default()),
+            vec![PronunciationRule {
+                pattern: "ІТ".into(),
+                replacement: "ай-ті".into(),
+                regex: false,
+                case_sensitive: true,
+            }],
+        );
+        assert_eq!(job.project_id(), Some("book-1"));
+        assert_eq!(job.chapter_index(), Some(3));
+        assert!(job.project_settings.is_some());
+        assert_eq!(job.pronunciation.len(), 1);
+
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.contains("project_chapter"));
+        let parsed: JobRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.project_id(), Some("book-1"));
+        assert_eq!(parsed.chapter_index(), Some(3));
+        assert_eq!(parsed.pronunciation.len(), 1);
+        assert_eq!(parsed.audio_location, job.audio_location);
+
+        let plain = JobRecord::new("job-2".into(), sample_request());
+        assert_eq!(plain.audio_location, AudioLocation::Job);
+        assert_eq!(plain.project_id(), None);
     }
 }

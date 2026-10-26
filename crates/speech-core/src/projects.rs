@@ -356,11 +356,12 @@ impl Chapter {
         self.updated_at = Some(now_rfc3339());
     }
 
+    /// Позначити главу застарілою: текст або налаштування змінилися.
+    ///
+    /// Активні глави теж стають `stale` — job, що вже виконується, побачить
+    /// зміну тексту/знімка налаштувань і не перезапише актуальний стан.
     pub fn mark_stale(&mut self) {
-        if matches!(
-            self.status,
-            ChapterStatus::Completed | ChapterStatus::Failed | ChapterStatus::Cancelled
-        ) {
+        if self.status != ChapterStatus::Empty {
             self.status = ChapterStatus::Stale;
         }
         self.error = None;
@@ -706,6 +707,10 @@ impl ProjectStore {
     }
 
     pub fn save_chapter_audio(&self, id: &str, index: usize, bytes: &[u8]) -> Result<PathBuf> {
+        let dir = self.project_dir(id)?;
+        if !dir.join("project.json").is_file() {
+            bail!("project {id} does not exist");
+        }
         let path = self.chapter_audio_path(id, index)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -872,6 +877,13 @@ mod tests {
         assert!(chapter.status.is_ready());
         assert_eq!(chapter.audio_bytes, Some(10));
 
+        chapter.mark_stale();
+        assert_eq!(chapter.status, ChapterStatus::Stale);
+
+        chapter.mark_queued("job-2");
+        chapter.mark_stale();
+        assert_eq!(chapter.status, ChapterStatus::Stale);
+        chapter.mark_running();
         chapter.mark_stale();
         assert_eq!(chapter.status, ChapterStatus::Stale);
         chapter.mark_failed("boom");

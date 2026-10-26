@@ -125,7 +125,6 @@ impl PronunciationStore {
 
     /// Глобальні + проєктні правила (проєктні перекривають глобальні).
     /// Використовується генерацією глав проєкту.
-    #[allow(dead_code)]
     pub fn merged_pronouncer(
         &self,
         project_rules: &[PronunciationRule],

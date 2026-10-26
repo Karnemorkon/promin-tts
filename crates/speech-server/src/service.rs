@@ -8,10 +8,11 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use speech_audio::{
-    crossfade_concat, crossfade_samples, decode_wav_f32, float_to_pcm16, pcm16_bytes,
-    resample_to_24k, wav_bytes, SAMPLE_RATE,
+    crossfade_concat, crossfade_samples, decode_wav_f32, float_to_pcm16, float_to_pcm16_clipped,
+    pcm16_bytes, resample_to_24k, wav_bytes, SAMPLE_RATE,
 };
 use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
+use speech_core::projects::{ChunkTiming, LoudnessReport as ProjectLoudnessReport};
 use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
@@ -111,6 +112,20 @@ impl SynthPcmOutput {
     pub fn audio_ms(&self) -> u64 {
         self.pcm.len() as u64 * 1000 / SAMPLE_RATE as u64
     }
+}
+
+/// Результат синтезу глави проєкту: PCM, таймінги чанків і звіт гучності.
+#[derive(Debug)]
+pub struct SynthChapterOutput {
+    pub pcm: Vec<i16>,
+    pub verbalizer: &'static str,
+    pub vb_ms: u64,
+    pub chunks: usize,
+    /// Межі чанків після кросфейду (для SRT/VTT).
+    pub chunk_timings: Vec<ChunkTiming>,
+    /// `None`, якщо нормалізацію вимкнено або сигнал надто короткий.
+    pub loudness: Option<ProjectLoudnessReport>,
+    pub duration_ms: u64,
 }
 
 /// Метадані, готові до відправки клієнту перед першим аудіо-чанком.
@@ -811,6 +826,117 @@ impl SynthService {
         })
     }
 
+    /// Синтез глави проєкту: таймінги чанків, LUFS-нормалізація та PCM.
+    ///
+    /// На відміну від [`Self::synthesize_long_pcm_with_pronunciation`], тут
+    /// зберігаються межі кожного чанка після кросфейду, а нормалізація
+    /// виконується до конверсії в PCM16 (без повторної пікової нормалізації).
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_chapter_pcm(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        audio_base64: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        max_chars: usize,
+        crossfade_ms: u32,
+        pronunciation: Option<&Pronouncer>,
+        loudness_target: Option<speech_audio::loudness::LoudnessTarget>,
+        mut progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
+    ) -> Result<SynthChapterOutput, SynthError> {
+        let text = self.validate_long_text(text)?;
+        self.validate_speed(speed)?;
+
+        let voice_vector = match audio_base64 {
+            Some(reference) => self.encode_reference(reference)?,
+            None => self.resolve_voice(voice)?,
+        };
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
+        tracing::debug!(verbalizer, vb_ms, "chapter text verbalized");
+
+        let chunks = chunk_text(&verbalized, max_chars);
+        if chunks.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+        let total = chunks.len();
+        let timing_texts = timing_texts(text, &chunks, max_chars);
+
+        if let Some(cb) = progress.as_deref_mut() {
+            if !cb(0, total) {
+                return Err(SynthError::Cancelled);
+            }
+        }
+
+        let mut audio_chunks = Vec::with_capacity(total);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let samples =
+                self.synthesize_verbalized_f32(chunk, &voice_vector, speed, raw_stress)?;
+            audio_chunks.push(samples);
+            if let Some(cb) = progress.as_deref_mut() {
+                if !cb(index + 1, total) {
+                    return Err(SynthError::Cancelled);
+                }
+            }
+        }
+
+        let overlap = crossfade_samples(crossfade_ms.min(200), SAMPLE_RATE);
+        let mut chunk_timings = Vec::with_capacity(total);
+        let mut cursor = 0usize;
+        for (index, audio) in audio_chunks.iter().enumerate() {
+            let start = if index == 0 {
+                0
+            } else {
+                cursor.saturating_sub(overlap)
+            };
+            let end = start + audio.len();
+            chunk_timings.push(ChunkTiming {
+                start_ms: samples_to_ms(start),
+                end_ms: samples_to_ms(end),
+                text: timing_texts[index].clone(),
+            });
+            cursor = end;
+        }
+
+        let mut samples = crossfade_concat(&audio_chunks, overlap);
+        let duration_ms = samples_to_ms(samples.len());
+        let mut loudness = None;
+        if let Some(target) = loudness_target {
+            let report = speech_audio::loudness::normalize(&mut samples, SAMPLE_RATE, target)
+                .map_err(SynthError::Internal)?;
+            if report.normalized {
+                loudness = Some(ProjectLoudnessReport {
+                    input_lufs: report.input_lufs.unwrap_or(-70.0),
+                    output_lufs: report.output_lufs.unwrap_or(-70.0),
+                    input_true_peak_db: report.input_true_peak_db.unwrap_or(-120.0),
+                    output_true_peak_db: report.output_true_peak_db.unwrap_or(-120.0),
+                    gain_db: report.gain_db,
+                    target_lufs: target.target_lufs,
+                    target_true_peak_db: target.true_peak_db,
+                    limited: report.limited_samples > 0,
+                });
+            }
+        }
+        let pcm = if loudness.is_some() {
+            float_to_pcm16_clipped(&samples)
+        } else {
+            float_to_pcm16(&samples)
+        };
+
+        Ok(SynthChapterOutput {
+            pcm,
+            verbalizer,
+            vb_ms,
+            chunks: total,
+            chunk_timings,
+            loudness,
+            duration_ms,
+        })
+    }
+
     /// Потоковий синтез: `on_ready` -> метадані, `on_chunk` -> PCM16-байти.
     ///
     /// `false` з будь-якого колбека означає, що клієнт відключився.
@@ -872,6 +998,21 @@ impl SynthService {
             chunks: chunks.len(),
             audio_ms,
         })
+    }
+}
+
+fn samples_to_ms(samples: usize) -> u64 {
+    samples as u64 * 1000 / SAMPLE_RATE as u64
+}
+
+/// Текст для субтитрів: оригінальні чанки, якщо вербалізація зберегла
+/// кількість чанків; інакше — вербалізовані (номери вже розгорнуто).
+fn timing_texts(original: &str, spoken: &[String], max_chars: usize) -> Vec<String> {
+    let original_chunks = chunk_text(original, max_chars);
+    if original_chunks.len() == spoken.len() {
+        original_chunks
+    } else {
+        spoken.to_vec()
     }
 }
 

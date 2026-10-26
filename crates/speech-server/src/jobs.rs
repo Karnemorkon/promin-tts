@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use speech_core::jobs::{JobRecord, JobRequest, JobStatus, JobStore};
+use speech_audio::loudness::LoudnessTarget;
+use speech_core::jobs::{AudioLocation, JobRecord, JobRequest, JobStatus, JobStore};
+use speech_core::projects::{valid_project_id, ProjectSettings, ProjectStore, PronunciationRule};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
+use crate::pronunciation::PronunciationStore;
 use crate::service::{SynthError, SynthService, VerbalizerMode, MAX_JOB_TEXT_CHARS, SPEED_RANGE};
 
 /// Компактна подія для SSE/WebSocket (без повного тексту запиту).
@@ -32,6 +35,10 @@ pub struct JobEvent {
     pub chunks: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verbalizer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chapter_index: Option<usize>,
 }
 
 impl JobEvent {
@@ -46,6 +53,8 @@ impl JobEvent {
             duration_ms: job.duration_ms,
             chunks: job.chunks,
             verbalizer: job.verbalizer.clone(),
+            project_id: job.project_id().map(str::to_owned),
+            chapter_index: job.chapter_index(),
         }
     }
 }
@@ -76,6 +85,8 @@ pub struct JobSummary {
     pub duration_ms: Option<u64>,
     pub chunks: Option<usize>,
     pub verbalizer: Option<String>,
+    pub project_id: Option<String>,
+    pub chapter_index: Option<usize>,
 }
 
 impl From<&JobRecord> for JobSummary {
@@ -96,6 +107,8 @@ impl From<&JobRecord> for JobSummary {
             duration_ms: job.duration_ms,
             chunks: job.chunks,
             verbalizer: job.verbalizer.clone(),
+            project_id: job.project_id().map(str::to_owned),
+            chapter_index: job.chapter_index(),
         }
     }
 }
@@ -104,6 +117,9 @@ impl From<&JobRecord> for JobSummary {
 pub struct JobManager {
     store: Arc<JobStore>,
     service: Arc<SynthService>,
+    projects: Arc<ProjectStore>,
+    pronunciation: Arc<PronunciationStore>,
+    project_lock: Arc<tokio::sync::Mutex<()>>,
     sender: mpsc::Sender<String>,
     state: Arc<Mutex<HashMap<String, JobRecord>>>,
     cancel: Arc<Mutex<HashSet<String>>>,
@@ -114,9 +130,13 @@ pub struct JobManager {
 
 impl JobManager {
     /// Створити чергу, відновити записи з диска та запустити воркерів.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<JobStore>,
         service: Arc<SynthService>,
+        projects: Arc<ProjectStore>,
+        pronunciation: Arc<PronunciationStore>,
+        project_lock: Arc<tokio::sync::Mutex<()>>,
         concurrency: usize,
         public_url: String,
     ) -> Result<Arc<Self>> {
@@ -141,6 +161,9 @@ impl JobManager {
         let manager = Arc::new(Self {
             store,
             service,
+            projects,
+            pronunciation,
+            project_lock,
             sender,
             state: Arc::new(Mutex::new(state)),
             cancel: Arc::new(Mutex::new(HashSet::new())),
@@ -172,8 +195,43 @@ impl JobManager {
     /// Додати завдання в чергу.
     pub async fn submit(&self, request: JobRequest) -> Result<JobRecord, String> {
         validate_job_request(&request)?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let job = JobRecord::new(id.clone(), request);
+        let job = JobRecord::new(uuid::Uuid::new_v4().to_string(), request);
+        self.enqueue(job).await
+    }
+
+    /// Додати завдання генерації глави проєкту із заздалегідь
+    /// зарезервованим id.
+    ///
+    /// Дозволяє спершу зберегти `queued`-статус глави під `project_lock`,
+    /// відпустити lock і лише потім поставити job-и в чергу (інакше воркер
+    /// може заблокуватися на оновленні глави, поки черга переповнена).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_chapter_with_id(
+        &self,
+        job_id: String,
+        project_id: &str,
+        chapter_index: usize,
+        request: JobRequest,
+        project_settings: Option<ProjectSettings>,
+        pronunciation: Vec<PronunciationRule>,
+    ) -> Result<JobRecord, String> {
+        validate_job_request(&request)?;
+        if !valid_project_id(project_id) {
+            return Err("invalid project id".into());
+        }
+        let job = JobRecord::for_project_chapter(
+            job_id,
+            request,
+            project_id,
+            chapter_index,
+            project_settings,
+            pronunciation,
+        );
+        self.enqueue(job).await
+    }
+
+    async fn enqueue(&self, job: JobRecord) -> Result<JobRecord, String> {
+        let id = job.id.clone();
         self.store.save(&job).map_err(|error| error.to_string())?;
         self.state
             .lock()
@@ -260,6 +318,21 @@ impl JobManager {
         self.events.subscribe()
     }
 
+    /// Скасувати всі активні job-и проєкту (перед видаленням каталогу).
+    pub fn cancel_project_jobs(&self, project_id: &str) -> usize {
+        let ids: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|job| job.project_id() == Some(project_id) && !job.status.is_terminal())
+            .map(|job| job.id.clone())
+            .collect();
+        ids.iter()
+            .filter(|id| self.cancel(id) == CancelOutcome::Cancelled)
+            .count()
+    }
+
     /// Зберегти запис на диск і оновити in-memory стан (єдине джерело для GET).
     fn persist(&self, job: &JobRecord) {
         persist_job(&self.state, &self.store, job);
@@ -295,6 +368,20 @@ impl JobManager {
         self.persist(&job);
         self.broadcast(&job);
 
+        match job.audio_location.clone() {
+            AudioLocation::Job => self.run_regular_job(job).await,
+            AudioLocation::ProjectChapter {
+                project_id,
+                chapter_index,
+            } => {
+                self.run_project_chapter(job, &project_id, chapter_index)
+                    .await;
+            }
+        }
+    }
+
+    async fn run_regular_job(&self, job: JobRecord) {
+        let id = job.id.clone();
         let request = job.request.clone();
         let mode = VerbalizerMode::parse(request.auto_verbalize.as_ref());
         let max_chars = request.max_chars.unwrap_or(1_200).clamp(50, 5_000);
@@ -305,38 +392,10 @@ impl JobManager {
         let store = Arc::clone(&self.store);
         let events = self.events.clone();
         let cancel = Arc::clone(&self.cancel);
-        let job_id = id.to_string();
+        let job_id = id.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut progress = |done: usize, total: usize| -> bool {
-                if cancel
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .contains(&job_id)
-                {
-                    return false;
-                }
-                let progress = done
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .unwrap_or(0)
-                    .min(99) as u8;
-                let job = {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let Some(job) = state.get_mut(&job_id) else {
-                        return false;
-                    };
-                    job.set_progress(progress);
-                    job.clone()
-                };
-                if let Err(error) = store.save(&job) {
-                    tracing::error!(job_id = %job_id, error = %error, "cannot save progress");
-                }
-                let _ = events.send(JobEvent::from_record(&job));
-                true
-            };
+            let mut progress = progress_callback(state, store, events, cancel, job_id);
 
             service.synthesize_long_pcm(
                 &request.text,
@@ -352,7 +411,7 @@ impl JobManager {
         })
         .await;
 
-        let mut job = match self.get(id) {
+        let mut job = match self.get(&id) {
             Some(job) => job,
             None => return,
         };
@@ -369,7 +428,7 @@ impl JobManager {
                         return;
                     }
                 };
-                if let Err(error) = self.store.save_audio(id, &wav) {
+                if let Err(error) = self.store.save_audio(&id, &wav) {
                     job.mark_failed(format!("cannot save audio: {error}"));
                     self.persist(&job);
                     self.broadcast(&job);
@@ -409,6 +468,262 @@ impl JobManager {
         }
     }
 
+    async fn run_project_chapter(
+        &self,
+        mut job: JobRecord,
+        project_id: &str,
+        chapter_index: usize,
+    ) {
+        let id = job.id.clone();
+        let project = match self.projects.load(project_id) {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                self.fail_job(&mut job, "project does not exist");
+                return;
+            }
+            Err(error) => {
+                self.fail_job(&mut job, format!("cannot load project: {error}"));
+                return;
+            }
+        };
+        let Some(chapter) = project.chapter(chapter_index) else {
+            self.fail_job(&mut job, "chapter does not exist");
+            return;
+        };
+        if chapter.text != job.request.text {
+            self.update_project_chapter(project_id, chapter_index, |chapter| chapter.mark_stale())
+                .await;
+            self.fail_job(&mut job, "chapter text changed after job was queued");
+            return;
+        }
+
+        self.update_project_chapter(project_id, chapter_index, |chapter| chapter.mark_running())
+            .await;
+
+        let pronouncer = match self.pronunciation.merged_pronouncer(&job.pronunciation) {
+            Ok(pronouncer) => pronouncer,
+            Err(error) => {
+                let message = format!("pronunciation dictionary: {error}");
+                self.fail_job(&mut job, message.clone());
+                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                    chapter.mark_failed(message)
+                })
+                .await;
+                return;
+            }
+        };
+
+        let loudness_target = job.project_settings.as_ref().and_then(|settings| {
+            settings.loudness.enabled.then(|| {
+                LoudnessTarget::new(
+                    settings.loudness.target_lufs,
+                    settings.loudness.true_peak_db,
+                )
+            })
+        });
+        let request = job.request.clone();
+        let mode = VerbalizerMode::parse(request.auto_verbalize.as_ref());
+        let max_chars = request.max_chars.unwrap_or(1_200).clamp(50, 5_000);
+        let crossfade_ms = request.crossfade_ms.unwrap_or(40).min(200);
+
+        let service = Arc::clone(&self.service);
+        let state = Arc::clone(&self.state);
+        let store = Arc::clone(&self.store);
+        let events = self.events.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let job_id = id.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut progress = progress_callback(state, store, events, cancel, job_id);
+            service.synthesize_chapter_pcm(
+                &request.text,
+                request.voice.as_deref(),
+                None,
+                request.speed,
+                mode,
+                request.raw_stress,
+                max_chars,
+                crossfade_ms,
+                Some(pronouncer.as_ref()),
+                loudness_target,
+                Some(&mut progress),
+            )
+        })
+        .await;
+
+        let mut job = match self.get(&id) {
+            Some(job) => job,
+            None => return,
+        };
+        if self.is_cancelled(&id) {
+            job.mark_cancelled();
+            self.persist(&job);
+            self.broadcast(&job);
+            self.update_project_chapter(project_id, chapter_index, |chapter| {
+                chapter.mark_cancelled()
+            })
+            .await;
+            return;
+        }
+
+        match result {
+            Ok(Ok(output)) => {
+                let wav = match speech_audio::wav_bytes(&output.pcm, speech_audio::SAMPLE_RATE) {
+                    Ok(wav) => wav,
+                    Err(error) => {
+                        let message = format!("WAV export failed: {error}");
+                        self.fail_job(&mut job, message.clone());
+                        self.update_project_chapter(project_id, chapter_index, |chapter| {
+                            chapter.mark_failed(message)
+                        })
+                        .await;
+                        return;
+                    }
+                };
+                match self
+                    .complete_project_chapter(&job, project_id, chapter_index, &wav, &output)
+                    .await
+                {
+                    Ok(()) => {
+                        let audio_url = format!(
+                            "{}/v1/projects/{project_id}/chapters/{chapter_index}/audio",
+                            self.public_url
+                        );
+                        job.mark_completed(
+                            audio_url,
+                            wav.len() as u64,
+                            output.duration_ms,
+                            output.chunks,
+                            output.verbalizer.to_string(),
+                            output.vb_ms,
+                        );
+                        self.persist(&job);
+                        self.broadcast(&job);
+                        self.fire_webhook(&job);
+                    }
+                    Err(error) => {
+                        if self.is_cancelled(&id) {
+                            job.mark_cancelled();
+                            self.persist(&job);
+                            self.broadcast(&job);
+                            return;
+                        }
+                        let message = format!("cannot save chapter: {error}");
+                        self.fail_job(&mut job, message.clone());
+                        self.update_project_chapter(project_id, chapter_index, |chapter| {
+                            chapter.mark_failed(message)
+                        })
+                        .await;
+                    }
+                }
+            }
+            Ok(Err(SynthError::Cancelled)) => {
+                job.mark_cancelled();
+                self.persist(&job);
+                self.broadcast(&job);
+                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                    chapter.mark_cancelled()
+                })
+                .await;
+            }
+            Ok(Err(error)) => {
+                let message = error.to_string();
+                self.fail_job(&mut job, message.clone());
+                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                    chapter.mark_failed(message)
+                })
+                .await;
+            }
+            Err(join_error) => {
+                let message = format!("synthesis task failed: {join_error}");
+                self.fail_job(&mut job, message.clone());
+                self.update_project_chapter(project_id, chapter_index, |chapter| {
+                    chapter.mark_failed(message)
+                })
+                .await;
+            }
+        }
+    }
+
+    /// Зберегти аудіо глави та оновити `project.json` під тим самим lock,
+    /// що й видалення проєкту (щоб не відтворити видалений каталог).
+    async fn complete_project_chapter(
+        &self,
+        job: &JobRecord,
+        project_id: &str,
+        chapter_index: usize,
+        wav: &[u8],
+        output: &crate::service::SynthChapterOutput,
+    ) -> Result<(), String> {
+        let _guard = self.project_lock.lock().await;
+        let mut project = self
+            .projects
+            .load(project_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "project does not exist".to_string())?;
+        let Some(chapter) = project.chapter(chapter_index) else {
+            return Err("chapter does not exist".to_string());
+        };
+        let text_changed = chapter.text != job.request.text;
+        let settings_changed = job.project_settings.as_ref() != Some(&project.settings);
+        let pronunciation_changed = job.pronunciation != project.pronunciation;
+
+        self.projects
+            .save_chapter_audio(project_id, chapter_index, wav)
+            .map_err(|error| error.to_string())?;
+
+        let chapter = project
+            .chapter_mut(chapter_index)
+            .expect("chapter existence checked above");
+        chapter.mark_completed(
+            wav.len() as u64,
+            output.duration_ms,
+            output.loudness.clone(),
+            output.chunk_timings.clone(),
+        );
+        if text_changed || settings_changed || pronunciation_changed {
+            chapter.mark_stale();
+            if text_changed {
+                chapter.error = Some("chapter text changed after generation".to_string());
+            }
+        }
+        self.projects
+            .save(&mut project)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    async fn update_project_chapter<F>(&self, project_id: &str, chapter_index: usize, update: F)
+    where
+        F: FnOnce(&mut speech_core::projects::Chapter),
+    {
+        let _guard = self.project_lock.lock().await;
+        match self.projects.load(project_id) {
+            Ok(Some(mut project)) => {
+                let Some(chapter) = project.chapter_mut(chapter_index) else {
+                    return;
+                };
+                update(chapter);
+                if let Err(error) = self.projects.save(&mut project) {
+                    tracing::error!(project_id, error = %error, "cannot save project chapter");
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(project_id, "project disappeared while updating chapter");
+            }
+            Err(error) => {
+                tracing::error!(project_id, error = %error, "cannot load project");
+            }
+        }
+    }
+
+    fn fail_job(&self, job: &mut JobRecord, error: impl Into<String>) {
+        job.mark_failed(error);
+        self.persist(job);
+        self.broadcast(job);
+        self.fire_webhook(job);
+    }
+
     fn fire_webhook(&self, job: &JobRecord) {
         let Some(url) = job.request.webhook_url.clone() else {
             return;
@@ -444,6 +759,45 @@ impl JobManager {
                 }
             }
         });
+    }
+}
+
+/// Колбек прогресу для `spawn_blocking`: оновлює job-запис і шле SSE.
+fn progress_callback(
+    state: Arc<Mutex<HashMap<String, JobRecord>>>,
+    store: Arc<JobStore>,
+    events: broadcast::Sender<JobEvent>,
+    cancel: Arc<Mutex<HashSet<String>>>,
+    job_id: String,
+) -> impl FnMut(usize, usize) -> bool {
+    move |done: usize, total: usize| -> bool {
+        if cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job_id)
+        {
+            return false;
+        }
+        let progress = done
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0)
+            .min(99) as u8;
+        let job = {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(job) = state.get_mut(&job_id) else {
+                return false;
+            };
+            job.set_progress(progress);
+            job.clone()
+        };
+        if let Err(error) = store.save(&job) {
+            tracing::error!(job_id = %job_id, error = %error, "cannot save progress");
+        }
+        let _ = events.send(JobEvent::from_record(&job));
+        true
     }
 }
 

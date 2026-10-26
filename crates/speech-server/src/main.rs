@@ -4,6 +4,7 @@ use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, Request, State},
@@ -13,7 +14,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use clap::Parser;
@@ -21,13 +22,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use speech_audio::{default_streaming_wav_header, pcm16_bytes, wav_bytes, SAMPLE_RATE};
 use speech_core::jobs::{JobRequest, JobStatus};
+use speech_core::projects::{LoudnessSettings, ProjectStore};
 use tokio::sync::{broadcast, mpsc};
 
 mod downloader;
 mod jobs;
 mod mcp;
+mod projects;
 mod pronunciation;
 mod service;
+mod subtitles;
 mod wyoming;
 
 use downloader::{ensure_models, DownloadOptions};
@@ -79,13 +83,29 @@ struct Args {
     /// Global pronunciation dictionary; default `<data>/pronunciation.json`
     #[arg(long, env = "PROMIN_PRONUNCIATION_FILE")]
     pronunciation_file: Option<PathBuf>,
+
+    /// Directory for book projects; default `<models>/projects`
+    #[arg(long, env = "PROMIN_PROJECTS_DIR")]
+    projects_dir: Option<PathBuf>,
+
+    /// Integrated loudness target (LUFS) for new projects
+    #[arg(long, env = "PROMIN_LOUDNESS_TARGET", default_value_t = -19.0)]
+    loudness_target: f64,
+
+    /// True-peak ceiling (dBTP) for new projects
+    #[arg(long, env = "PROMIN_TRUE_PEAK", default_value_t = -3.0)]
+    true_peak: f64,
 }
 
 #[derive(Clone)]
 struct AppState {
     service: Arc<SynthService>,
     jobs: Arc<JobManager>,
+    projects: Arc<ProjectStore>,
+    project_lock: Arc<tokio::sync::Mutex<()>>,
     pronunciation: Arc<PronunciationStore>,
+    default_loudness: LoudnessSettings,
+    public_url: String,
     api_keys: Arc<Vec<String>>,
 }
 
@@ -966,12 +986,50 @@ async fn main() -> anyhow::Result<()> {
         fallback
     };
     let store = Arc::new(speech_core::jobs::JobStore::new(&jobs_dir)?);
+
+    let default_loudness = LoudnessSettings {
+        enabled: true,
+        target_lufs: args.loudness_target,
+        true_peak_db: args.true_peak,
+    };
+    default_loudness
+        .validate()
+        .context("invalid loudness settings")?;
+    let preferred_projects = args
+        .projects_dir
+        .unwrap_or_else(|| args.models_dir.join("projects"));
+    let projects_dir = if writable_dir(&preferred_projects) {
+        preferred_projects
+    } else {
+        let fallback = std::env::temp_dir().join("promin-tts-projects");
+        tracing::warn!(
+            preferred = %preferred_projects.display(),
+            fallback = %fallback.display(),
+            "projects directory is not writable, using temporary directory"
+        );
+        fallback
+    };
+    let projects = Arc::new(ProjectStore::new(&projects_dir)?);
+    let reconciled = projects::reconcile_projects(&projects)?;
+    if reconciled > 0 {
+        tracing::warn!(projects = reconciled, "reconciled projects after restart");
+    }
+    tracing::info!(
+        projects_dir = %projects_dir.display(),
+        reconciled,
+        "book projects ready"
+    );
+    let project_lock = Arc::new(tokio::sync::Mutex::new(()));
+
     let public_url = args
         .public_url
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", args.http_addr.port()));
     let jobs = JobManager::new(
         Arc::clone(&store),
         Arc::clone(&service),
+        Arc::clone(&projects),
+        Arc::clone(&pronunciation),
+        Arc::clone(&project_lock),
         args.jobs_concurrency,
         public_url.clone(),
     )?;
@@ -997,7 +1055,11 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         service,
         jobs,
+        projects,
+        project_lock,
         pronunciation,
+        default_loudness,
+        public_url,
         api_keys,
     };
 
@@ -1034,6 +1096,45 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/tts/synthesize", post(synthesize))
         .route("/v1/tts/stream", post(synthesize_stream))
         .route("/v1/projects/generate-async", post(generate_async))
+        .route(
+            "/v1/projects",
+            get(projects::list_projects).post(projects::create_project),
+        )
+        .route("/v1/projects/import", post(projects::import_project))
+        .route(
+            "/v1/projects/{id}",
+            get(projects::get_project)
+                .put(projects::update_project)
+                .delete(projects::delete_project),
+        )
+        .route(
+            "/v1/projects/{id}/pronunciation",
+            put(projects::put_project_pronunciation),
+        )
+        .route(
+            "/v1/projects/{id}/generate",
+            post(projects::generate_project),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}",
+            get(projects::get_chapter).put(projects::update_chapter),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/audio",
+            get(projects::chapter_audio),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/subtitles",
+            get(projects::chapter_subtitles),
+        )
+        .route(
+            "/v1/projects/{id}/manifest",
+            get(projects::project_manifest),
+        )
+        .route(
+            "/v1/projects/{id}/speechproj",
+            get(projects::project_speechproj),
+        )
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/jobs/{id}/audio", get(job_audio))
@@ -1046,8 +1147,9 @@ async fn main() -> anyhow::Result<()> {
             get(get_pronunciation).put(put_pronunciation),
         )
         .route("/mcp", post(mcp::handle))
-        // `audio_base64` може містити WAV до 120 с (base64 ~30–60 МБ).
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        // `audio_base64` може містити WAV до 120 с (base64 ~30–60 МБ);
+        // для multipart-імпорту 64 МБ файлу потрібен запас на межі частин.
+        .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
