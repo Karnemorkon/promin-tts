@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,11 +26,15 @@ use tokio::sync::{broadcast, mpsc};
 mod downloader;
 mod jobs;
 mod mcp;
+mod pronunciation;
 mod service;
 mod wyoming;
 
 use downloader::{ensure_models, DownloadOptions};
 use jobs::{CancelOutcome, JobManager};
+use pronunciation::{
+    PronunciationFile, PronunciationPayload, PronunciationStore, PronunciationStoreError,
+};
 use service::{ModelPaths, StreamMeta, StreamSummary, SynthError, SynthService, VerbalizerMode};
 
 #[derive(Parser, Debug)]
@@ -71,12 +75,17 @@ struct Args {
     /// Wyoming TCP listen address for Home Assistant (`off` disables)
     #[arg(long, env = "PROMIN_WYOMING_ADDR", default_value = "0.0.0.0:10200")]
     wyoming_addr: String,
+
+    /// Global pronunciation dictionary; default `<data>/pronunciation.json`
+    #[arg(long, env = "PROMIN_PRONUNCIATION_FILE")]
+    pronunciation_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
     service: Arc<SynthService>,
     jobs: Arc<JobManager>,
+    pronunciation: Arc<PronunciationStore>,
     api_keys: Arc<Vec<String>>,
 }
 
@@ -147,6 +156,7 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "verbalizer": state.service.verbalizer_name(),
         "accentor": state.service.accentor_name(),
         "voice_encoder": state.service.voice_encoder_name(),
+        "pronunciation_rules": state.pronunciation.rule_count(),
     }))
 }
 
@@ -752,6 +762,34 @@ async fn openai_speech(
     }
 }
 
+/// `GET /v1/pronunciation`: глобальний словник вимови.
+async fn get_pronunciation(State(state): State<AppState>) -> Json<PronunciationFile> {
+    Json(PronunciationFile {
+        rules: state.pronunciation.rules(),
+    })
+}
+
+/// `PUT /v1/pronunciation`: замінити глобальний словник.
+async fn put_pronunciation(
+    State(state): State<AppState>,
+    Json(payload): Json<PronunciationPayload>,
+) -> Response {
+    match state.pronunciation.replace(payload.into_rules()) {
+        Ok(rules) => Json(PronunciationFile { rules }).into_response(),
+        Err(PronunciationStoreError::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+        Err(PronunciationStoreError::Io(error)) => {
+            tracing::error!(error = %error, "save pronunciation dictionary");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// `GET /v1/models`: мінімальний OpenAI-сумісний список моделей.
 async fn openai_models() -> Json<serde_json::Value> {
     Json(json!({
@@ -894,7 +932,24 @@ async fn main() -> anyhow::Result<()> {
         speakers_dir = %speakers_dir.display(),
         "loading models"
     );
-    let service = Arc::new(SynthService::load(&paths, args.threads, speakers_dir)?);
+    let data_dir = args
+        .models_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| StdPath::new("."));
+    let pronunciation_path = args
+        .pronunciation_file
+        .clone()
+        .unwrap_or_else(|| data_dir.join("pronunciation.json"));
+    let pronunciation = Arc::new(PronunciationStore::load(&pronunciation_path)?);
+    tracing::info!(
+        path = %pronunciation.path().display(),
+        rules = pronunciation.rule_count(),
+        "pronunciation dictionary ready"
+    );
+    let mut service = SynthService::load(&paths, args.threads, speakers_dir)?;
+    service.set_pronunciation_store(Arc::clone(&pronunciation));
+    let service = Arc::new(service);
 
     let preferred_jobs = args
         .jobs_dir
@@ -942,6 +997,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         service,
         jobs,
+        pronunciation,
         api_keys,
     };
 
@@ -985,6 +1041,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/audio/speech", post(openai_speech))
         .route("/v1/audio/voices", get(openai_voices))
         .route("/v1/models", get(openai_models))
+        .route(
+            "/v1/pronunciation",
+            get(get_pronunciation).put(put_pronunciation),
+        )
         .route("/mcp", post(mcp::handle))
         // `audio_base64` може містити WAV до 120 с (base64 ~30–60 МБ).
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))

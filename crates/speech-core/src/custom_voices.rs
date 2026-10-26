@@ -146,8 +146,10 @@ pub fn load_npy_f32_bytes(bytes: &[u8]) -> Result<Vec<f32>, CustomVoiceError> {
         return Err(CustomVoiceError::Npy("truncated data".into()));
     }
     Ok(bytes[header_end..header_end + data_len]
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 

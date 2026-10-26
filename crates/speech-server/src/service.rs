@@ -15,9 +15,12 @@ use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
 use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
+use speech_text::pronunciation::Pronouncer;
 use speech_text::segment::chunk_text;
 use speech_text::tokenizer::CharTokenizer;
 use speech_text::verbalize;
+
+use crate::pronunciation::PronunciationStore;
 
 /// Голос за замовчуванням (як у holos-cli).
 pub const DEFAULT_VOICE: &str = "Speaker_0";
@@ -277,6 +280,8 @@ pub struct SynthService {
     voice_encoder: Option<VoiceEncoder>,
     /// Кастомні голоси (`<dir>/<name>.npy`); порожній каталог -> вимкнено.
     custom_voices: CustomVoices,
+    /// Глобальний словник вимови; `None` -> без замін.
+    pronunciation: Option<Arc<PronunciationStore>>,
 }
 
 impl SynthService {
@@ -366,7 +371,13 @@ impl SynthService {
             neural,
             voice_encoder,
             custom_voices,
+            pronunciation: None,
         })
+    }
+
+    /// Підключити глобальний словник вимови (до загортання в `Arc`).
+    pub fn set_pronunciation_store(&mut self, store: Arc<PronunciationStore>) {
+        self.pronunciation = Some(store);
     }
 
     pub fn voice_names(&self) -> Vec<&str> {
@@ -499,9 +510,23 @@ impl SynthService {
         self.custom_voices.remove(name).map_err(custom_voice_error)
     }
 
-    /// Застосовує обраний режим; neural -> rule, якщо модель недоступна/впала.
-    fn apply_verbalizer(&self, text: &str, mode: VerbalizerMode) -> (String, &'static str, u64) {
+    /// Застосовує словник вимови, потім обраний режим вербалізації;
+    /// neural -> rule, якщо модель недоступна/впала.
+    fn apply_verbalizer(
+        &self,
+        text: &str,
+        mode: VerbalizerMode,
+        pronunciation: Option<&Pronouncer>,
+    ) -> (String, &'static str, u64) {
         let started = Instant::now();
+        let pronounced = match pronunciation {
+            Some(pronouncer) => pronouncer.apply(text),
+            None => match &self.pronunciation {
+                Some(store) => store.pronouncer().apply(text),
+                None => std::borrow::Cow::Borrowed(text),
+            },
+        };
+        let text = pronounced.as_ref();
         let (out, applied) = match mode {
             VerbalizerMode::Off => (text.to_string(), "off"),
             VerbalizerMode::Rule => (verbalize::verbalize(text), "rule"),
@@ -550,7 +575,7 @@ impl SynthService {
     /// Вербалізація без синтезу (для `POST /api/verbalize`).
     pub fn verbalize_text(&self, text: &str, mode: VerbalizerMode) -> Result<String, SynthError> {
         let text = self.validate_text(text)?;
-        let (out, applied, vb_ms) = self.apply_verbalizer(text, mode);
+        let (out, applied, vb_ms) = self.apply_verbalizer(text, mode, None);
         tracing::debug!(mode = mode.name(), applied, vb_ms, "verbalized");
         Ok(out)
     }
@@ -617,6 +642,28 @@ impl SynthService {
         mode: VerbalizerMode,
         raw_stress: bool,
     ) -> Result<SynthPcmOutput, SynthError> {
+        self.synthesize_pcm_with_pronunciation(
+            text,
+            voice,
+            audio_base64,
+            speed,
+            mode,
+            raw_stress,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_pcm_with_pronunciation(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        audio_base64: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        pronunciation: Option<&Pronouncer>,
+    ) -> Result<SynthPcmOutput, SynthError> {
         let text = self.validate_text(text)?;
         self.validate_speed(speed)?;
 
@@ -625,7 +672,7 @@ impl SynthService {
             None => self.resolve_voice(voice)?,
         };
 
-        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode);
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
         tracing::debug!(verbalizer, vb_ms, "text verbalized");
         let samples =
             self.synthesize_verbalized_f32(&verbalized, &voice_vector, speed, raw_stress)?;
@@ -676,19 +723,56 @@ impl SynthService {
         raw_stress: bool,
         max_chars: usize,
         crossfade_ms: u32,
+        progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
+    ) -> Result<SynthPcmOutput, SynthError> {
+        self.synthesize_long_pcm_with_pronunciation(
+            text,
+            voice,
+            audio_base64,
+            speed,
+            mode,
+            raw_stress,
+            max_chars,
+            crossfade_ms,
+            None,
+            progress,
+        )
+    }
+
+    /// Довгий синтез із додатковим (проєктним) словником вимови.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_long_pcm_with_pronunciation(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        audio_base64: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        max_chars: usize,
+        crossfade_ms: u32,
+        pronunciation: Option<&Pronouncer>,
         mut progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
     ) -> Result<SynthPcmOutput, SynthError> {
         let text = self.validate_long_text(text)?;
         self.validate_speed(speed)?;
         if max_chars == 0 {
-            return self.synthesize_pcm(text, voice, audio_base64, speed, mode, raw_stress);
+            return self.synthesize_pcm_with_pronunciation(
+                text,
+                voice,
+                audio_base64,
+                speed,
+                mode,
+                raw_stress,
+                pronunciation,
+            );
         }
 
         let voice_vector = match audio_base64 {
             Some(reference) => self.encode_reference(reference)?,
             None => self.resolve_voice(voice)?,
         };
-        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode);
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
         tracing::debug!(verbalizer, vb_ms, "long text verbalized");
 
         let chunks = chunk_text(&verbalized, max_chars);
@@ -754,7 +838,7 @@ impl SynthService {
             Some(reference) => self.encode_reference(reference)?,
             None => self.resolve_voice(voice)?,
         };
-        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode);
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, None);
         let chunks = chunk_text(&verbalized, max_chars);
         if chunks.is_empty() {
             return Err(SynthError::BadRequest(

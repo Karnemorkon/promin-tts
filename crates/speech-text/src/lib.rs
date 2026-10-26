@@ -4,6 +4,7 @@ pub mod import;
 pub mod ipa;
 pub mod neural;
 pub mod phonemize;
+pub mod pronunciation;
 mod repl;
 pub mod segment;
 pub mod stress;
