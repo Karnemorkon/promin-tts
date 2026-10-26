@@ -5,6 +5,7 @@
 
 pub mod crossfade;
 pub mod decode;
+pub mod loudness;
 pub mod resample;
 
 pub use crossfade::{
@@ -12,6 +13,7 @@ pub use crossfade::{
     streaming_wav_header, wav_header,
 };
 pub use decode::decode_wav_f32;
+pub use loudness::{LoudnessMeasurement, LoudnessReport, LoudnessTarget};
 pub use resample::resample_to_24k;
 
 use std::io::Cursor;
