@@ -24,26 +24,30 @@ ENV ORT_STRATEGY=system \
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-RUN cargo build --release -p speech-server
+RUN cargo build --release -p speech-server --bins
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data/speakers
+    && mkdir -p /data/models /data/speakers /data/jobs
 
 COPY --from=builder /opt/ort/lib/ /opt/ort/lib/
 COPY --from=builder /build/target/release/speech-server /usr/local/bin/speech-server
+COPY --from=builder /build/target/release/promin-mcp /usr/local/bin/promin-mcp
 
 ENV LD_LIBRARY_PATH=/opt/ort/lib \
     PROMIN_HTTP_ADDR=0.0.0.0:8010 \
-    PROMIN_MODELS_DIR=/models \
+    PROMIN_WYOMING_ADDR=0.0.0.0:10200 \
+    PROMIN_MODELS_DIR=/data/models \
     PROMIN_SPEAKERS_DIR=/data/speakers \
+    PROMIN_JOBS_DIR=/data/jobs \
+    PROMIN_AUTO_DOWNLOAD=auto \
     PROMIN_THREADS=4 \
     RUST_LOG=info
 
-EXPOSE 8010
+EXPOSE 8010 10200
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8010/healthz || exit 1

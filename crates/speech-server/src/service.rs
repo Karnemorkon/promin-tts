@@ -7,11 +7,15 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
-use speech_audio::{decode_wav_f32, float_to_pcm16, resample_to_24k, wav_bytes, SAMPLE_RATE};
+use speech_audio::{
+    crossfade_concat, crossfade_samples, decode_wav_f32, float_to_pcm16, pcm16_bytes,
+    resample_to_24k, wav_bytes, SAMPLE_RATE,
+};
 use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
 use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
+use speech_text::segment::chunk_text;
 use speech_text::tokenizer::CharTokenizer;
 use speech_text::verbalize;
 
@@ -20,6 +24,9 @@ pub const DEFAULT_VOICE: &str = "Speaker_0";
 
 /// Обмеження довжини тексту в одному запиті.
 pub const MAX_TEXT_CHARS: usize = 5_000;
+
+/// Обмеження для асинхронних завдань / потокового синтезу довгого тексту.
+pub const MAX_JOB_TEXT_CHARS: usize = 200_000;
 
 /// Допустимий діапазон темпу.
 pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
@@ -82,6 +89,42 @@ pub struct SynthOutput {
     /// Фактично застосований режим (`off` / `rule` / `neural`).
     pub verbalizer: &'static str,
     pub vb_ms: u64,
+    /// Кількість чанків, з яких складено аудіо.
+    pub chunks: usize,
+    /// Тривалість аудіо в мілісекундах.
+    pub audio_ms: u64,
+}
+
+/// PCM-результат синтезу (без WAV-контейнера).
+#[derive(Debug)]
+pub struct SynthPcmOutput {
+    pub pcm: Vec<i16>,
+    pub verbalizer: &'static str,
+    pub vb_ms: u64,
+    pub chunks: usize,
+}
+
+impl SynthPcmOutput {
+    pub fn audio_ms(&self) -> u64 {
+        self.pcm.len() as u64 * 1000 / SAMPLE_RATE as u64
+    }
+}
+
+/// Метадані, готові до відправки клієнту перед першим аудіо-чанком.
+#[derive(Debug, Clone)]
+pub struct StreamMeta {
+    pub verbalizer: &'static str,
+    pub vb_ms: u64,
+    pub chunks: usize,
+}
+
+/// Підсумок потокового синтезу.
+#[derive(Debug, Clone)]
+pub struct StreamSummary {
+    pub verbalizer: &'static str,
+    pub vb_ms: u64,
+    pub chunks: usize,
+    pub audio_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +135,9 @@ pub enum SynthError {
     /// Функція недоступна на цьому сервері (HTTP 503).
     #[error("{0}")]
     Unavailable(String),
+    /// Синтез скасовано клієнтом (HTTP 409).
+    #[error("cancelled")]
+    Cancelled,
     /// Внутрішня помилка (HTTP 500).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -116,16 +162,21 @@ impl ModelPaths {
     /// `dir/tts/*` + `dir/stress/*`, з fallback на плоску розкладку `dir/*`.
     pub fn discover(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        let tts_dir = if dir.join("tts").is_dir() {
-            dir.join("tts")
-        } else {
-            dir.to_path_buf()
+        // Кожен обов'язковий файл шукаємо окремо: це підтримує змішану
+        // розкладку (flat-моделі + опційний `tts/voice_encoder.onnx`).
+        let tts_file = |name: &str| {
+            let nested = dir.join("tts").join(name);
+            if nested.is_file() {
+                nested
+            } else {
+                dir.join(name)
+            }
         };
-        let stress_dir = if dir.join("stress").is_dir() {
-            dir.join("stress")
-        } else {
-            dir.to_path_buf()
-        };
+        let stress_trie = ["stress/stress.trie", "stress.trie"]
+            .iter()
+            .map(|rel| dir.join(rel))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| dir.join("stress/stress.trie"));
 
         // Gemma-вербалізатор опційний: без нього працює rule fallback.
         let verbalizer = ["verbalizer/gemma-int8", "verbalizer", "gemma-int8", ""]
@@ -148,17 +199,17 @@ impl ModelPaths {
 
         // voice encoder опційний: без нього клонування вимкнено.
         let voice_encoder = [
-            tts_dir.join("voice_encoder.onnx"),
+            dir.join("tts/voice_encoder.onnx"),
             dir.join("voice_encoder.onnx"),
         ]
         .into_iter()
         .find(|candidate| candidate.is_file());
 
         let paths = Self {
-            model: tts_dir.join("holos_cpu_int8.onnx"),
-            vocab: tts_dir.join("vocab.json"),
-            voices: tts_dir.join("voices.json"),
-            stress_trie: stress_dir.join("stress.trie"),
+            model: tts_file("holos_cpu_int8.onnx"),
+            vocab: tts_file("vocab.json"),
+            voices: tts_file("voices.json"),
+            stress_trie,
             verbalizer,
             accentor,
             voice_encoder,
@@ -471,17 +522,29 @@ impl SynthService {
         (out, applied, started.elapsed().as_millis() as u64)
     }
 
-    fn validate_text<'a>(&self, text: &'a str) -> Result<&'a str, SynthError> {
+    fn validate_text_with_limit<'a>(
+        &self,
+        text: &'a str,
+        limit: usize,
+    ) -> Result<&'a str, SynthError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(SynthError::BadRequest("text must not be empty".into()));
         }
-        if text.chars().count() > MAX_TEXT_CHARS {
+        if text.chars().count() > limit {
             return Err(SynthError::BadRequest(format!(
-                "text is too long: max {MAX_TEXT_CHARS} characters"
+                "text is too long: max {limit} characters"
             )));
         }
         Ok(text)
+    }
+
+    fn validate_text<'a>(&self, text: &'a str) -> Result<&'a str, SynthError> {
+        self.validate_text_with_limit(text, MAX_TEXT_CHARS)
+    }
+
+    fn validate_long_text<'a>(&self, text: &'a str) -> Result<&'a str, SynthError> {
+        self.validate_text_with_limit(text, MAX_JOB_TEXT_CHARS)
     }
 
     /// Вербалізація без синтезу (для `POST /api/verbalize`).
@@ -490,6 +553,88 @@ impl SynthService {
         let (out, applied, vb_ms) = self.apply_verbalizer(text, mode);
         tracing::debug!(mode = mode.name(), applied, vb_ms, "verbalized");
         Ok(out)
+    }
+
+    fn validate_speed(&self, speed: f32) -> Result<(), SynthError> {
+        if !speed.is_finite() || !SPEED_RANGE.contains(&speed) {
+            return Err(SynthError::BadRequest(format!(
+                "speed must be in {}..={}",
+                SPEED_RANGE.start(),
+                SPEED_RANGE.end()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Фонеми -> ONNX -> float32-семпли (один або кілька викликів моделі).
+    fn synthesize_verbalized_f32(
+        &self,
+        text: &str,
+        voice_vector: &[f32],
+        speed: f32,
+        raw_stress: bool,
+    ) -> Result<Vec<f32>, SynthError> {
+        let parts = self.phonemizer.phonemize(text, raw_stress);
+        if parts.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+
+        let mut samples = Vec::new();
+        for part in parts {
+            let ids = self.tokenizer.encode(&part);
+            if ids.is_empty() {
+                continue;
+            }
+            // Один важкий ONNX-виклик за раз: модель int8 і так вантажить усі ядра.
+            let engine = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let chunk = engine
+                .generate(&ids, voice_vector, speed)
+                .with_context(|| format!("generate audio for phonemes {part:?}"))?;
+            drop(engine);
+            samples.extend_from_slice(&chunk);
+        }
+
+        if samples.is_empty() {
+            return Err(SynthError::Internal(anyhow::anyhow!(
+                "model produced no audio samples"
+            )));
+        }
+        Ok(samples)
+    }
+
+    /// Короткий синтез (без нарізки тексту) у PCM16.
+    pub fn synthesize_pcm(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        audio_base64: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+    ) -> Result<SynthPcmOutput, SynthError> {
+        let text = self.validate_text(text)?;
+        self.validate_speed(speed)?;
+
+        let voice_vector = match audio_base64 {
+            Some(reference) => self.encode_reference(reference)?,
+            None => self.resolve_voice(voice)?,
+        };
+
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode);
+        tracing::debug!(verbalizer, vb_ms, "text verbalized");
+        let samples =
+            self.synthesize_verbalized_f32(&verbalized, &voice_vector, speed, raw_stress)?;
+        Ok(SynthPcmOutput {
+            pcm: float_to_pcm16(&samples),
+            verbalizer,
+            vb_ms,
+            chunks: 1,
+        })
     }
 
     /// Повний ланцюжок: текст -> вербалізація -> фонеми -> ONNX -> PCM16 -> WAV.
@@ -505,61 +650,143 @@ impl SynthService {
         mode: VerbalizerMode,
         raw_stress: bool,
     ) -> Result<SynthOutput, SynthError> {
-        let text = self.validate_text(text)?;
-        if !speed.is_finite() || !SPEED_RANGE.contains(&speed) {
-            return Err(SynthError::BadRequest(format!(
-                "speed must be in {}..={}",
-                SPEED_RANGE.start(),
-                SPEED_RANGE.end()
-            )));
+        let pcm = self.synthesize_pcm(text, voice, audio_base64, speed, mode, raw_stress)?;
+        let wav = wav_bytes(&pcm.pcm, SAMPLE_RATE).map_err(SynthError::Internal)?;
+        Ok(SynthOutput {
+            wav,
+            verbalizer: pcm.verbalizer,
+            vb_ms: pcm.vb_ms,
+            chunks: pcm.chunks,
+            audio_ms: pcm.audio_ms(),
+        })
+    }
+
+    /// Довгий текст: нарізка на чанки, кросфейд, одна пікова нормалізація.
+    ///
+    /// `progress(done, total)` викликається перед першим чанком і після кожного;
+    /// `false` означає скасування.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_long_pcm(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        audio_base64: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        max_chars: usize,
+        crossfade_ms: u32,
+        mut progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
+    ) -> Result<SynthPcmOutput, SynthError> {
+        let text = self.validate_long_text(text)?;
+        self.validate_speed(speed)?;
+        if max_chars == 0 {
+            return self.synthesize_pcm(text, voice, audio_base64, speed, mode, raw_stress);
         }
 
         let voice_vector = match audio_base64 {
             Some(reference) => self.encode_reference(reference)?,
             None => self.resolve_voice(voice)?,
         };
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode);
+        tracing::debug!(verbalizer, vb_ms, "long text verbalized");
 
-        let (text, applied, vb_ms) = self.apply_verbalizer(text, mode);
-        tracing::debug!(verbalizer = applied, vb_ms, "text verbalized");
+        let chunks = chunk_text(&verbalized, max_chars);
+        if chunks.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+        let total = chunks.len();
 
-        let parts = self.phonemizer.phonemize(&text, raw_stress);
-        if parts.is_empty() {
+        if let Some(cb) = progress.as_deref_mut() {
+            if !cb(0, total) {
+                return Err(SynthError::Cancelled);
+            }
+        }
+
+        let mut audio_chunks = Vec::with_capacity(total);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let samples =
+                self.synthesize_verbalized_f32(chunk, &voice_vector, speed, raw_stress)?;
+            audio_chunks.push(samples);
+            if let Some(cb) = progress.as_deref_mut() {
+                if !cb(index + 1, total) {
+                    return Err(SynthError::Cancelled);
+                }
+            }
+        }
+
+        let overlap = crossfade_samples(crossfade_ms.min(200), SAMPLE_RATE);
+        let samples = crossfade_concat(&audio_chunks, overlap);
+        Ok(SynthPcmOutput {
+            pcm: float_to_pcm16(&samples),
+            verbalizer,
+            vb_ms,
+            chunks: total,
+        })
+    }
+
+    /// Потоковий синтез: `on_ready` -> метадані, `on_chunk` -> PCM16-байти.
+    ///
+    /// `false` з будь-якого колбека означає, що клієнт відключився.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_stream_pcm<F, G>(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        audio_base64: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        max_chars: usize,
+        mut on_ready: F,
+        mut on_chunk: G,
+    ) -> Result<StreamSummary, SynthError>
+    where
+        F: FnMut(&StreamMeta) -> bool,
+        G: FnMut(&[u8]) -> bool,
+    {
+        let text = self.validate_long_text(text)?;
+        self.validate_speed(speed)?;
+
+        let voice_vector = match audio_base64 {
+            Some(reference) => self.encode_reference(reference)?,
+            None => self.resolve_voice(voice)?,
+        };
+        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode);
+        let chunks = chunk_text(&verbalized, max_chars);
+        if chunks.is_empty() {
             return Err(SynthError::BadRequest(
                 "text contains no speakable content".into(),
             ));
         }
 
-        // Один важкий ONNX-виклик за раз: модель int8 і так вантажить усі ядра.
-        let engine = self
-            .engine
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let mut samples = Vec::new();
-        for part in parts {
-            let ids = self.tokenizer.encode(&part);
-            if ids.is_empty() {
-                continue;
-            }
-            let chunk = engine
-                .generate(&ids, &voice_vector, speed)
-                .with_context(|| format!("generate audio for phonemes {part:?}"))?;
-            samples.extend_from_slice(&chunk);
-        }
-        drop(engine);
-
-        if samples.is_empty() {
-            return Err(SynthError::Internal(anyhow::anyhow!(
-                "model produced no audio samples"
-            )));
-        }
-
-        let pcm = float_to_pcm16(&samples);
-        let wav = wav_bytes(&pcm, SAMPLE_RATE).map_err(SynthError::Internal)?;
-        Ok(SynthOutput {
-            wav,
-            verbalizer: applied,
+        let meta = StreamMeta {
+            verbalizer,
             vb_ms,
+            chunks: chunks.len(),
+        };
+        if !on_ready(&meta) {
+            return Err(SynthError::Cancelled);
+        }
+
+        let mut audio_ms = 0u64;
+        for chunk in &chunks {
+            let samples =
+                self.synthesize_verbalized_f32(chunk, &voice_vector, speed, raw_stress)?;
+            let pcm = float_to_pcm16(&samples);
+            audio_ms += pcm.len() as u64 * 1000 / SAMPLE_RATE as u64;
+            if !on_chunk(&pcm16_bytes(&pcm)) {
+                break;
+            }
+        }
+
+        Ok(StreamSummary {
+            verbalizer,
+            vb_ms,
+            chunks: chunks.len(),
+            audio_ms,
         })
     }
 }
@@ -811,6 +1038,40 @@ mod tests {
         assert_eq!(paths.stress_trie, root.join("stress.trie"));
         assert!(paths.verbalizer.is_none());
         assert!(paths.accentor.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn discovers_mixed_flat_and_nested_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "promin-models-mixed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("tts")).unwrap();
+        for file in [
+            "holos_cpu_int8.onnx",
+            "vocab.json",
+            "voices.json",
+            "stress.trie",
+        ] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        // Автозавантаження опційного encoder-а створює `tts/` у flat-каталозі.
+        std::fs::write(root.join("tts/voice_encoder.onnx"), b"x").unwrap();
+
+        let paths = ModelPaths::discover(&root).expect("discover mixed layout");
+        assert_eq!(paths.model, root.join("holos_cpu_int8.onnx"));
+        assert_eq!(paths.vocab, root.join("vocab.json"));
+        assert_eq!(paths.voices, root.join("voices.json"));
+        assert_eq!(paths.stress_trie, root.join("stress.trie"));
+        assert_eq!(
+            paths.voice_encoder.as_deref(),
+            Some(root.join("tts/voice_encoder.onnx").as_path())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

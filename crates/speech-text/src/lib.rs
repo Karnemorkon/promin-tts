@@ -3,6 +3,7 @@ pub mod ipa;
 pub mod neural;
 pub mod phonemize;
 mod repl;
+pub mod segment;
 pub mod stress;
 pub mod text_prep;
 pub mod tokenizer;

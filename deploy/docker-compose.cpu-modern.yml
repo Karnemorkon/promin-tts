@@ -8,13 +8,26 @@ services:
     container_name: promin-tts
     ports:
       - "8010:8010"
+      - "10200:10200"
     environment:
       - PROMIN_HTTP_ADDR=0.0.0.0:8010
+      - PROMIN_WYOMING_ADDR=0.0.0.0:10200
       - PROMIN_MODELS_DIR=/data/models
+      - PROMIN_SPEAKERS_DIR=/data/speakers
+      - PROMIN_JOBS_DIR=/data/jobs
+      - PROMIN_JOBS_CONCURRENCY=${PROMIN_JOBS_CONCURRENCY:-1}
+      - PROMIN_PUBLIC_URL=${PROMIN_PUBLIC_URL:-http://localhost:8010}
+      - PROMIN_API_KEYS=${PROMIN_API_KEYS:-}
+      - PROMIN_AUTO_DOWNLOAD=${PROMIN_AUTO_DOWNLOAD:-auto}
+      - PROMIN_DOWNLOAD_OPTIONAL=${PROMIN_DOWNLOAD_OPTIONAL:-1}
       - RUST_LOG=info
     volumes:
       - promin_models:/data/models
+      - promin_speakers:/data/speakers
+      - promin_jobs:/data/jobs
     restart: unless-stopped
 
 volumes:
   promin_models:
+  promin_speakers:
+  promin_jobs:

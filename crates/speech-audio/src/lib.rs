@@ -3,9 +3,14 @@
 //! Порт `audio.cpp` з holos-tts-core: пікова нормалізація на весь масив,
 //! clip у [-1, 1], округлення `lround(x * 32767)`, WAV 24 кГц mono.
 
+pub mod crossfade;
 pub mod decode;
 pub mod resample;
 
+pub use crossfade::{
+    crossfade_concat, crossfade_samples, default_streaming_wav_header, pcm16_bytes,
+    streaming_wav_header, wav_header,
+};
 pub use decode::decode_wav_f32;
 pub use resample::resample_to_24k;
 

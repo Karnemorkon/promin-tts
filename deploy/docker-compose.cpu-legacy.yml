@@ -8,17 +8,31 @@ services:
     image: morkon06/promin-tts:cpu-legacy
     container_name: promin-tts
     ports:
-      - "8010:8010"
+      - "8010:8010"   # HTTP / REST / OpenAI / MCP
+      - "10200:10200" # Wyoming (Home Assistant)
     environment:
       - PROMIN_HTTP_ADDR=0.0.0.0:8010
+      - PROMIN_WYOMING_ADDR=0.0.0.0:10200
       - PROMIN_MODELS_DIR=/data/models
       - PROMIN_SPEAKERS_DIR=/data/speakers
+      - PROMIN_JOBS_DIR=/data/jobs
+      - PROMIN_JOBS_CONCURRENCY=${PROMIN_JOBS_CONCURRENCY:-1}
+      - PROMIN_PUBLIC_URL=${PROMIN_PUBLIC_URL:-http://localhost:8010}
+      # Comma-separated keys; empty disables authentication.
+      - PROMIN_API_KEYS=${PROMIN_API_KEYS:-}
+      # `auto` downloads missing models into a writable models volume.
+      - PROMIN_AUTO_DOWNLOAD=${PROMIN_AUTO_DOWNLOAD:-auto}
+      - PROMIN_DOWNLOAD_OPTIONAL=${PROMIN_DOWNLOAD_OPTIONAL:-1}
       - RUST_LOG=info
     volumes:
-      # Host directory with tts/ + stress/ (or flat layout). Read-only.
-      - ${PROMIN_MODELS_HOST:-../models}:/data/models:ro
+      # Host directory with tts/ + stress/ (or flat layout). Writable so that
+      # PROMIN_AUTO_DOWNLOAD=auto can fetch missing models; add `:ro` if the
+      # directory is fully populated and must stay immutable.
+      - ${PROMIN_MODELS_HOST:-../models}:/data/models
       # Writable directory for cloned voices (`<name>.npy`).
       - ${PROMIN_SPEAKERS_HOST:-../models/speakers}:/data/speakers
+      # Async jobs (`<id>.json` + `<id>.wav`), persisted across restarts.
+      - ${PROMIN_JOBS_HOST:-../models/jobs}:/data/jobs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/healthz"]

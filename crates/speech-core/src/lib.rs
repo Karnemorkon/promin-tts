@@ -1,6 +1,7 @@
 //! Бізнес-логіка Promin TTS: кастомні голоси, проєкти, черга генерації.
 
 pub mod custom_voices;
+pub mod jobs;
 
 pub fn crate_name() -> &'static str {
     "speech-core"
