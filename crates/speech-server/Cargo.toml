@@ -19,7 +19,7 @@ path = "src/bin/promin-mcp.rs"
 speech-audio = { path = "../speech-audio" }
 speech-core = { path = "../speech-core" }
 speech-inference = { path = "../speech-inference" }
-speech-text = { path = "../speech-text" }
+speech-text = { path = "../speech-text", features = ["import"] }
 
 anyhow.workspace = true
 async-stream.workspace = true
