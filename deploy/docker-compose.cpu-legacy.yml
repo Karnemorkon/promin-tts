@@ -16,7 +16,10 @@ services:
       - PROMIN_MODELS_DIR=/data/models
       - PROMIN_SPEAKERS_DIR=/data/speakers
       - PROMIN_JOBS_DIR=/data/jobs
+      - PROMIN_PROJECTS_DIR=/data/projects
       - PROMIN_JOBS_CONCURRENCY=${PROMIN_JOBS_CONCURRENCY:-1}
+      - PROMIN_LOUDNESS_TARGET=${PROMIN_LOUDNESS_TARGET:--19}
+      - PROMIN_TRUE_PEAK=${PROMIN_TRUE_PEAK:--3}
       - PROMIN_PUBLIC_URL=${PROMIN_PUBLIC_URL:-http://localhost:8010}
       # Comma-separated keys; empty disables authentication.
       - PROMIN_API_KEYS=${PROMIN_API_KEYS:-}
@@ -33,6 +36,8 @@ services:
       - ${PROMIN_SPEAKERS_HOST:-../models/speakers}:/data/speakers
       # Async jobs (`<id>.json` + `<id>.wav`), persisted across restarts.
       - ${PROMIN_JOBS_HOST:-../models/jobs}:/data/jobs
+      # Audiobook projects (`<id>/project.json` + chapter WAV files).
+      - ${PROMIN_PROJECTS_HOST:-../models/projects}:/data/projects
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/healthz"]

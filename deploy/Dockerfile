@@ -31,7 +31,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /data/models /data/speakers /data/jobs
+    && mkdir -p /data/models /data/speakers /data/jobs /data/projects
 
 COPY --from=builder /opt/ort/lib/ /opt/ort/lib/
 COPY --from=builder /build/target/release/speech-server /usr/local/bin/speech-server
@@ -43,6 +43,9 @@ ENV LD_LIBRARY_PATH=/opt/ort/lib \
     PROMIN_MODELS_DIR=/data/models \
     PROMIN_SPEAKERS_DIR=/data/speakers \
     PROMIN_JOBS_DIR=/data/jobs \
+    PROMIN_PROJECTS_DIR=/data/projects \
+    PROMIN_LOUDNESS_TARGET=-19 \
+    PROMIN_TRUE_PEAK=-3 \
     PROMIN_AUTO_DOWNLOAD=auto \
     PROMIN_THREADS=4 \
     RUST_LOG=info

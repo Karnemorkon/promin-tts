@@ -1,13 +1,14 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.5 adds async jobs, SSE, streaming WAV, OpenAI-compatible API, API keys, webhooks, model auto-download, Wyoming (Home Assistant) and MCP.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.6 adds audiobook projects, EPUB/FB2/DOCX/TXT/Markdown import, chapter generation, ACX loudness normalization, SRT/VTT subtitles and `.speechproj` manifests.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.5 «Server & Integrations»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
-плюс клонування голосу, асинхронна черга, потоковий синтез та інтеграції.
+**v0.6 «Books & Projects»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
+плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції та
+озвучення книг по главах з LUFS-нормалізацією і субтитрами.
 
 Реалізовано:
 
@@ -23,25 +24,34 @@
   numpy-сумісне): атомарний запис, рескан каталогу при кожному зверненні.
 - `speech-core::jobs` — файлове сховище завдань `<jobs>/<id>.json` + `<id>.wav`,
   атомарний запис, відновлення перерваних завдань після рестарту.
+- `speech-core::projects` — модель книги/глав, статуси, `.speechproj` (JSON),
+  атомарне сховище `<projects>/<id>/project.json` + `chapters/<n>.wav`.
+- `speech-text::import` — EPUB 2/3, FB2 (UTF-8/CP1251), DOCX, TXT, Markdown;
+  захист ZIP, ліміти розміру/глав, розбиття великих XHTML за заголовками.
+- `speech-text::pronunciation` — глобальні та проєктні правила вимови
+  (підрядок/regex, регістронезалежність), проєктні перекривають глобальні.
 - `speech-audio` — PCM16 з піковою нормалізацією + WAV 24 кГц mono; декодування
   WAV (PCM 8/16/24/32, float32, багатоканальне → моно), ресемплінг через `rubato`,
   рівнопотужний кросфейд між чанками.
+- `speech-audio::loudness` — EBU R128 / ACX: вимірювання LUFS + true peak,
+  статичний gain, look-ahead лімітер, фінальна TP-корекція (типово −19 LUFS / −3 dBTP).
 - `speech-text::verbalize` — rule-вербалізатор: числа, дати, час. Golden 68/68.
 - `speech-inference::gemma` — Gemma-3-270M INT8 з KV-кешем; golden 46/46,
   token IDs звірені 1:1 із системним SentencePiece 0.2.0.
 - `speech-inference` — ONNX Runtime 1.31.0 (офіційний x64 build; перевірено на
   AVX-only Xeon E5-2650), автоматичний біндінг входів `tokens` / `voice` / `speed`.
 - `speech-server` — Axum: REST, streaming WAV, асинхронні job-и + SSE, webhook-и,
-  OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP.
+  OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP,
+  API проєктів книг, імпорт, генерація глав, SRT/VTT, `.speechproj`.
 
 ## Архітектура
 
 ```
 crates/
-├── speech-core/        # Бізнес-логіка: кастомні голоси (.npy), черга та сховище job-ів
-├── speech-text/        # Препроцесинг: нормалізація, вербалізація, наголоси, IPA, чанки
+├── speech-core/        # Голоси (.npy), job-и, проєкти книг, `.speechproj`
+├── speech-text/        # Препроцесинг, вербалізація, наголоси, IPA, чанки, імпорт, вимова
 ├── speech-inference/   # ONNX Runtime: TTS-генератор, Gemma, accentor, voice encoder
-├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд
+├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP
 └── speech-server/      # Axum + Wyoming + MCP (HTTP і stdio-проксі promin-mcp)
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
 ```
@@ -66,12 +76,15 @@ models/
 │   ├── tokenizer.model
 │   └── config.json
 ├── speakers/                 # клоновані голоси: <name>.npy (float32[256])
-└── jobs/                     # асинхронні завдання: <id>.json + <id>.wav
+├── jobs/                     # асинхронні завдання: <id>.json + <id>.wav
+└── projects/                 # книги: <id>/project.json + chapters/<n>.wav
 ```
 
 Шлях до моделей задається через `PROMIN_MODELS_DIR`; каталог клонованих голосів —
 `PROMIN_SPEAKERS_DIR` (типово `<models>/speakers`), job-ів — `PROMIN_JOBS_DIR`
-(типово `<models>/jobs`). Без `voice_encoder.onnx` клонування вимкнено
+(типово `<models>/jobs`), проєктів — `PROMIN_PROJECTS_DIR` (типово
+`<models>/projects`). Глобальний словник вимови — `<data>/pronunciation.json`
+(override: `PROMIN_PRONUNCIATION_FILE`). Без `voice_encoder.onnx` клонування вимкнено
 (`/healthz` → `"voice_encoder":"off"`, енролмент → HTTP 503).
 
 ### Автозавантаження моделей
@@ -97,11 +110,12 @@ models/
 ## Швидкий старт (Docker)
 
 ```bash
-mkdir -p /srv/promin/{models,speakers,jobs}
+mkdir -p /srv/promin/{models,speakers,jobs,projects}
 
 PROMIN_MODELS_HOST=/srv/promin/models \
 PROMIN_SPEAKERS_HOST=/srv/promin/speakers \
 PROMIN_JOBS_HOST=/srv/promin/jobs \
+PROMIN_PROJECTS_HOST=/srv/promin/projects \
 PROMIN_API_KEYS=change-me \
 PROMIN_PUBLIC_URL=http://192.168.1.10:8010 \
   docker compose -f deploy/docker-compose.cpu-legacy.yml up -d --build
@@ -159,6 +173,7 @@ export LD_LIBRARY_PATH=/opt/ort-1.31.0/lib
 export PROMIN_MODELS_DIR=/path/to/models
 export PROMIN_SPEAKERS_DIR=/path/to/models/speakers
 export PROMIN_JOBS_DIR=/path/to/models/jobs
+export PROMIN_PROJECTS_DIR=/path/to/models/projects
 export PROMIN_WYOMING_ADDR=127.0.0.1:10200
 
 cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
@@ -180,7 +195,20 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `POST` | `/api/synthesize/stream` | Те саме, але потоковий WAV (chunked) |
 | `POST` | `/v1/tts/synthesize` | Синонім `/api/synthesize` |
 | `POST` | `/v1/tts/stream` | Синонім `/api/synthesize/stream` |
-| `POST` | `/v1/projects/generate-async` | Довгий текст → `202` + job record |
+| `POST` | `/v1/projects/generate-async` | Довгий текст → `202` + job record (legacy) |
+| `GET` | `/v1/projects` | Список книг |
+| `POST` | `/v1/projects` | Створити проєкт із JSON |
+| `POST` | `/v1/projects/import` | Multipart-імпорт EPUB/FB2/DOCX/TXT/MD або `.speechproj` |
+| `GET` | `/v1/projects/{id}` | Повний проєкт із главами |
+| `PUT` | `/v1/projects/{id}` | Метадані, налаштування синтезу, словник вимови |
+| `DELETE` | `/v1/projects/{id}` | Скасувати job-и глави та видалити проєкт |
+| `PUT` | `/v1/projects/{id}/pronunciation` | Замінити проєктний словник вимови |
+| `POST` | `/v1/projects/{id}/generate` | Поставити глави в чергу (`chapters?`, `force?`) |
+| `GET`/`PUT` | `/v1/projects/{id}/chapters/{i}` | Отримати/змінити назву й текст глави |
+| `GET` | `/v1/projects/{id}/chapters/{i}/audio` | Готовий WAV глави |
+| `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt` | Субтитри глави |
+| `GET` | `/v1/projects/{id}/manifest` | JSON-манифест із посиланнями на аудіо/субтитри |
+| `GET` | `/v1/projects/{id}/speechproj` | Скачати `.speechproj` |
 | `GET` | `/v1/jobs?limit=50` | Останні завдання |
 | `GET` | `/v1/jobs/{id}` | Статус, прогрес, метадані |
 | `DELETE` | `/v1/jobs/{id}` | Скасувати: 204, 404 або 409 (уже завершено) |
@@ -239,6 +267,87 @@ SSE надсилає початковий стан одразу, далі под
 Job-и зберігаються у `PROMIN_JOBS_DIR`; після рестарту незавершені позначаються
 `failed` («server restarted before completion»), завершені лишаються доступними.
 `PROMIN_JOBS_CONCURRENCY` (типово 1) обмежує одночасний синтез.
+
+### Книги та проєкти (v0.6)
+
+Проєкт — це книга з главами, налаштуваннями синтезу та власним словником вимови.
+Аудіо кожної глави генерується окремим job-ом і зберігається в
+`<projects>/<id>/chapters/<index>.wav`; `project.json` — атомарний манифест.
+
+Підтримка імпорту: **EPUB 2/3** (NCX/nav), **FB2** (UTF-8/CP1251), **DOCX**,
+**TXT**, **Markdown**, а також `.speechproj`. PDF відкладено до v0.7.
+Ліміти: 64 МБ на файл, 2000 глав, 200 000 символів на главу, 2 000 000 на книгу.
+
+```bash
+# Імпорт книги (multipart, поле `file`)
+curl -X POST http://localhost:8010/v1/projects/import \
+  -H 'Authorization: Bearer change-me' \
+  -F 'file=@frankenstein.epub'
+# -> 201 {"id":"...","title":"...","chapters":[...]}
+
+# Або створити проєкт вручну
+curl -X POST http://localhost:8010/v1/projects \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{
+    "title": "Моя книга",
+    "author": "Автор",
+    "chapters": [
+      {"title": "Розділ 1", "text": "Текст першого розділу."},
+      {"title": "Розділ 2", "text": "Текст другого розділу."}
+    ]
+  }'
+
+# Поставити всі незавершені глави в чергу
+curl -X POST http://localhost:8010/v1/projects/<id>/generate \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"force": false}'
+# -> 202 {"jobs":[{"job_id":"...","chapter_index":0}],"skipped":[],"errors":[]}
+
+# Прогрес — у проєкті або в job-і
+curl -H 'Authorization: Bearer change-me' http://localhost:8010/v1/projects/<id>
+curl -H 'Authorization: Bearer change-me' http://localhost:8010/v1/jobs/<job_id>
+
+# Готове аудіо та субтитри
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/chapters/0/audio -o chapter-0.wav
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8010/v1/projects/<id>/chapters/0/subtitles?format=srt' -o chapter-0.srt
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8010/v1/projects/<id>/chapters/0/subtitles?format=vtt' -o chapter-0.vtt
+```
+
+Статуси глави: `empty`, `queued`, `running`, `completed`, `failed`, `cancelled`,
+`stale`. Якщо текст, налаштування або словник вимови змінилися під час генерації,
+готова глава стає `stale` і потребує перегенерації (`force: true`). Після рестарту
+активні глави позначаються `failed`, а `completed` без файлу аудіо — `stale`.
+
+Нормалізація гучності типово ACX: **−19 LUFS** та **−3 dBTP** (можна змінити
+`PROMIN_LOUDNESS_TARGET`/`PROMIN_TRUE_PEAK` або `settings.loudness` проєкту).
+Ланцюжок: вимірювання → статичний gain → look-ahead лімітер → перевірка true peak.
+Субтитри будуються з пост-кросфейдних меж чанків і діляться на речення.
+
+```bash
+# Змінити налаштування проєкту (готові глави стануть stale)
+curl -X PUT http://localhost:8010/v1/projects/<id> \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"settings":{"voice":"Speaker_0","speed":1.0,"max_chars":1200,"crossfade_ms":40,"loudness":{"enabled":true,"target_lufs":-19,"true_peak_db":-3}}}'
+
+# Проєктний словник вимови (перекриває глобальний за однаковим pattern)
+curl -X PUT http://localhost:8010/v1/projects/<id>/pronunciation \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"rules":[{"pattern":"ІТ","replacement":"ай-ті","case_sensitive":true}]}'
+
+# Експорт/імпорт .speechproj (JSON без аудіо)
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/speechproj -o book.speechproj
+curl -X POST http://localhost:8010/v1/projects/import \
+  -H 'Authorization: Bearer change-me' \
+  -F 'file=@book.speechproj'
+```
 
 ### OpenAI-сумісний API
 
@@ -305,6 +414,10 @@ MCP audio content (`audio/wav` base64) і текст із метаданими.
 | `PROMIN_SPEAKERS_DIR` | `<models>/speakers` | Клоновані голоси |
 | `PROMIN_JOBS_DIR` | `<models>/jobs` | Job-и та аудіо |
 | `PROMIN_JOBS_CONCURRENCY` | `1` | Одночасних job-ів |
+| `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV) |
+| `PROMIN_PRONUNCIATION_FILE` | `<data>/pronunciation.json` | Глобальний словник вимови |
+| `PROMIN_LOUDNESS_TARGET` | `-19` | Ціль LUFS для нових проєктів |
+| `PROMIN_TRUE_PEAK` | `-3` | Ціль dBTP для нових проєктів |
 | `PROMIN_PUBLIC_URL` | `http://127.0.0.1:<port>` | База для `audio_url`/webhook |
 | `PROMIN_API_KEYS` | — | Ключі через кому; порожньо = без авторизації |
 | `PROMIN_THREADS` | `4` | ONNX intra-op threads |
@@ -319,11 +432,13 @@ export ORT_STRATEGY=system
 export ORT_LIB_LOCATION=/opt/ort-1.31.0/lib
 export LD_LIBRARY_PATH=/opt/ort-1.31.0/lib
 cargo test --workspace
+cargo test -p speech-text --features import
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Golden-тести accentor/Gemma/voice encoder потребують моделей і запускаються
-окремо (див. `crates/*/tests`).
+окремо (див. `crates/*/tests`). Імпорт книг перевіряється синтетичними
+EPUB2/EPUB3/FB2/DOCX/ZIP-фікстурами, LUFS — еталонним синусом і сплесками.
 
 ## Ліцензія та застереження
 

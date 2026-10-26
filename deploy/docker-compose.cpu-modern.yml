@@ -15,7 +15,10 @@ services:
       - PROMIN_MODELS_DIR=/data/models
       - PROMIN_SPEAKERS_DIR=/data/speakers
       - PROMIN_JOBS_DIR=/data/jobs
+      - PROMIN_PROJECTS_DIR=/data/projects
       - PROMIN_JOBS_CONCURRENCY=${PROMIN_JOBS_CONCURRENCY:-1}
+      - PROMIN_LOUDNESS_TARGET=${PROMIN_LOUDNESS_TARGET:--19}
+      - PROMIN_TRUE_PEAK=${PROMIN_TRUE_PEAK:--3}
       - PROMIN_PUBLIC_URL=${PROMIN_PUBLIC_URL:-http://localhost:8010}
       - PROMIN_API_KEYS=${PROMIN_API_KEYS:-}
       - PROMIN_AUTO_DOWNLOAD=${PROMIN_AUTO_DOWNLOAD:-auto}
@@ -25,9 +28,11 @@ services:
       - promin_models:/data/models
       - promin_speakers:/data/speakers
       - promin_jobs:/data/jobs
+      - promin_projects:/data/projects
     restart: unless-stopped
 
 volumes:
   promin_models:
   promin_speakers:
   promin_jobs:
+  promin_projects:
