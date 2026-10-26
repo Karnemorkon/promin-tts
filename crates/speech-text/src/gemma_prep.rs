@@ -204,6 +204,7 @@ mod tests {
     fn bare_digit_routing() {
         assert_eq!(match_bare_digits("12345678").as_deref(), Some("12345678"));
         assert_eq!(match_bare_digits("000000").as_deref(), Some("000000"));
+        assert_eq!(match_bare_digits("0000000").as_deref(), Some("0000000"));
         assert_eq!(match_bare_digits("007").as_deref(), Some("007"));
         assert_eq!(match_bare_digits("0000").as_deref(), Some("0000"));
         assert_eq!(
@@ -217,7 +218,11 @@ mod tests {
         assert_eq!(match_bare_digits("42"), None);
         assert_eq!(match_bare_digits("2026"), None);
         assert_eq!(match_bare_digits("10 000 001"), None);
+        assert_eq!(match_bare_digits("0800 500 000"), None);
         assert_eq!(match_bare_digits("У звіті 12345678."), None);
+        assert_eq!(match_bare_digits("У звіті вказано число 12345678."), None);
+        assert_eq!(match_bare_digits("12345678."), None);
+        assert_eq!(match_bare_digits("№1024"), None);
         assert_eq!(match_bare_digits(""), None);
     }
 
@@ -291,6 +296,10 @@ mod tests {
                 "Рахунок на 1 111 386,40 грн треба сплатити до 25.07.2026.",
             ),
             ("Борг 12 3456 789 гривень.", "Борг 123 456 789 гривень."),
+            (
+                "Борг 12\u{a0}3456\u{a0}789 гривень.",
+                "Борг 123 456 789 гривень.",
+            ),
             ("Оборот 1 111 386 гривень.", "Оборот 1 111 386 гривень."),
             ("Сума 10 000 001 грн.", "Сума 10 000 001 грн."),
             (

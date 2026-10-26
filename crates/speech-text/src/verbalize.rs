@@ -323,7 +323,8 @@ fn trim_right(s: &[u8], begin: usize) -> usize {
     end
 }
 
-fn strip_ws(s: &str) -> String {
+/// Trim ASCII whitespace + NBSP (як Python `str.strip` / PCRE `\s`).
+pub fn strip_ws(s: &str) -> String {
     let bytes = s.as_bytes();
     let b = trim_left(bytes);
     let e = trim_right(bytes, b);

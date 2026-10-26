@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use speech_audio::{float_to_pcm16, wav_bytes, SAMPLE_RATE};
-use speech_inference::TtsEngine;
+use speech_inference::{GemmaVerbalizer, TtsEngine};
 use speech_text::neural::NeuralVerbalizer;
 use speech_text::phonemize::Phonemizer;
 use speech_text::tokenizer::CharTokenizer;
@@ -195,8 +195,21 @@ impl SynthService {
             voices.keys().next().cloned().expect("voices is non-empty")
         };
 
-        // Нейромережевий вербалізатор підключається окремо (v0.2.1).
-        let neural: Option<Arc<dyn NeuralVerbalizer>> = None;
+        // Нейромережевий вербалізатор опційний: без моделі працює rule fallback.
+        let neural: Option<Arc<dyn NeuralVerbalizer>> = match &paths.verbalizer {
+            Some(dir) => match GemmaVerbalizer::from_dir(dir, intra_threads) {
+                Ok(engine) => Some(Arc::new(engine)),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        dir = %dir.display(),
+                        "gemma verbalizer unavailable, using rule fallback"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         tracing::info!(
             voices = voices.len(),

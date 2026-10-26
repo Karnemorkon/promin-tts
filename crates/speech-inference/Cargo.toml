@@ -8,8 +8,11 @@ rust-version.workspace = true
 description = "ONNX Runtime inference bindings: TTS generator, verbalizer, accentor, voice encoder"
 
 [dependencies]
+speech-text = { path = "../speech-text" }
+
 anyhow.workspace = true
 ndarray.workspace = true
 ort.workspace = true
+sentencepiece = { version = "0.14", features = ["static"] }
 thiserror.workspace = true
 tracing.workspace = true

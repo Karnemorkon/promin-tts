@@ -7,8 +7,8 @@
 ## Статус
 
 **v0.2 «Verbalizer»** — повний ланцюжок `текст → вербалізація → фонеми → ONNX → WAV`.
-Реалізовано rule-вербалізатор (числа, дати, час) і REST-ендпоінт `/api/verbalize`;
-Gemma-3-270M INT8 підключається наступним кроком.
+Працюють обидва вербалізатори: rule (числа, дати, час) і Gemma-3-270M INT8
+(decoder-only, KV-cache); без Gemma-моделі автоматично вмикається rule fallback.
 
 Реалізовано:
 
@@ -16,6 +16,11 @@ Gemma-3-270M INT8 підключається наступним кроком.
   2.9 млн форм), українська IPA-транскрипція. Фонеми звірені 1:1 з `holos-tts-core`.
 - `speech-text::verbalize` — rule-вербалізатор: кардинальні числа до 999 999 999 999,
   дати `ДД.ММ.РРРР`, час `ГГ:ХХ`. Golden-тест 68/68 проти C++ `holos::verbalize`.
+- `speech-text::gemma_prep` — поцифрове читання номерів і групування розрядів
+  (порт `gemma_prep`), 33/33 кейси C++.
+- `speech-inference::gemma` — Gemma-3-270M INT8 з KV-кешем: промпт Gemma-3 chat,
+  бан цифрових токенів, fallback на оригінал речення. Golden-тест 46/46;
+  token IDs звірені 1:1 із системним SentencePiece 0.2.0.
 - `speech-inference` — ONNX Runtime 1.17.3 (остання версія без вимоги AVX2),
   автоматичний біндінг входів `tokens` / `voice` / `speed`.
 - `speech-audio` — PCM16 з піковою нормалізацією + WAV 24 кГц mono.
@@ -78,7 +83,9 @@ Intel Xeon E5-2650 тощо. Саме тому образ фіксує ONNX Runt
 
 ## Локальний запуск
 
-Потрібен ONNX Runtime 1.17.3 (наприклад, у `/opt/ort/current`):
+Потрібен ONNX Runtime 1.17.3 (наприклад, у `/opt/ort/current`), а також `cmake`
+і `g++` — `sentencepiece-sys` збирає ту саму C++ бібліотеку, що використовує
+`holos-tts-core` (гарантує 1:1 token IDs).
 
 ```bash
 export ORT_STRATEGY=system

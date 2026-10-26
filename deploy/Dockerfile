@@ -7,8 +7,9 @@ ARG ORT_VERSION=1.17.3
 WORKDIR /build
 
 # Official ORT x64 build; 1.18+ requires AVX2 and would SIGILL on Xeon E5-2650.
+# cmake/g++ — для sentencepiece-sys (static, та сама C++ бібліотека, що в core).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl cmake g++ make \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL -o /tmp/ort.tgz \
         "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \

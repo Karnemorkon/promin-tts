@@ -1,6 +1,8 @@
 pub mod engine;
+pub mod gemma;
 
 pub use engine::{TtsEngine, VOICE_DIM};
+pub use gemma::GemmaVerbalizer;
 
 pub fn crate_name() -> &'static str {
     "speech-inference"
