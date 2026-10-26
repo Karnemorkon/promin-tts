@@ -6,25 +6,29 @@
 
 ## Статус
 
-**v0.1 «Core Parity»** — повний ланцюжок `текст → фонеми → ONNX → WAV` працює через REST.
-Повне технічне завдання: [tz-rust-tts-service-v5.md](tz-rust-tts-service-v5.md).
+**v0.2 «Verbalizer»** — повний ланцюжок `текст → вербалізація → фонеми → ONNX → WAV`.
+Реалізовано rule-вербалізатор (числа, дати, час) і REST-ендпоінт `/api/verbalize`;
+Gemma-3-270M INT8 підключається наступним кроком.
 
 Реалізовано:
 
 - `speech-text` — порт C++ препроцесу: нормалізація, словниковий наголос (marisa-trie,
   2.9 млн форм), українська IPA-транскрипція. Фонеми звірені 1:1 з `holos-tts-core`.
+- `speech-text::verbalize` — rule-вербалізатор: кардинальні числа до 999 999 999 999,
+  дати `ДД.ММ.РРРР`, час `ГГ:ХХ`. Golden-тест 68/68 проти C++ `holos::verbalize`.
 - `speech-inference` — ONNX Runtime 1.17.3 (остання версія без вимоги AVX2),
   автоматичний біндінг входів `tokens` / `voice` / `speed`.
 - `speech-audio` — PCM16 з піковою нормалізацією + WAV 24 кГц mono.
-- `speech-server` — Axum: `GET /healthz`, `GET /api/voices`, `POST /api/synthesize`.
+- `speech-server` — Axum: `GET /healthz`, `GET /api/voices`,
+  `POST /api/verbalize`, `POST /api/synthesize`.
 
 ## Архітектура
 
 ```
 crates/
 ├── speech-core/        # Бізнес-логіка, проєкти, черга генерації (каркас)
-├── speech-text/        # Препроцесинг: нормалізація, наголоси, IPA
-├── speech-inference/   # ONNX Runtime: TTS-генератор
+├── speech-text/        # Препроцесинг: нормалізація, вербалізація, наголоси, IPA
+├── speech-inference/   # ONNX Runtime: TTS-генератор (+ Gemma-вербалізатор)
 ├── speech-audio/       # PCM16, WAV-експорт
 └── speech-server/      # Axum: REST API
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
@@ -40,8 +44,11 @@ models/
 │   ├── holos_cpu_int8.onnx
 │   ├── vocab.json
 │   └── voices.json
-└── stress/
-    └── stress.trie
+├── stress/
+│   └── stress.trie
+└── verbalizer/gemma-int8/   # опційно: без нього працює rule fallback
+    ├── model.onnx
+    └── tokenizer.model
 ```
 
 Шлях задається через `PROMIN_MODELS_DIR`.
@@ -59,6 +66,11 @@ curl -X POST http://localhost:8010/api/synthesize \
   -H 'Content-Type: application/json' \
   -d '{"text":"Привіт, світе!","voice":"Speaker_0","speed":1.0}' \
   -o out.wav
+
+# Вербалізація чисел/дат без синтезу
+curl -X POST http://localhost:8010/api/verbalize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Ціна 1250 грн, зустріч о 14:30.","mode":"rule"}'
 ```
 
 Основна цільова платформа — сервери з процесорами, що мають лише **AVX** (без AVX2):
@@ -81,12 +93,18 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 
 | Метод | Шлях | Опис |
 |---|---|---|
-| `GET` | `/healthz` | Стан сервера, кількість голосів |
+| `GET` | `/healthz` | Стан сервера, кількість голосів, активний вербалізатор |
 | `GET` | `/api/voices` | Список голосів + голос за замовчуванням |
-| `POST` | `/api/synthesize` | `{text, voice?, speed?}` → `audio/wav` |
+| `POST` | `/api/verbalize` | `{text, mode?}` → `{text}`; `mode`: `neural` (типово), `rule`, `off` |
+| `POST` | `/api/synthesize` | `{text, voice?, speed?, auto_verbalize?, raw_stress?}` → `audio/wav` |
 
-`POST /v1/tts/synthesize` — синонім `/api/synthesize`. Обмеження v0.1:
-до 5000 символів на запит, `speed` у діапазоні `0.5..=2.0`.
+`POST /v1/tts/synthesize` — синонім `/api/synthesize`.
+
+- `auto_verbalize`: `true`/`false` або `"neural"`/`"rule"`/`"off"`; відсутнє ⇒ `neural`
+  (як у `holos-tts-core`). Якщо Gemma-моделі немає — автоматичний fallback на `rule`.
+- `raw_stress`: не додавати автоматичні наголоси (очікуються `+`/U+0301 у тексті).
+- Заголовки відповіді: `X-Promin-Verbalizer` (`off`/`rule`/`neural`) і `X-Promin-Vb-Ms`.
+- Обмеження: до 5000 символів на запит, `speed` у діапазоні `0.5..=2.0`.
 
 ## Ліцензія та застереження
 

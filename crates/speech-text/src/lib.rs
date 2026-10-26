@@ -1,10 +1,13 @@
+pub mod gemma_prep;
 pub mod ipa;
+pub mod neural;
 pub mod phonemize;
 mod repl;
 pub mod stress;
 pub mod text_prep;
 pub mod tokenizer;
 pub mod utf8;
+pub mod verbalize;
 
 pub fn crate_name() -> &'static str {
     "speech-text"

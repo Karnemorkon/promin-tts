@@ -2,22 +2,82 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use speech_audio::{float_to_pcm16, wav_bytes, SAMPLE_RATE};
 use speech_inference::TtsEngine;
+use speech_text::neural::NeuralVerbalizer;
 use speech_text::phonemize::Phonemizer;
 use speech_text::tokenizer::CharTokenizer;
+use speech_text::verbalize;
 
 /// Голос за замовчуванням (як у holos-cli).
 pub const DEFAULT_VOICE: &str = "Speaker_0";
 
-/// Обмеження довжини тексту в одному запиті (v0.1).
+/// Обмеження довжини тексту в одному запиті.
 pub const MAX_TEXT_CHARS: usize = 5_000;
 
 /// Допустимий діапазон темпу.
 pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+
+/// Режим вербалізації (як `VbMode` у C++-сервері).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbalizerMode {
+    Off,
+    Rule,
+    Neural,
+}
+
+impl VerbalizerMode {
+    /// `auto_verbalize` з тіла запиту: bool або рядок; відсутнє -> neural.
+    pub fn parse(value: Option<&serde_json::Value>) -> Self {
+        use serde_json::Value;
+        match value {
+            None => Self::Neural,
+            Some(Value::Bool(true)) => Self::Neural,
+            Some(Value::Bool(false)) => Self::Off,
+            Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+                "neural" | "true" | "1" => Self::Neural,
+                "rule" => Self::Rule,
+                "off" | "false" | "0" | "none" => Self::Off,
+                _ => Self::Neural,
+            },
+            // Як у C++: не bool/string -> neural.
+            Some(_) => Self::Neural,
+        }
+    }
+
+    pub fn parse_mode(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Neural,
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "neural" | "true" | "1" => Self::Neural,
+                "rule" => Self::Rule,
+                "off" | "false" | "0" | "none" => Self::Off,
+                _ => Self::Neural,
+            },
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Rule => "rule",
+            Self::Neural => "neural",
+        }
+    }
+}
+
+/// Результат синтезу: WAV + метадані вербалізації.
+#[derive(Debug)]
+pub struct SynthOutput {
+    pub wav: Vec<u8>,
+    /// Фактично застосований режим (`off` / `rule` / `neural`).
+    pub verbalizer: &'static str,
+    pub vb_ms: u64,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SynthError {
@@ -36,6 +96,8 @@ pub struct ModelPaths {
     pub vocab: PathBuf,
     pub voices: PathBuf,
     pub stress_trie: PathBuf,
+    /// Каталог Gemma-вербалізатора (`model.onnx` + `tokenizer.model`), якщо є.
+    pub verbalizer: Option<PathBuf>,
 }
 
 impl ModelPaths {
@@ -53,11 +115,21 @@ impl ModelPaths {
             dir.to_path_buf()
         };
 
+        // Gemma-вербалізатор опційний: без нього працює rule fallback.
+        let verbalizer = ["verbalizer/gemma-int8", "verbalizer", "gemma-int8", ""]
+            .iter()
+            .map(|rel| dir.join(rel))
+            .find(|candidate| {
+                candidate.join("model.onnx").is_file()
+                    && candidate.join("tokenizer.model").is_file()
+            });
+
         let paths = Self {
             model: tts_dir.join("holos_cpu_int8.onnx"),
             vocab: tts_dir.join("vocab.json"),
             voices: tts_dir.join("voices.json"),
             stress_trie: stress_dir.join("stress.trie"),
+            verbalizer,
         };
         paths.validate()?;
         Ok(paths)
@@ -104,6 +176,8 @@ pub struct SynthService {
     phonemizer: Phonemizer,
     voices: BTreeMap<String, Vec<f32>>,
     default_voice: String,
+    /// Gemma-вербалізатор; `None` -> rule fallback.
+    neural: Option<Arc<dyn NeuralVerbalizer>>,
 }
 
 impl SynthService {
@@ -121,10 +195,15 @@ impl SynthService {
             voices.keys().next().cloned().expect("voices is non-empty")
         };
 
+        // Нейромережевий вербалізатор підключається окремо (v0.2.1).
+        let neural: Option<Arc<dyn NeuralVerbalizer>> = None;
+
         tracing::info!(
             voices = voices.len(),
             default_voice = %default_voice,
             vocab = tokenizer.vocab_len(),
+            verbalizer = if neural.is_some() { "neural+rule" } else { "rule" },
+            verbalizer_dir = ?paths.verbalizer,
             "synthesis service ready"
         );
 
@@ -134,6 +213,7 @@ impl SynthService {
             phonemizer,
             voices,
             default_voice,
+            neural,
         })
     }
 
@@ -153,13 +233,39 @@ impl SynthService {
         SAMPLE_RATE
     }
 
-    /// Повний ланцюжок: текст -> фонеми -> токени -> ONNX -> PCM16 -> WAV.
-    pub fn synthesize_wav(
-        &self,
-        text: &str,
-        voice: Option<&str>,
-        speed: f32,
-    ) -> Result<Vec<u8>, SynthError> {
+    /// Фактично доступний вербалізатор для `/healthz`.
+    pub fn verbalizer_name(&self) -> &'static str {
+        if self.neural.is_some() {
+            "neural+rule"
+        } else {
+            "rule"
+        }
+    }
+
+    /// Застосовує обраний режим; neural -> rule, якщо модель недоступна/впала.
+    fn apply_verbalizer(&self, text: &str, mode: VerbalizerMode) -> (String, &'static str, u64) {
+        let started = Instant::now();
+        let (out, applied) = match mode {
+            VerbalizerMode::Off => (text.to_string(), "off"),
+            VerbalizerMode::Rule => (verbalize::verbalize(text), "rule"),
+            VerbalizerMode::Neural => match &self.neural {
+                Some(engine) => match engine.verbalize(text) {
+                    Ok(out) => (out, "neural"),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "neural verbalizer failed, falling back to rule"
+                        );
+                        (verbalize::verbalize(text), "rule")
+                    }
+                },
+                None => (verbalize::verbalize(text), "rule"),
+            },
+        };
+        (out, applied, started.elapsed().as_millis() as u64)
+    }
+
+    fn validate_text<'a>(&self, text: &'a str) -> Result<&'a str, SynthError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(SynthError::BadRequest("text must not be empty".into()));
@@ -169,6 +275,27 @@ impl SynthService {
                 "text is too long: max {MAX_TEXT_CHARS} characters"
             )));
         }
+        Ok(text)
+    }
+
+    /// Вербалізація без синтезу (для `POST /api/verbalize`).
+    pub fn verbalize_text(&self, text: &str, mode: VerbalizerMode) -> Result<String, SynthError> {
+        let text = self.validate_text(text)?;
+        let (out, applied, vb_ms) = self.apply_verbalizer(text, mode);
+        tracing::debug!(mode = mode.name(), applied, vb_ms, "verbalized");
+        Ok(out)
+    }
+
+    /// Повний ланцюжок: текст -> вербалізація -> фонеми -> ONNX -> PCM16 -> WAV.
+    pub fn synthesize_wav(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+    ) -> Result<SynthOutput, SynthError> {
+        let text = self.validate_text(text)?;
         if !speed.is_finite() || !SPEED_RANGE.contains(&speed) {
             return Err(SynthError::BadRequest(format!(
                 "speed must be in {}..={}",
@@ -183,7 +310,10 @@ impl SynthService {
             .get(voice_name)
             .ok_or_else(|| SynthError::BadRequest(format!("unknown voice: {voice_name}")))?;
 
-        let parts = self.phonemizer.phonemize(text, false);
+        let (text, applied, vb_ms) = self.apply_verbalizer(text, mode);
+        tracing::debug!(verbalizer = applied, vb_ms, "text verbalized");
+
+        let parts = self.phonemizer.phonemize(&text, raw_stress);
         if parts.is_empty() {
             return Err(SynthError::BadRequest(
                 "text contains no speakable content".into(),
@@ -216,7 +346,12 @@ impl SynthService {
         }
 
         let pcm = float_to_pcm16(&samples);
-        wav_bytes(&pcm, SAMPLE_RATE).map_err(SynthError::Internal)
+        let wav = wav_bytes(&pcm, SAMPLE_RATE).map_err(SynthError::Internal)?;
+        Ok(SynthOutput {
+            wav,
+            verbalizer: applied,
+            vb_ms,
+        })
     }
 }
 
@@ -234,6 +369,54 @@ mod tests {
     #[test]
     fn rejects_empty_voices() {
         assert!(parse_voices("{}").is_err());
+    }
+
+    #[test]
+    fn parses_verbalizer_modes() {
+        use serde_json::json;
+        assert_eq!(VerbalizerMode::parse(None), VerbalizerMode::Neural);
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!(true))),
+            VerbalizerMode::Neural
+        );
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!(false))),
+            VerbalizerMode::Off
+        );
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!("rule"))),
+            VerbalizerMode::Rule
+        );
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!("off"))),
+            VerbalizerMode::Off
+        );
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!("neural"))),
+            VerbalizerMode::Neural
+        );
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!("unknown"))),
+            VerbalizerMode::Neural
+        );
+        assert_eq!(
+            VerbalizerMode::parse(Some(&json!(0))),
+            VerbalizerMode::Neural
+        );
+    }
+
+    #[test]
+    fn parses_explicit_mode_strings() {
+        assert_eq!(VerbalizerMode::parse_mode(None), VerbalizerMode::Neural);
+        assert_eq!(
+            VerbalizerMode::parse_mode(Some("rule")),
+            VerbalizerMode::Rule
+        );
+        assert_eq!(VerbalizerMode::parse_mode(Some("OFF")), VerbalizerMode::Off);
+        assert_eq!(
+            VerbalizerMode::parse_mode(Some("nonsense")),
+            VerbalizerMode::Neural
+        );
     }
 
     #[test]
@@ -260,6 +443,44 @@ mod tests {
         let paths = ModelPaths::discover(&root).expect("discover nested layout");
         assert_eq!(paths.model, root.join("tts/holos_cpu_int8.onnx"));
         assert_eq!(paths.stress_trie, root.join("stress/stress.trie"));
+        assert!(paths.verbalizer.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovers_optional_verbalizer() {
+        let root = std::env::temp_dir().join(format!(
+            "promin-models-vb-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("tts")).unwrap();
+        std::fs::create_dir_all(root.join("stress")).unwrap();
+        std::fs::create_dir_all(root.join("verbalizer/gemma-int8")).unwrap();
+        for file in [
+            "tts/holos_cpu_int8.onnx",
+            "tts/vocab.json",
+            "tts/voices.json",
+            "stress/stress.trie",
+        ] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        for file in [
+            "verbalizer/gemma-int8/model.onnx",
+            "verbalizer/gemma-int8/tokenizer.model",
+        ] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+
+        let paths = ModelPaths::discover(&root).expect("discover verbalizer");
+        assert_eq!(
+            paths.verbalizer.as_deref(),
+            Some(root.join("verbalizer/gemma-int8").as_path())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -271,16 +492,17 @@ mod tests {
         let paths = ModelPaths::discover(dir).expect("discover models");
         let service = SynthService::load(&paths, 4).expect("load service");
 
-        let wav = service
-            .synthesize_wav("Привіт, світе!", None, 1.0)
+        let output = service
+            .synthesize_wav("Привіт, світе!", None, 1.0, VerbalizerMode::Off, false)
             .expect("synthesize");
 
-        let reader = hound::WavReader::new(std::io::Cursor::new(wav)).expect("parse WAV");
+        let reader = hound::WavReader::new(std::io::Cursor::new(output.wav)).expect("parse WAV");
         assert_eq!(reader.spec().sample_rate, SAMPLE_RATE);
         assert_eq!(reader.spec().channels, 1);
         assert_eq!(reader.spec().bits_per_sample, 16);
         // Еталон holos-cli: 28200 семплів (1.175 с) для цієї фрази.
         assert_eq!(reader.len(), 28_200);
+        assert_eq!(output.verbalizer, "off");
     }
 
     #[test]
@@ -306,6 +528,7 @@ mod tests {
         let paths = ModelPaths::discover(&root).expect("discover flat layout");
         assert_eq!(paths.model, root.join("holos_cpu_int8.onnx"));
         assert_eq!(paths.stress_trie, root.join("stress.trie"));
+        assert!(paths.verbalizer.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

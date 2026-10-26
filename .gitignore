@@ -10,3 +10,6 @@
 /.idea
 /.vscode
 .env
+
+# Local-only technical specification (not published)
+/tz-rust-tts-service-*.md
