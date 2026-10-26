@@ -41,7 +41,7 @@ fn has_ascii_digits(text: &str) -> bool {
 }
 
 #[test]
-#[ignore = "requires Gemma model: PROMIN_GEMMA_DIR + ORT 1.17"]
+#[ignore = "requires Gemma model: PROMIN_GEMMA_DIR + ORT 1.31"]
 fn gemma_matches_cpp_golden() {
     let Some(dir) = std::env::var_os("PROMIN_GEMMA_DIR").map(PathBuf::from) else {
         eprintln!("SKIP: PROMIN_GEMMA_DIR is not set");

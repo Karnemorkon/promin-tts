@@ -1,13 +1,14 @@
 # syntax=docker/dockerfile:1
 
-# CPU-legacy image: ONNX Runtime 1.17.3 (last release that works on AVX-only CPUs).
+# CPU-legacy image: ONNX Runtime 1.31.0 (official x64 build).
+# Verified on AVX-only Xeon E5-2650: no AVX2/FMA required for our models.
 FROM rust:1-bookworm AS builder
 
-ARG ORT_VERSION=1.17.3
+ARG ORT_VERSION=1.31.0
 WORKDIR /build
 
-# Official ORT x64 build; 1.18+ requires AVX2 and would SIGILL on Xeon E5-2650.
-# cmake/g++ — для sentencepiece-sys (static, та сама C++ бібліотека, що в core).
+# Official ORT x64 build. 1.31.0 reads IR version 10 (voice_encoder.onnx) and
+# still runs on AVX-only CPUs; cmake/g++ are for sentencepiece-sys (static).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl cmake g++ make \
     && rm -rf /var/lib/apt/lists/* \
@@ -29,7 +30,8 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/speakers
 
 COPY --from=builder /opt/ort/lib/ /opt/ort/lib/
 COPY --from=builder /build/target/release/speech-server /usr/local/bin/speech-server
@@ -37,6 +39,7 @@ COPY --from=builder /build/target/release/speech-server /usr/local/bin/speech-se
 ENV LD_LIBRARY_PATH=/opt/ort/lib \
     PROMIN_HTTP_ADDR=0.0.0.0:8010 \
     PROMIN_MODELS_DIR=/models \
+    PROMIN_SPEAKERS_DIR=/data/speakers \
     PROMIN_THREADS=4 \
     RUST_LOG=info
 

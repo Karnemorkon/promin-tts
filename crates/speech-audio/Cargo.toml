@@ -10,5 +10,6 @@ description = "DSP, crossfade, LUFS normalization, export helpers"
 [dependencies]
 anyhow.workspace = true
 hound.workspace = true
+rubato = "5"
 thiserror.workspace = true
 tracing.workspace = true

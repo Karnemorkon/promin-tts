@@ -12,10 +12,13 @@ services:
     environment:
       - PROMIN_HTTP_ADDR=0.0.0.0:8010
       - PROMIN_MODELS_DIR=/data/models
+      - PROMIN_SPEAKERS_DIR=/data/speakers
       - RUST_LOG=info
     volumes:
       # Host directory with tts/ + stress/ (or flat layout). Read-only.
       - ${PROMIN_MODELS_HOST:-../models}:/data/models:ro
+      # Writable directory for cloned voices (`<name>.npy`).
+      - ${PROMIN_SPEAKERS_HOST:-../models/speakers}:/data/speakers
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/healthz"]

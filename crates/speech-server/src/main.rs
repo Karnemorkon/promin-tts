@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use clap::Parser;
@@ -31,6 +31,10 @@ struct Args {
     /// ONNX intra-op threads
     #[arg(long, env = "PROMIN_THREADS", default_value_t = 4)]
     threads: i16,
+
+    /// Directory with cloned voices (`<name>.npy`); default `<models>/speakers`
+    #[arg(long, env = "PROMIN_SPEAKERS_DIR")]
+    speakers_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -43,6 +47,9 @@ struct SynthesizeRequest {
     text: String,
     #[serde(default)]
     voice: Option<String>,
+    /// WAV у base64: клонування голосу з референсу (пріоритет над `voice`).
+    #[serde(default)]
+    audio_base64: Option<String>,
     #[serde(default = "default_speed")]
     speed: f32,
     /// `true`/`false` або `"neural"`/`"rule"`/`"off"`; відсутнє -> neural.
@@ -72,8 +79,23 @@ struct VerbalizeResponse {
 #[derive(Debug, Serialize)]
 struct VoicesResponse {
     voices: Vec<String>,
+    /// Клоновані голоси (`<speakers>/<name>.npy`).
+    custom: Vec<String>,
     default: String,
     sample_rate: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnrollVoiceRequest {
+    name: String,
+    /// WAV у base64 (0.25–120 с, будь-яка частота; конвертується в 24 кГц).
+    audio_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrollVoiceResponse {
+    name: String,
+    dim: usize,
 }
 
 async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -82,9 +104,11 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "engine": "promin-tts",
         "version": env!("CARGO_PKG_VERSION"),
         "voices": state.service.voice_count(),
+        "custom_voices": state.service.custom_voice_count(),
         "sample_rate": state.service.sample_rate(),
         "verbalizer": state.service.verbalizer_name(),
         "accentor": state.service.accentor_name(),
+        "voice_encoder": state.service.voice_encoder_name(),
     }))
 }
 
@@ -96,9 +120,32 @@ async fn voices(State(state): State<AppState>) -> Json<VoicesResponse> {
             .into_iter()
             .map(str::to_owned)
             .collect(),
+        custom: state.service.custom_voice_names(),
         default: state.service.default_voice().to_owned(),
         sample_rate: state.service.sample_rate(),
     })
+}
+
+/// Помилка сервісу -> HTTP-відповідь (`400`/`503`/`500`).
+fn synth_error_response(error: SynthError, context: &'static str) -> Response {
+    match error {
+        SynthError::BadRequest(message) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+        SynthError::Unavailable(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": message })),
+        )
+            .into_response(),
+        SynthError::Internal(error) => {
+            tracing::error!(error = %error, context, "request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn synthesize(
@@ -111,6 +158,7 @@ async fn synthesize(
         service.synthesize_wav(
             &request.text,
             request.voice.as_deref(),
+            request.audio_base64.as_deref(),
             request.speed,
             mode,
             request.raw_stress,
@@ -133,17 +181,7 @@ async fn synthesize(
             );
             (headers, output.wav).into_response()
         }
-        Ok(Err(SynthError::BadRequest(message))) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
-        }
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, "synthesis failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": error.to_string() })),
-            )
-                .into_response()
-        }
+        Ok(Err(error)) => synth_error_response(error, "synthesis"),
         Err(join_error) => {
             tracing::error!(error = %join_error, "synthesis task panicked");
             (
@@ -166,19 +204,62 @@ async fn verbalize(
 
     match result {
         Ok(Ok(text)) => Json(VerbalizeResponse { text }).into_response(),
-        Ok(Err(SynthError::BadRequest(message))) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
-        }
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, "verbalization failed");
+        Ok(Err(error)) => synth_error_response(error, "verbalization"),
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "verbalization task panicked");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": error.to_string() })),
+                Json(json!({ "error": "internal task error" })),
             )
                 .into_response()
         }
+    }
+}
+
+/// `POST /api/voices`: WAV-референс -> `<speakers>/<name>.npy`.
+async fn enroll_voice(
+    State(state): State<AppState>,
+    Json(request): Json<EnrollVoiceRequest>,
+) -> Response {
+    let EnrollVoiceRequest { name, audio_base64 } = request;
+    let task_name = name.clone();
+    let service = Arc::clone(&state.service);
+    let result =
+        tokio::task::spawn_blocking(move || service.enroll_voice(&task_name, &audio_base64)).await;
+
+    match result {
+        Ok(Ok(())) => Json(EnrollVoiceResponse {
+            name,
+            dim: speech_core::custom_voices::VOICE_DIM,
+        })
+        .into_response(),
+        Ok(Err(error)) => synth_error_response(error, "voice enrollment"),
         Err(join_error) => {
-            tracing::error!(error = %join_error, "verbalization task panicked");
+            tracing::error!(error = %join_error, "voice enrollment task panicked");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal task error" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `DELETE /api/voices/{name}`: 204, якщо видалено; 404, якщо голосу немає.
+async fn delete_voice(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let service = Arc::clone(&state.service);
+    let result = tokio::task::spawn_blocking(move || service.delete_voice(&name)).await;
+
+    match result {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "unknown custom voice" })),
+        )
+            .into_response(),
+        Ok(Err(error)) => synth_error_response(error, "voice deletion"),
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "voice deletion task panicked");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "internal task error" })),
@@ -204,15 +285,25 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let paths = ModelPaths::discover(&args.models_dir)?;
-    tracing::info!(models_dir = %args.models_dir.display(), "loading models");
-    let service = Arc::new(SynthService::load(&paths, args.threads)?);
+    let speakers_dir = args
+        .speakers_dir
+        .unwrap_or_else(|| args.models_dir.join("speakers"));
+    tracing::info!(
+        models_dir = %args.models_dir.display(),
+        speakers_dir = %speakers_dir.display(),
+        "loading models"
+    );
+    let service = Arc::new(SynthService::load(&paths, args.threads, speakers_dir)?);
 
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .route("/api/voices", get(voices))
+        .route("/api/voices", get(voices).post(enroll_voice))
+        .route("/api/voices/{name}", delete(delete_voice))
         .route("/api/verbalize", post(verbalize))
         .route("/api/synthesize", post(synthesize))
         .route("/v1/tts/synthesize", post(synthesize))
+        // `audio_base64` може містити WAV до 120 с (base64 ~30–60 МБ).
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(AppState { service });
 
     let listener = tokio::net::TcpListener::bind(args.http_addr).await?;

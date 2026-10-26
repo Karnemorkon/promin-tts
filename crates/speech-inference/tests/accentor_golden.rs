@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use speech_inference::Accentor;
 
 #[test]
-#[ignore = "requires accentor-lite.onnx: PROMIN_ACCENTOR + ORT 1.17"]
+#[ignore = "requires accentor-lite.onnx: PROMIN_ACCENTOR + ORT 1.31"]
 fn accentor_matches_cpp_golden() {
     let Some(path) = std::env::var_os("PROMIN_ACCENTOR").map(PathBuf::from) else {
         eprintln!("SKIP: PROMIN_ACCENTOR is not set");

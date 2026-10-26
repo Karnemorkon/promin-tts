@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires models + ORT 1.17: ORT_STRATEGY=system ORT_LIB_LOCATION=<ort>/lib PROMIN_MODELS_DIR=<dir>"]
+    #[ignore = "requires models + ORT 1.31: ORT_STRATEGY=system ORT_LIB_LOCATION=<ort>/lib PROMIN_MODELS_DIR=<dir>"]
     fn load_holos_model() {
         let dir = std::env::var("PROMIN_MODELS_DIR").expect("PROMIN_MODELS_DIR not set");
         let nested = Path::new(&dir).join("tts/holos_cpu_int8.onnx");

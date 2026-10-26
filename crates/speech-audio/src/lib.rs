@@ -1,7 +1,13 @@
-//! Аудіо-хелпери: float32 -> PCM16, WAV (PCM16 mono).
+//! Аудіо-хелпери: float32 -> PCM16, WAV (PCM16 mono), декодування та ресемплінг.
 //!
 //! Порт `audio.cpp` з holos-tts-core: пікова нормалізація на весь масив,
 //! clip у [-1, 1], округлення `lround(x * 32767)`, WAV 24 кГц mono.
+
+pub mod decode;
+pub mod resample;
+
+pub use decode::decode_wav_f32;
+pub use resample::resample_to_24k;
 
 use std::io::Cursor;
 use std::path::Path;

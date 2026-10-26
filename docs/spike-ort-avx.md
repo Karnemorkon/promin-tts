@@ -4,6 +4,12 @@
 **Платформа:** 192.168.22.146 — Debian 13, 2× Xeon E5-2650 (Sandy Bridge-EP, 16C/32T), 24 GB RAM, **лише AVX** (без AVX2 / FMA / BMI2), без GPU.
 **Мета:** обрати стратегію інтеграції `ort` crate з ONNX Runtime так, щоб синтез працював на процесорах без AVX2 без `SIGILL`.
 
+> **Оновлення 2026-10-26 (v0.4):** офіційний prebuilt **ORT 1.31.0** перевірено на цьому ж
+> AVX-only E5-2650: TTS, Gemma, accentor і voice encoder golden-тести проходять без `SIGILL`,
+> включно з моделлю IR version 10 (`voice_encoder.onnx`). Проєкт перейшов на ORT 1.31.0;
+> розділи нижче збережено як історію spike v0.1 (проблема була в pyke-бінарниках 2.0-rc,
+> а не в офіційних prebuilt 1.31.x).
+
 ## Результати
 
 | Конфігурація | Результат |
@@ -11,7 +17,8 @@
 | `ort = { git = "https://github.com/pykeio/ort", tag = "v1.16.3" }` (ORT 1.16.0, pyke prebuilt CPU) | **PASS** — інференс MNIST onnx виконано, exit 0, без SIGILL |
 | `ort = "=2.0.0-rc.15"` (pyke prebuilt binaries) | **FAIL** — `Illegal instruction` (exit 132) + вбудоване попередження: *"This CPU does not support AVX2 … use a custom build of ONNX Runtime to fix"* |
 
-Висновок прямо підтверджує документацію ONNX Runtime: **офіційні prebuilt-бінарники ORT ≥1.18 вимагають AVX2**; остання лінійка, що працює на AVX-only — ORT ≤1.17.
+Висновок: **pyke-бінарники `ort` 2.0-rc.15 (ORT ≥1.18) вимагають AVX2**; натомість офіційний
+prebuilt ORT 1.31.0 на тому ж CPU працює (див. оновлення вище). Для v0.1 обрано ORT 1.17.3.
 
 ## Рішення (v0.1) — фінальне
 

@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use speech_audio::{float_to_pcm16, wav_bytes, SAMPLE_RATE};
-use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine};
+use base64::Engine as _;
+use speech_audio::{decode_wav_f32, float_to_pcm16, resample_to_24k, wav_bytes, SAMPLE_RATE};
+use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
+use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
 use speech_text::tokenizer::CharTokenizer;
@@ -21,6 +23,9 @@ pub const MAX_TEXT_CHARS: usize = 5_000;
 
 /// Допустимий діапазон темпу.
 pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
+
+/// Референс для клонування: мінімальна та максимальна тривалість (секунди).
+pub const REFERENCE_SECONDS: std::ops::RangeInclusive<f32> = 0.25..=120.0;
 
 /// Режим вербалізації (як `VbMode` у C++-сервері).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +89,9 @@ pub enum SynthError {
     /// Некоректний запит клієнта (HTTP 400).
     #[error("{0}")]
     BadRequest(String),
+    /// Функція недоступна на цьому сервері (HTTP 503).
+    #[error("{0}")]
+    Unavailable(String),
     /// Внутрішня помилка (HTTP 500).
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -100,6 +108,8 @@ pub struct ModelPaths {
     pub verbalizer: Option<PathBuf>,
     /// accentor-lite ONNX (neural fallback для OOV-наголосу), якщо є.
     pub accentor: Option<PathBuf>,
+    /// voice encoder ONNX (клонування голосу), якщо є.
+    pub voice_encoder: Option<PathBuf>,
 }
 
 impl ModelPaths {
@@ -136,6 +146,14 @@ impl ModelPaths {
         .map(|rel| dir.join(rel))
         .find(|candidate| candidate.is_file());
 
+        // voice encoder опційний: без нього клонування вимкнено.
+        let voice_encoder = [
+            tts_dir.join("voice_encoder.onnx"),
+            dir.join("voice_encoder.onnx"),
+        ]
+        .into_iter()
+        .find(|candidate| candidate.is_file());
+
         let paths = Self {
             model: tts_dir.join("holos_cpu_int8.onnx"),
             vocab: tts_dir.join("vocab.json"),
@@ -143,6 +161,7 @@ impl ModelPaths {
             stress_trie: stress_dir.join("stress.trie"),
             verbalizer,
             accentor,
+            voice_encoder,
         };
         paths.validate()?;
         Ok(paths)
@@ -182,6 +201,18 @@ fn load_voices(path: &Path) -> Result<BTreeMap<String, Vec<f32>>> {
     parse_voices(&json)
 }
 
+/// Помилка сховища кастомних голосів -> HTTP-помилка сервісу.
+fn custom_voice_error(error: CustomVoiceError) -> SynthError {
+    match error {
+        CustomVoiceError::Disabled => SynthError::Unavailable(error.to_string()),
+        CustomVoiceError::Unknown(_)
+        | CustomVoiceError::InvalidName(_)
+        | CustomVoiceError::WrongDim(_)
+        | CustomVoiceError::Npy(_) => SynthError::BadRequest(error.to_string()),
+        CustomVoiceError::Io(io) => SynthError::Internal(io.into()),
+    }
+}
+
 /// Завантажені моделі + стан синтезу.
 pub struct SynthService {
     engine: Mutex<TtsEngine>,
@@ -191,10 +222,14 @@ pub struct SynthService {
     default_voice: String,
     /// Gemma-вербалізатор; `None` -> rule fallback.
     neural: Option<Arc<dyn NeuralVerbalizer>>,
+    /// voice encoder; `None` -> клонування вимкнено.
+    voice_encoder: Option<VoiceEncoder>,
+    /// Кастомні голоси (`<dir>/<name>.npy`); порожній каталог -> вимкнено.
+    custom_voices: CustomVoices,
 }
 
 impl SynthService {
-    pub fn load(paths: &ModelPaths, intra_threads: i16) -> Result<Self> {
+    pub fn load(paths: &ModelPaths, intra_threads: i16, speakers_dir: PathBuf) -> Result<Self> {
         let engine = TtsEngine::from_file(&paths.model, intra_threads)?;
         let tokenizer = CharTokenizer::from_vocab_json(&paths.vocab)
             .with_context(|| format!("load vocab {}", paths.vocab.display()))?;
@@ -240,6 +275,23 @@ impl SynthService {
             None => None,
         };
 
+        // Voice encoder опційний і завантажується ліниво (перший енролмент).
+        let voice_encoder = match &paths.voice_encoder {
+            Some(path) => match VoiceEncoder::from_file(path, intra_threads) {
+                Ok(encoder) => Some(encoder),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        path = %path.display(),
+                        "voice encoder unavailable, cloning disabled"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let custom_voices = CustomVoices::new(speakers_dir);
+
         tracing::info!(
             voices = voices.len(),
             default_voice = %default_voice,
@@ -248,6 +300,9 @@ impl SynthService {
             verbalizer_dir = ?paths.verbalizer,
             accentor = if phonemizer.has_accentor() { "on" } else { "off" },
             accentor_path = ?paths.accentor,
+            voice_encoder = if voice_encoder.is_some() { "on" } else { "off" },
+            voice_encoder_path = ?paths.voice_encoder,
+            speakers_dir = %custom_voices.dir().display(),
             "synthesis service ready"
         );
 
@@ -258,6 +313,8 @@ impl SynthService {
             voices,
             default_voice,
             neural,
+            voice_encoder,
+            custom_voices,
         })
     }
 
@@ -293,6 +350,102 @@ impl SynthService {
         } else {
             "off"
         }
+    }
+
+    /// Чи підключено voice encoder (для `/healthz`).
+    pub fn voice_encoder_name(&self) -> &'static str {
+        if self.voice_encoder.is_some() {
+            "on"
+        } else {
+            "off"
+        }
+    }
+
+    /// Кастомні голоси (рескан каталогу при кожному виклику).
+    pub fn custom_voice_names(&self) -> Vec<String> {
+        self.custom_voices.names()
+    }
+
+    pub fn custom_voice_count(&self) -> usize {
+        self.custom_voices.names().len()
+    }
+
+    /// Голос за назвою: пресет із voices.json, далі кастомний `.npy`.
+    fn resolve_voice(&self, voice: Option<&str>) -> Result<Vec<f32>, SynthError> {
+        let name = voice.unwrap_or(&self.default_voice);
+        if let Some(vector) = self.voices.get(name) {
+            return Ok(vector.clone());
+        }
+        match self.custom_voices.get(name) {
+            Ok(vector) => Ok(vector),
+            Err(CustomVoiceError::Unknown(_)) => {
+                Err(SynthError::BadRequest(format!("unknown voice: {name}")))
+            }
+            Err(error) => Err(custom_voice_error(error)),
+        }
+    }
+
+    /// base64 WAV -> mono float32 @24 кГц (без енкодера).
+    fn decode_reference(&self, audio_base64: &str) -> Result<Vec<f32>, SynthError> {
+        // Дозволяємо переноси рядків (base64 CLI без -w0).
+        let compact: String = audio_base64
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&compact)
+            .map_err(|_| SynthError::BadRequest("audio_base64 is not valid base64".into()))?;
+        let (samples, rate) = decode_wav_f32(&bytes)
+            .map_err(|error| SynthError::BadRequest(format!("invalid reference audio: {error}")))?;
+        if samples.is_empty() {
+            return Err(SynthError::BadRequest(
+                "reference audio contains no samples".into(),
+            ));
+        }
+        let seconds = samples.len() as f32 / rate as f32;
+        if !REFERENCE_SECONDS.contains(&seconds) {
+            return Err(SynthError::BadRequest(format!(
+                "reference audio must be {}..={} seconds, got {seconds:.2}",
+                REFERENCE_SECONDS.start(),
+                REFERENCE_SECONDS.end()
+            )));
+        }
+        resample_to_24k(samples, rate)
+            .map_err(|error| SynthError::BadRequest(format!("cannot resample reference: {error}")))
+    }
+
+    /// WAV (base64) -> 256-вимірний ембеддінг.
+    fn encode_reference(&self, audio_base64: &str) -> Result<Vec<f32>, SynthError> {
+        let encoder = self.voice_encoder.as_ref().ok_or_else(|| {
+            SynthError::Unavailable("voice encoder is not configured on this server".into())
+        })?;
+        let samples = self.decode_reference(audio_base64)?;
+        encoder
+            .encode(&samples)
+            .map_err(|error| SynthError::Internal(error.context("voice encoder failed")))
+    }
+
+    /// Енролмент: обчислити ембеддінг і зберегти `<speakers>/<name>.npy`.
+    pub fn enroll_voice(&self, name: &str, audio_base64: &str) -> Result<(), SynthError> {
+        if !self.custom_voices.enabled() {
+            return Err(SynthError::Unavailable(
+                "custom voices are disabled (PROMIN_SPEAKERS_DIR is empty)".into(),
+            ));
+        }
+        if !speech_core::custom_voices::valid_name(name) {
+            return Err(SynthError::BadRequest(
+                "voice name must be 1-40 letters/digits/space/underscore/hyphen".into(),
+            ));
+        }
+        let embedding = self.encode_reference(audio_base64)?;
+        self.custom_voices
+            .save(name, &embedding)
+            .map_err(custom_voice_error)
+    }
+
+    /// Видалення кастомного голосу; `false` — такого голосу не було.
+    pub fn delete_voice(&self, name: &str) -> Result<bool, SynthError> {
+        self.custom_voices.remove(name).map_err(custom_voice_error)
     }
 
     /// Застосовує обраний режим; neural -> rule, якщо модель недоступна/впала.
@@ -340,10 +493,14 @@ impl SynthService {
     }
 
     /// Повний ланцюжок: текст -> вербалізація -> фонеми -> ONNX -> PCM16 -> WAV.
+    ///
+    /// `audio_base64` (WAV-референс для клонування) має пріоритет над `voice`
+    /// (як у HolosTTS-hybrid); без нього голос береться з `voice`/дефолту.
     pub fn synthesize_wav(
         &self,
         text: &str,
         voice: Option<&str>,
+        audio_base64: Option<&str>,
         speed: f32,
         mode: VerbalizerMode,
         raw_stress: bool,
@@ -357,11 +514,10 @@ impl SynthService {
             )));
         }
 
-        let voice_name = voice.unwrap_or(&self.default_voice);
-        let voice_vector = self
-            .voices
-            .get(voice_name)
-            .ok_or_else(|| SynthError::BadRequest(format!("unknown voice: {voice_name}")))?;
+        let voice_vector = match audio_base64 {
+            Some(reference) => self.encode_reference(reference)?,
+            None => self.resolve_voice(voice)?,
+        };
 
         let (text, applied, vb_ms) = self.apply_verbalizer(text, mode);
         tracing::debug!(verbalizer = applied, vb_ms, "text verbalized");
@@ -386,7 +542,7 @@ impl SynthService {
                 continue;
             }
             let chunk = engine
-                .generate(&ids, voice_vector, speed)
+                .generate(&ids, &voice_vector, speed)
                 .with_context(|| format!("generate audio for phonemes {part:?}"))?;
             samples.extend_from_slice(&chunk);
         }
@@ -572,14 +728,53 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires models + ORT 1.17: ORT_STRATEGY=system ORT_LIB_LOCATION=<ort>/lib PROMIN_MODELS_DIR=<dir>"]
+    fn discovers_optional_voice_encoder() {
+        let root = std::env::temp_dir().join(format!(
+            "promin-models-encoder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("tts")).unwrap();
+        std::fs::create_dir_all(root.join("stress")).unwrap();
+        for file in [
+            "tts/holos_cpu_int8.onnx",
+            "tts/vocab.json",
+            "tts/voices.json",
+            "stress/stress.trie",
+        ] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        std::fs::write(root.join("tts/voice_encoder.onnx"), b"x").unwrap();
+
+        let paths = ModelPaths::discover(&root).expect("discover voice encoder");
+        assert_eq!(
+            paths.voice_encoder.as_deref(),
+            Some(root.join("tts/voice_encoder.onnx").as_path())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "requires models + ORT 1.31: ORT_STRATEGY=system ORT_LIB_LOCATION=<ort>/lib PROMIN_MODELS_DIR=<dir>"]
     fn synthesizes_golden_phrase() {
         let dir = std::env::var("PROMIN_MODELS_DIR").expect("PROMIN_MODELS_DIR not set");
-        let paths = ModelPaths::discover(dir).expect("discover models");
-        let service = SynthService::load(&paths, 4).expect("load service");
+        let paths = ModelPaths::discover(&dir).expect("discover models");
+        let service = SynthService::load(&paths, 4, PathBuf::from(&dir).join("speakers"))
+            .expect("load service");
 
         let output = service
-            .synthesize_wav("Привіт, світе!", None, 1.0, VerbalizerMode::Off, false)
+            .synthesize_wav(
+                "Привіт, світе!",
+                None,
+                None,
+                1.0,
+                VerbalizerMode::Off,
+                false,
+            )
             .expect("synthesize");
 
         let reader = hound::WavReader::new(std::io::Cursor::new(output.wav)).expect("parse WAV");
