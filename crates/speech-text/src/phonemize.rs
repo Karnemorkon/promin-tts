@@ -1,9 +1,11 @@
 //! Текст -> фонеми: split_to_parts -> normalize_part -> stress -> ipa::transcribe.
-//! Порт phonemize.cpp (без neural accentor у v0.1).
+//! Порт phonemize.cpp: словниковий наголос + neural accentor для OOV.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::ipa;
+use crate::neural::NeuralStress;
 use crate::stress::StressDictionary;
 use crate::text_prep;
 
@@ -12,8 +14,33 @@ fn is_word_cp(c: char) -> bool {
     ('\u{0400}'..='\u{04FF}').contains(&c) || c == '\u{02BC}' || c == '\u{2019}' || c == '\''
 }
 
-/// Наголос по кожному слову тексту (словник; accentor відкладено до v0.2).
-pub fn stress_text(dict: &StressDictionary, text: &str) -> String {
+const ACUTE: char = '\u{0301}';
+
+/// Словниковий наголос; якщо словник не дав U+0301 — accentor (як у C++).
+fn stress_word(dict: &StressDictionary, accentor: Option<&dyn NeuralStress>, word: &str) -> String {
+    let stressed = dict.stress(word);
+    if stressed.contains(ACUTE) {
+        return stressed;
+    }
+    let Some(accentor) = accentor else {
+        return stressed;
+    };
+    match accentor.stress(word) {
+        Ok(neural) if neural.contains(ACUTE) => neural,
+        Ok(_) => stressed,
+        Err(error) => {
+            tracing::warn!(error = %error, word, "accentor failed, keeping dictionary form");
+            stressed
+        }
+    }
+}
+
+/// Наголос по кожному слову тексту (словник + опційний accentor).
+pub fn stress_text(
+    dict: &StressDictionary,
+    accentor: Option<&dyn NeuralStress>,
+    text: &str,
+) -> String {
     let mut out = String::with_capacity(text.len());
     let mut word = String::new();
     for ch in text.chars() {
@@ -21,28 +48,42 @@ pub fn stress_text(dict: &StressDictionary, text: &str) -> String {
             word.push(ch);
         } else {
             if !word.is_empty() {
-                out.push_str(&dict.stress(&word));
+                out.push_str(&stress_word(dict, accentor, &word));
                 word.clear();
             }
             out.push(ch);
         }
     }
     if !word.is_empty() {
-        out.push_str(&dict.stress(&word));
+        out.push_str(&stress_word(dict, accentor, &word));
     }
     out
 }
 
-/// Фонемізатор: словниковий наголос + IPA-транскрипція.
+/// Фонемізатор: словниковий наголос (+ accentor) + IPA-транскрипція.
 pub struct Phonemizer {
     dict: StressDictionary,
+    accentor: Option<Arc<dyn NeuralStress>>,
 }
 
 impl Phonemizer {
     pub fn open(stress_trie: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_with_accentor(stress_trie, None)
+    }
+
+    /// `accentor` — опційний neural fallback для слів поза словником.
+    pub fn open_with_accentor(
+        stress_trie: impl AsRef<Path>,
+        accentor: Option<Arc<dyn NeuralStress>>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             dict: StressDictionary::open(stress_trie)?,
+            accentor,
         })
+    }
+
+    pub fn has_accentor(&self) -> bool {
+        self.accentor.is_some()
     }
 
     /// Фонемний рядок на кожну частину тексту.
@@ -57,7 +98,7 @@ impl Phonemizer {
             let stressed = if raw_stress {
                 norm
             } else {
-                stress_text(&self.dict, &norm)
+                stress_text(&self.dict, self.accentor.as_deref(), &norm)
             };
             let ph = ipa::transcribe(&stressed).unwrap_or_default();
             if !ph.is_empty() {

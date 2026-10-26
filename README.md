@@ -6,14 +6,18 @@
 
 ## Статус
 
-**v0.2 «Verbalizer»** — повний ланцюжок `текст → вербалізація → фонеми → ONNX → WAV`.
+**v0.3 «Accentor»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`.
 Працюють обидва вербалізатори: rule (числа, дати, час) і Gemma-3-270M INT8
 (decoder-only, KV-cache); без Gemma-моделі автоматично вмикається rule fallback.
+Слова поза словником отримують neural-наголос від accentor-lite.
 
 Реалізовано:
 
 - `speech-text` — порт C++ препроцесу: нормалізація, словниковий наголос (marisa-trie,
   2.9 млн форм), українська IPA-транскрипція. Фонеми звірені 1:1 з `holos-tts-core`.
+- `speech-inference::accentor` — accentor-lite (ONNX LSTM, 1.2 MB): наголос для
+  OOV-слів; словник має пріоритет, accentor підключається лише коли словник не дав
+  U+0301. Golden-тест 54/54 проти C++ `holos::Accentor`.
 - `speech-text::verbalize` — rule-вербалізатор: кардинальні числа до 999 999 999 999,
   дати `ДД.ММ.РРРР`, час `ГГ:ХХ`. Golden-тест 68/68 проти C++ `holos::verbalize`.
 - `speech-text::gemma_prep` — поцифрове читання номерів і групування розрядів
@@ -33,7 +37,7 @@
 crates/
 ├── speech-core/        # Бізнес-логіка, проєкти, черга генерації (каркас)
 ├── speech-text/        # Препроцесинг: нормалізація, вербалізація, наголоси, IPA
-├── speech-inference/   # ONNX Runtime: TTS-генератор (+ Gemma-вербалізатор)
+├── speech-inference/   # ONNX Runtime: TTS-генератор, Gemma-вербалізатор, accentor
 ├── speech-audio/       # PCM16, WAV-експорт
 └── speech-server/      # Axum: REST API
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
@@ -51,6 +55,8 @@ models/
 │   └── voices.json
 ├── stress/
 │   └── stress.trie
+├── accentor/
+│   └── accentor-lite.onnx    # опційно: neural-наголос для OOV-слів
 └── verbalizer/gemma-int8/   # опційно: без нього працює rule fallback
     ├── model.onnx
     └── tokenizer.model
@@ -100,7 +106,7 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 
 | Метод | Шлях | Опис |
 |---|---|---|
-| `GET` | `/healthz` | Стан сервера, кількість голосів, активний вербалізатор |
+| `GET` | `/healthz` | Стан сервера, кількість голосів, активний вербалізатор та accentor |
 | `GET` | `/api/voices` | Список голосів + голос за замовчуванням |
 | `POST` | `/api/verbalize` | `{text, mode?}` → `{text}`; `mode`: `neural` (типово), `rule`, `off` |
 | `POST` | `/api/synthesize` | `{text, voice?, speed?, auto_verbalize?, raw_stress?}` → `audio/wav` |
@@ -110,6 +116,8 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 - `auto_verbalize`: `true`/`false` або `"neural"`/`"rule"`/`"off"`; відсутнє ⇒ `neural`
   (як у `holos-tts-core`). Якщо Gemma-моделі немає — автоматичний fallback на `rule`.
 - `raw_stress`: не додавати автоматичні наголоси (очікуються `+`/U+0301 у тексті).
+- Наголос: спершу словник; якщо форма відсутня або неоднозначна — accentor-lite.
+  Без `accentor-lite.onnx` OOV-слова лишаються без наголосу (як у v0.2).
 - Заголовки відповіді: `X-Promin-Verbalizer` (`off`/`rule`/`neural`) і `X-Promin-Vb-Ms`.
 - Обмеження: до 5000 символів на запит, `speed` у діапазоні `0.5..=2.0`.
 

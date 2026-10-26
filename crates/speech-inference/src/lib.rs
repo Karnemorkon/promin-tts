@@ -1,6 +1,8 @@
+pub mod accentor;
 pub mod engine;
 pub mod gemma;
 
+pub use accentor::Accentor;
 pub use engine::{TtsEngine, VOICE_DIM};
 pub use gemma::GemmaVerbalizer;
 

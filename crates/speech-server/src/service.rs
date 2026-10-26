@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use speech_audio::{float_to_pcm16, wav_bytes, SAMPLE_RATE};
-use speech_inference::{GemmaVerbalizer, TtsEngine};
-use speech_text::neural::NeuralVerbalizer;
+use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine};
+use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
 use speech_text::tokenizer::CharTokenizer;
 use speech_text::verbalize;
@@ -98,6 +98,8 @@ pub struct ModelPaths {
     pub stress_trie: PathBuf,
     /// Каталог Gemma-вербалізатора (`model.onnx` + `tokenizer.model`), якщо є.
     pub verbalizer: Option<PathBuf>,
+    /// accentor-lite ONNX (neural fallback для OOV-наголосу), якщо є.
+    pub accentor: Option<PathBuf>,
 }
 
 impl ModelPaths {
@@ -124,12 +126,23 @@ impl ModelPaths {
                     && candidate.join("tokenizer.model").is_file()
             });
 
+        // accentor-lite опційний: без нього OOV-слова лишаються без наголосу.
+        let accentor = [
+            "accentor/accentor-lite.onnx",
+            "accentor-lite.onnx",
+            "accentor/accentor.onnx",
+        ]
+        .iter()
+        .map(|rel| dir.join(rel))
+        .find(|candidate| candidate.is_file());
+
         let paths = Self {
             model: tts_dir.join("holos_cpu_int8.onnx"),
             vocab: tts_dir.join("vocab.json"),
             voices: tts_dir.join("voices.json"),
             stress_trie: stress_dir.join("stress.trie"),
             verbalizer,
+            accentor,
         };
         paths.validate()?;
         Ok(paths)
@@ -185,7 +198,23 @@ impl SynthService {
         let engine = TtsEngine::from_file(&paths.model, intra_threads)?;
         let tokenizer = CharTokenizer::from_vocab_json(&paths.vocab)
             .with_context(|| format!("load vocab {}", paths.vocab.display()))?;
-        let phonemizer = Phonemizer::open(&paths.stress_trie)
+
+        // accentor-lite опційний: без нього працює лише словниковий наголос.
+        let accentor: Option<Arc<dyn NeuralStress>> = match &paths.accentor {
+            Some(path) => match Accentor::from_file(path) {
+                Ok(engine) => Some(Arc::new(engine)),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        path = %path.display(),
+                        "accentor unavailable, using dictionary stress only"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let phonemizer = Phonemizer::open_with_accentor(&paths.stress_trie, accentor)
             .with_context(|| format!("load stress dictionary {}", paths.stress_trie.display()))?;
         let voices = load_voices(&paths.voices)?;
 
@@ -217,6 +246,8 @@ impl SynthService {
             vocab = tokenizer.vocab_len(),
             verbalizer = if neural.is_some() { "neural+rule" } else { "rule" },
             verbalizer_dir = ?paths.verbalizer,
+            accentor = if phonemizer.has_accentor() { "on" } else { "off" },
+            accentor_path = ?paths.accentor,
             "synthesis service ready"
         );
 
@@ -252,6 +283,15 @@ impl SynthService {
             "neural+rule"
         } else {
             "rule"
+        }
+    }
+
+    /// Чи підключено neural accentor (для `/healthz`).
+    pub fn accentor_name(&self) -> &'static str {
+        if self.phonemizer.has_accentor() {
+            "on"
+        } else {
+            "off"
         }
     }
 
@@ -457,6 +497,7 @@ mod tests {
         assert_eq!(paths.model, root.join("tts/holos_cpu_int8.onnx"));
         assert_eq!(paths.stress_trie, root.join("stress/stress.trie"));
         assert!(paths.verbalizer.is_none());
+        assert!(paths.accentor.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -493,6 +534,38 @@ mod tests {
         assert_eq!(
             paths.verbalizer.as_deref(),
             Some(root.join("verbalizer/gemma-int8").as_path())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovers_optional_accentor() {
+        let root = std::env::temp_dir().join(format!(
+            "promin-models-accentor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("tts")).unwrap();
+        std::fs::create_dir_all(root.join("stress")).unwrap();
+        std::fs::create_dir_all(root.join("accentor")).unwrap();
+        for file in [
+            "tts/holos_cpu_int8.onnx",
+            "tts/vocab.json",
+            "tts/voices.json",
+            "stress/stress.trie",
+        ] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        std::fs::write(root.join("accentor/accentor-lite.onnx"), b"x").unwrap();
+
+        let paths = ModelPaths::discover(&root).expect("discover accentor");
+        assert_eq!(
+            paths.accentor.as_deref(),
+            Some(root.join("accentor/accentor-lite.onnx").as_path())
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -542,6 +615,7 @@ mod tests {
         assert_eq!(paths.model, root.join("holos_cpu_int8.onnx"));
         assert_eq!(paths.stress_trie, root.join("stress.trie"));
         assert!(paths.verbalizer.is_none());
+        assert!(paths.accentor.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

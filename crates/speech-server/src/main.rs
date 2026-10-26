@@ -84,6 +84,7 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "voices": state.service.voice_count(),
         "sample_rate": state.service.sample_rate(),
         "verbalizer": state.service.verbalizer_name(),
+        "accentor": state.service.accentor_name(),
     }))
 }
 
