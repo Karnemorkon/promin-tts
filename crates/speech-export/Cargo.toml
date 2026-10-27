@@ -1,0 +1,26 @@
+[package]
+name = "speech-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Audiobook export: M4B, MP3 and OGG Opus with chapters, cover art and subtitles"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+hound.workspace = true
+id3-core.workspace = true
+mp4-core.workspace = true
+mp4io.workspace = true
+ogg.workspace = true
+rusty_aac.workspace = true
+rusty_mp3.workspace = true
+rusty-opus.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
