@@ -1,11 +1,12 @@
-//! Імпорт книг: EPUB, FB2, DOCX, TXT, Markdown.
+//! Імпорт книг: EPUB, FB2, DOCX, PDF, TXT, Markdown.
 //!
 //! Модуль увімкнений feature-флагом `import`, щоб `speech-inference` не тягнув
-//! `zip`/`quick-xml`/`html-escape`.
+//! `zip`/`quick-xml`/`html-escape`/`pdf-extract`.
 
 mod docx;
 mod epub;
 mod fb2;
+mod pdf;
 mod text;
 mod util;
 
@@ -63,6 +64,7 @@ pub enum BookFormat {
     Epub,
     Fb2,
     Docx,
+    Pdf,
     Txt,
     Markdown,
 }
@@ -73,6 +75,7 @@ impl BookFormat {
             Self::Epub => "epub",
             Self::Fb2 => "fb2",
             Self::Docx => "docx",
+            Self::Pdf => "pdf",
             Self::Txt => "txt",
             Self::Markdown => "markdown",
         }
@@ -107,6 +110,7 @@ pub fn detect_format(filename: &str, bytes: &[u8]) -> Option<BookFormat> {
             "epub" => return Some(BookFormat::Epub),
             "fb2" => return Some(BookFormat::Fb2),
             "docx" => return Some(BookFormat::Docx),
+            "pdf" => return Some(BookFormat::Pdf),
             "md" | "markdown" => return Some(BookFormat::Markdown),
             "txt" => return Some(BookFormat::Txt),
             _ => {}
@@ -116,6 +120,9 @@ pub fn detect_format(filename: &str, bytes: &[u8]) -> Option<BookFormat> {
 }
 
 fn sniff_format(bytes: &[u8]) -> Option<BookFormat> {
+    if bytes.starts_with(b"%PDF-") {
+        return Some(BookFormat::Pdf);
+    }
     if bytes.starts_with(b"PK\x03\x04") {
         if let Ok(mut zip) = util::open_zip(bytes) {
             if zip.by_name("META-INF/container.xml").is_ok() {
@@ -212,6 +219,9 @@ pub fn import_book(filename: &str, bytes: &[u8]) -> Result<ImportedBook, ImportE
         )));
     }
     let format = detect_format(filename, bytes).ok_or(ImportError::UnsupportedFormat)?;
+    if format == BookFormat::Pdf {
+        return pdf::import(bytes, filename).and_then(finalize_book);
+    }
     import_bytes(format, bytes)
 }
 
@@ -221,6 +231,7 @@ pub fn import_bytes(format: BookFormat, bytes: &[u8]) -> Result<ImportedBook, Im
         BookFormat::Epub => epub::import(bytes)?,
         BookFormat::Fb2 => fb2::import(bytes)?,
         BookFormat::Docx => docx::import(bytes)?,
+        BookFormat::Pdf => pdf::import(bytes, "")?,
         BookFormat::Txt => text::import_plain(bytes)?,
         BookFormat::Markdown => text::import_markdown(bytes)?,
     };
@@ -298,6 +309,7 @@ mod tests {
         assert_eq!(detect_format("book.epub", b""), Some(BookFormat::Epub));
         assert_eq!(detect_format("book.FB2", b""), Some(BookFormat::Fb2));
         assert_eq!(detect_format("book.docx", b""), Some(BookFormat::Docx));
+        assert_eq!(detect_format("book.pdf", b""), Some(BookFormat::Pdf));
         assert_eq!(detect_format("book.md", b""), Some(BookFormat::Markdown));
         assert_eq!(detect_format("book.txt", b""), Some(BookFormat::Txt));
         assert_eq!(

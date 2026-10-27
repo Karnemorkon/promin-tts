@@ -232,11 +232,160 @@ fn imports_docx_with_heading_styles() {
     assert_eq!(book.chapters[2].title, "Розділ 2");
 }
 
+/// Зібрати простий PDF із текстовим шаром. Кожен рядок масиву — окремий
+/// рядок на сторінці. Кирилиця кодується через ToUnicode CMap, бо стандартні
+/// PDF-шрифти не мають української кодової таблиці.
+fn pdf_fixture(title: &str, author: &str, pages: &[&[&str]]) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+    use std::collections::HashMap;
+
+    let mut codes: HashMap<char, u8> = HashMap::new();
+    let mut next_code = 33u16;
+    for page in pages {
+        for line in *page {
+            for ch in line.chars() {
+                if let std::collections::hash_map::Entry::Vacant(entry) = codes.entry(ch) {
+                    assert!(next_code < 256, "too many unique characters");
+                    entry.insert(next_code as u8);
+                    next_code += 1;
+                }
+            }
+        }
+    }
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n\
+         12 dict begin\n\
+         begincmap\n\
+         /CMapName /ProminTest def\n\
+         /CMapType 2 def\n\
+         1 begincodespacerange\n\
+         <00> <FF>\n\
+         endcodespacerange\n",
+    );
+    let mut entries: Vec<(u8, char)> = codes.iter().map(|(ch, code)| (*code, *ch)).collect();
+    entries.sort_unstable();
+    for chunk in entries.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for (code, ch) in chunk {
+            let mut buffer = [0u16; 2];
+            let utf16: String = ch
+                .encode_utf16(&mut buffer)
+                .iter()
+                .map(|unit| format!("{unit:04X}"))
+                .collect();
+            cmap.push_str(&format!("<{code:02X}> <{utf16}>\n"));
+        }
+        cmap.push_str("endbfchar\n");
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let to_unicode_id = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+        "ToUnicode" => to_unicode_id,
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+
+    let mut kids = Vec::new();
+    for page_lines in pages {
+        let mut content = String::from("BT\n/F1 12 Tf\n72 760 Td\n");
+        for line in *page_lines {
+            let hex: String = line
+                .chars()
+                .map(|ch| format!("{:02X}", codes[&ch]))
+                .collect();
+            content.push_str(&format!("<{hex}> Tj\n0 -12 Td\n"));
+        }
+        content.push_str("ET\n");
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        });
+        kids.push(page_id.into());
+    }
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages.len() as i64,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    let info_id = doc.add_object(dictionary! {
+        "Title" => lopdf::text_string(title),
+        "Author" => lopdf::text_string(author),
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.trailer.set("Info", info_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn imports_pdf_text_layer_and_metadata() {
+    let bytes = pdf_fixture(
+        "Тестова PDF",
+        "Автор PDF",
+        &[
+            &[
+                "Розділ 1",
+                "Це перший розділ тестової книги з достатньо довгим текстом.",
+                "Другий рядок того самого розділу.",
+            ],
+            &[
+                "Розділ 2",
+                "Це другий розділ тестової книги, який теж має текст.",
+                "Останній рядок книги.",
+            ],
+        ],
+    );
+    assert_eq!(
+        speech_text::import::detect_format("book.pdf", &bytes),
+        Some(BookFormat::Pdf)
+    );
+    let book = import_book("book.pdf", &bytes).unwrap();
+    assert_eq!(book.title, "Тестова PDF");
+    assert_eq!(book.author, "Автор PDF");
+    assert_eq!(book.format, BookFormat::Pdf);
+    assert_eq!(book.chapters.len(), 2);
+    assert_eq!(book.chapters[0].title, "Розділ 1");
+    assert!(book.chapters[0].text.contains("перший розділ"));
+    assert!(book.chapters[0].text.contains("Другий рядок"));
+    assert_eq!(book.chapters[1].title, "Розділ 2");
+    assert!(book.chapters[1].text.contains("другий розділ"));
+    assert!(book.chapters[1].text.contains("Останній рядок"));
+}
+
+#[test]
+fn rejects_pdf_without_text_layer() {
+    let bytes = pdf_fixture("Скан", "", &[&[], &[]]);
+    let error = import_book("scan.pdf", &bytes).unwrap_err();
+    assert!(matches!(error, ImportError::Invalid(ref message) if message.contains("text layer")));
+}
+
 #[test]
 fn rejects_unsupported_binary_content() {
     assert_eq!(
         speech_text::import::detect_format("book.pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"),
-        None
+        Some(BookFormat::Pdf)
     );
     assert_eq!(
         speech_text::import::detect_format("book", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"),
@@ -256,7 +405,7 @@ fn rejects_unsupported_binary_content() {
     );
     assert!(matches!(
         import_book("book.pdf", b"%PDF-1.7\n"),
-        Err(ImportError::UnsupportedFormat)
+        Err(ImportError::Invalid(_))
     ));
 }
 

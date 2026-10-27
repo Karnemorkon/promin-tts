@@ -9,13 +9,20 @@ description = "Text preprocessing: import, verbalization, stress, segmentation"
 
 [features]
 default = []
-import = ["dep:zip", "dep:quick-xml", "dep:html-escape", "dep:encoding_rs"]
+import = [
+    "dep:zip",
+    "dep:quick-xml",
+    "dep:html-escape",
+    "dep:encoding_rs",
+    "dep:pdf-extract",
+]
 
 [dependencies]
 anyhow.workspace = true
 encoding_rs = { workspace = true, optional = true }
 fancy-regex.workspace = true
 html-escape = { workspace = true, optional = true }
+pdf-extract = { workspace = true, optional = true }
 quick-xml = { workspace = true, optional = true }
 regex.workspace = true
 rsmarisa.workspace = true
@@ -24,3 +31,6 @@ thiserror.workspace = true
 tracing.workspace = true
 unicode-normalization.workspace = true
 zip = { workspace = true, optional = true }
+
+[dev-dependencies]
+lopdf = { version = "0.42", default-features = false }
