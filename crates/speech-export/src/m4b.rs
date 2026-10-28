@@ -40,8 +40,7 @@ pub(crate) fn encode(
     if total_media_samples < AAC_FRAME_SAMPLES {
         return Err(ExportError::Invalid("book is too short".to_string()));
     }
-    let duration_ms =
-        (total_media_samples - AAC_FRAME_SAMPLES) * 1000 / u64::from(SAMPLE_RATE);
+    let duration_ms = (total_media_samples - AAC_FRAME_SAMPLES) * 1000 / u64::from(SAMPLE_RATE);
 
     let mut media_cursor = 0u64;
     let mut starts = Vec::with_capacity(encoded_counts.len());
@@ -130,7 +129,10 @@ fn encode_aac(pcm: &[i16], bitrate_bps: u32) -> Result<Vec<Vec<u8>>, ExportError
         bitrate_bps,
         ..Default::default()
     });
-    let floats: Vec<f32> = pcm.iter().map(|&sample| f32::from(sample) / 32768.0).collect();
+    let floats: Vec<f32> = pcm
+        .iter()
+        .map(|&sample| f32::from(sample) / 32768.0)
+        .collect();
     encoder
         .push_pcm(&floats, 1, SAMPLE_RATE)
         .map_err(|error| ExportError::M4b(format!("AAC encode: {error}")))?;
@@ -171,10 +173,18 @@ fn build_udta(
         &metadata.album
     };
     items.push(text_atom(atoms::ALBUM, album));
-    if let Some(narrator) = metadata.narrator.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(narrator) = metadata
+        .narrator
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         items.push(text_atom([0xA9, b'n', b'r', b't'], narrator));
     }
-    if let Some(year) = metadata.year.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(year) = metadata
+        .year
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         items.push(text_atom(atoms::YEAR, year));
     }
     if let Some(description) = metadata
@@ -265,8 +275,7 @@ fn insert_udta(mp4: &mut Vec<u8>, udta: &[u8]) -> Result<(), ExportError> {
             mp4.splice(end..end, udta.iter().copied());
             let new_size = size + udta.len();
             if size32 == 1 {
-                mp4[position + 8..position + 16]
-                    .copy_from_slice(&(new_size as u64).to_be_bytes());
+                mp4[position + 8..position + 16].copy_from_slice(&(new_size as u64).to_be_bytes());
             } else {
                 let new_size = u32::try_from(new_size)
                     .map_err(|_| ExportError::M4b("moov box is too large".to_string()))?;

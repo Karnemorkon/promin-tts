@@ -3,8 +3,8 @@
 use std::io::Write;
 
 use id3_core::{
-    AttachedPicture, Chapter as Id3Chapter, Comment, Frame, Language, Tag, TextEncoding,
-    TextField, Toc,
+    AttachedPicture, Chapter as Id3Chapter, Comment, Frame, Language, Tag, TextEncoding, TextField,
+    Toc,
 };
 
 use crate::{

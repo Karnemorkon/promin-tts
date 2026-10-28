@@ -233,15 +233,30 @@ pub fn export_book(
     let mut counter = CountingWriter::new(out);
     let cover = input.cover.clone().unwrap_or_else(default_cover);
     let encoded = match input.format {
-        ExportFormat::M4b => {
-            m4b::encode(input, &frame_counts, bitrate_kbps, &cover, &mut counter, observer)?
-        }
-        ExportFormat::Mp3 => {
-            mp3::encode(input, &frame_counts, bitrate_kbps, &cover, &mut counter, observer)?
-        }
-        ExportFormat::Ogg => {
-            ogg::encode(input, &frame_counts, bitrate_kbps, &cover, &mut counter, observer)?
-        }
+        ExportFormat::M4b => m4b::encode(
+            input,
+            &frame_counts,
+            bitrate_kbps,
+            &cover,
+            &mut counter,
+            observer,
+        )?,
+        ExportFormat::Mp3 => mp3::encode(
+            input,
+            &frame_counts,
+            bitrate_kbps,
+            &cover,
+            &mut counter,
+            observer,
+        )?,
+        ExportFormat::Ogg => ogg::encode(
+            input,
+            &frame_counts,
+            bitrate_kbps,
+            &cover,
+            &mut counter,
+            observer,
+        )?,
     };
 
     Ok(ExportSummary {

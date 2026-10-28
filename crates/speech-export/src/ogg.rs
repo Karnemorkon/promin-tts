@@ -39,12 +39,7 @@ pub(crate) fn encode(
 
     let mut writer = ogg::PacketWriter::new(out);
     writer
-        .write_packet(
-            opus_head(),
-            OGG_SERIAL,
-            ogg::PacketWriteEndInfo::EndPage,
-            0,
-        )
+        .write_packet(opus_head(), OGG_SERIAL, ogg::PacketWriteEndInfo::EndPage, 0)
         .map_err(|error| ExportError::Ogg(error.to_string()))?;
     writer
         .write_packet(
@@ -232,10 +227,7 @@ fn opus_tags(
     }
     for (position, chapter) in chapters.iter().enumerate() {
         let number = position + 1;
-        comments.push((
-            format!("CHAPTER{number:03}"),
-            timestamp(chapter.start_ms),
-        ));
+        comments.push((format!("CHAPTER{number:03}"), timestamp(chapter.start_ms)));
         comments.push((format!("CHAPTER{number:03}NAME"), chapter.title.clone()));
     }
     comments.push((

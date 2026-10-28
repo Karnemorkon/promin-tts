@@ -21,12 +21,10 @@ use axum::{
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use speech_core::projects::{
-    now_rfc3339, valid_project_id, ChapterStatus, Project, ProjectStore,
-};
+use speech_core::projects::{now_rfc3339, valid_project_id, ChapterStatus, Project, ProjectStore};
 use speech_export::{
-    combined_subtitles, export_book, CoverImage, Cue, ExportChapter, ExportError,
-    ExportFormat, ExportInput, ExportMetadata, ExportObserver, ExportSummary,
+    combined_subtitles, export_book, CoverImage, Cue, ExportChapter, ExportError, ExportFormat,
+    ExportInput, ExportMetadata, ExportObserver, ExportSummary,
 };
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::io::ReaderStream;
@@ -296,13 +294,9 @@ impl ExportManager {
             title,
             author,
             album,
-            narrator: request
-                .narrator
-                .filter(|value| !value.trim().is_empty()),
+            narrator: request.narrator.filter(|value| !value.trim().is_empty()),
             year,
-            description: request
-                .description
-                .filter(|value| !value.trim().is_empty()),
+            description: request.description.filter(|value| !value.trim().is_empty()),
             language: project.language.clone(),
         };
 
@@ -340,13 +334,7 @@ impl ExportManager {
         self.specs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                record.id.clone(),
-                ExportSpec {
-                    metadata,
-                    cover,
-                },
-            );
+            .insert(record.id.clone(), ExportSpec { metadata, cover });
 
         if self.sender.send(record.id.clone()).await.is_err() {
             self.state
@@ -374,11 +362,7 @@ impl ExportManager {
     }
 
     /// Отримати запис експорту.
-    pub fn get(
-        &self,
-        project_id: &str,
-        export_id: &str,
-    ) -> Result<ExportRecord, ExportApiError> {
+    pub fn get(&self, project_id: &str, export_id: &str) -> Result<ExportRecord, ExportApiError> {
         if !valid_project_id(project_id) {
             return Err(ExportApiError::bad("invalid project id"));
         }
@@ -402,9 +386,7 @@ impl ExportManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ExportApiError::NotFound("unknown export"))
             }
-            Err(error) => {
-                return Err(ExportApiError::internal("read export record", error))
-            }
+            Err(error) => return Err(ExportApiError::internal("read export record", error)),
         };
         serde_json::from_slice(&bytes)
             .map_err(|error| ExportApiError::internal("parse export record", error))
@@ -435,7 +417,9 @@ impl ExportManager {
                     .and_then(|bytes| serde_json::from_slice::<ExportRecord>(&bytes).ok())
                 {
                     Some(record) => records.push(record),
-                    None => tracing::warn!(path = %path.display(), "skipping malformed export record"),
+                    None => {
+                        tracing::warn!(path = %path.display(), "skipping malformed export record")
+                    }
                 }
             }
         }
@@ -520,16 +504,9 @@ impl ExportManager {
     }
 
     /// Шлях до файлу експорту (тільки ім’я, без шляхів).
-    pub fn file_path(
-        &self,
-        project_id: &str,
-        name: &str,
-    ) -> Result<PathBuf, ExportApiError> {
+    pub fn file_path(&self, project_id: &str, name: &str) -> Result<PathBuf, ExportApiError> {
         if !safe_file_name(name) {
-            return Err(ExportApiError::internal(
-                "invalid export file name",
-                name,
-            ));
+            return Err(ExportApiError::internal("invalid export file name", name));
         }
         Ok(self.export_dir(project_id)?.join(name))
     }
@@ -1065,11 +1042,7 @@ fn load_all_records(projects: &ProjectStore) -> anyhow::Result<Vec<ExportRecord>
 }
 
 /// JSON-подання запису з URL-посиланнями та прапорцем `stale`.
-fn export_view(
-    record: &ExportRecord,
-    project_updated_at: &str,
-    base: &str,
-) -> serde_json::Value {
+fn export_view(record: &ExportRecord, project_updated_at: &str, base: &str) -> serde_json::Value {
     let mut value = serde_json::to_value(record).unwrap_or_else(|_| json!({}));
     let Some(object) = value.as_object_mut() else {
         return value;
@@ -1284,10 +1257,7 @@ mod tests {
     use speech_export::default_cover;
 
     fn temp_projects() -> ProjectStore {
-        let dir = std::env::temp_dir().join(format!(
-            "promin-export-api-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("promin-export-api-{}", uuid::Uuid::new_v4()));
         ProjectStore::new(dir).unwrap()
     }
 
@@ -1494,7 +1464,12 @@ mod tests {
             let current = manager.get(&id, &record.id).unwrap();
             panic!("export did not finish in time: {current:?}")
         });
-        assert_eq!(finished.status, ExportStatus::Completed, "{:?}", finished.error);
+        assert_eq!(
+            finished.status,
+            ExportStatus::Completed,
+            "{:?}",
+            finished.error
+        );
         assert_eq!(finished.progress, 100);
         assert_eq!(finished.chapters_done, 2);
         assert!(finished.audio_bytes.unwrap() > 0);

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use speech_export::{
-    combined_subtitles, export_book, Cue, ExportChapter, ExportFormat, ExportInput,
-    ExportMetadata, NoopObserver,
+    combined_subtitles, export_book, Cue, ExportChapter, ExportFormat, ExportInput, ExportMetadata,
+    NoopObserver,
 };
 
 fn tone(seconds: f32, frequency: f32) -> Vec<i16> {
@@ -124,9 +124,7 @@ fn exports_every_format_with_chapters_and_subtitles() {
                 assert!(output.starts_with(b"OggS"));
                 assert!(output.windows(8).any(|window| window == b"OpusHead"));
                 assert!(output.windows(8).any(|window| window == b"OpusTags"));
-                assert!(output
-                    .windows(10)
-                    .any(|window| window == b"CHAPTER002"));
+                assert!(output.windows(10).any(|window| window == b"CHAPTER002"));
             }
         }
 
@@ -182,7 +180,10 @@ fn rejects_wav_with_wrong_sample_rate() {
         }],
     };
     let error = export_book(&input, &mut Vec::new(), &mut NoopObserver).unwrap_err();
-    assert!(matches!(error, speech_export::ExportError::WavFormat { .. }));
+    assert!(matches!(
+        error,
+        speech_export::ExportError::WavFormat { .. }
+    ));
 }
 
 #[test]
