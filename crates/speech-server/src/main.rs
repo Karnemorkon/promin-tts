@@ -26,6 +26,7 @@ use speech_core::projects::{LoudnessSettings, ProjectStore};
 use tokio::sync::{broadcast, mpsc};
 
 mod downloader;
+mod exports;
 mod jobs;
 mod mcp;
 mod projects;
@@ -68,6 +69,10 @@ struct Args {
     #[arg(long, env = "PROMIN_JOBS_CONCURRENCY", default_value_t = 1)]
     jobs_concurrency: usize,
 
+    /// Number of audiobook exports processed concurrently
+    #[arg(long, env = "PROMIN_EXPORT_CONCURRENCY", default_value_t = 1)]
+    export_concurrency: usize,
+
     /// Public base URL used in webhook payloads and job audio links
     #[arg(long, env = "PROMIN_PUBLIC_URL")]
     public_url: Option<String>,
@@ -102,6 +107,7 @@ struct AppState {
     service: Arc<SynthService>,
     jobs: Arc<JobManager>,
     projects: Arc<ProjectStore>,
+    exports: Arc<exports::ExportManager>,
     project_lock: Arc<tokio::sync::Mutex<()>>,
     pronunciation: Arc<PronunciationStore>,
     default_loudness: LoudnessSettings,
@@ -1039,6 +1045,11 @@ async fn main() -> anyhow::Result<()> {
         concurrency = args.jobs_concurrency.max(1),
         "async jobs ready"
     );
+    let exports = exports::ExportManager::new(Arc::clone(&projects), args.export_concurrency)?;
+    tracing::info!(
+        concurrency = args.export_concurrency.max(1),
+        "audiobook exports ready"
+    );
 
     let api_keys: Arc<Vec<String>> = Arc::new(
         args.api_keys
@@ -1056,6 +1067,7 @@ async fn main() -> anyhow::Result<()> {
         service,
         jobs,
         projects,
+        exports,
         project_lock,
         pronunciation,
         default_loudness,
@@ -1134,6 +1146,22 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/projects/{id}/speechproj",
             get(projects::project_speechproj),
+        )
+        .route(
+            "/v1/projects/{id}/exports",
+            get(exports::list_exports).post(exports::create_export),
+        )
+        .route(
+            "/v1/projects/{id}/exports/{export_id}",
+            get(exports::get_export).delete(exports::delete_export),
+        )
+        .route(
+            "/v1/projects/{id}/exports/{export_id}/audio",
+            get(exports::export_audio),
+        )
+        .route(
+            "/v1/projects/{id}/exports/{export_id}/subtitles",
+            get(exports::export_subtitles),
         )
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
