@@ -1,14 +1,15 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.6 adds audiobook projects, EPUB/FB2/DOCX/TXT/Markdown import, chapter generation, ACX loudness normalization, SRT/VTT subtitles and `.speechproj` manifests.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.7 adds PDF import (text layer) and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.6 «Books & Projects»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
-плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції та
-озвучення книг по главах з LUFS-нормалізацією і субтитрами.
+**v0.7 «PDF & Export»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
+плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
+озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF та
+експорт готової аудіокниги в M4B/MP3/OGG.
 
 Реалізовано:
 
@@ -42,9 +43,13 @@
   token IDs звірені 1:1 із системним SentencePiece 0.2.0.
 - `speech-inference` — ONNX Runtime 1.31.0 (офіційний x64 build; перевірено на
   AVX-only Xeon E5-2650), автоматичний біндінг входів `tokens` / `voice` / `speed`.
+- `speech-export` — експорт книги в **M4B** (AAC, глави, обкладинка, метадані),
+  **MP3** (ID3v2.4 CHAP/CTOC/APIC) та **OGG/Opus** (OpusTags, глави, обкладинка);
+  об'єднані SRT/VTT. Pure-Rust енкодери, без ffmpeg у рантаймі.
 - `speech-server` — Axum: REST, streaming WAV, асинхронні job-и + SSE, webhook-и,
   OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP,
-  API проєктів книг, імпорт, генерація глав, SRT/VTT, `.speechproj`.
+  API проєктів книг, імпорт, генерація глав, SRT/VTT, `.speechproj`,
+  асинхронні export-job-и аудіокниг.
 
 ## Архітектура
 
@@ -54,6 +59,7 @@ crates/
 ├── speech-text/        # Препроцесинг, вербалізація, наголоси, IPA, чанки, імпорт, вимова
 ├── speech-inference/   # ONNX Runtime: TTS-генератор, Gemma, accentor, voice encoder
 ├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP
+├── speech-export/      # M4B (AAC), MP3, OGG/Opus, глави, обкладинка, SRT/VTT
 └── speech-server/      # Axum + Wyoming + MCP (HTTP і stdio-проксі promin-mcp)
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
 ```
@@ -79,7 +85,7 @@ models/
 │   └── config.json
 ├── speakers/                 # клоновані голоси: <name>.npy (float32[256])
 ├── jobs/                     # асинхронні завдання: <id>.json + <id>.wav
-└── projects/                 # книги: <id>/project.json + chapters/<n>.wav
+└── projects/                 # книги: <id>/project.json + chapters/<n>.wav + exports/
 ```
 
 Шлях до моделей задається через `PROMIN_MODELS_DIR`; каталог клонованих голосів —
@@ -200,7 +206,7 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `POST` | `/v1/projects/generate-async` | Довгий текст → `202` + job record (legacy) |
 | `GET` | `/v1/projects` | Список книг |
 | `POST` | `/v1/projects` | Створити проєкт із JSON |
-| `POST` | `/v1/projects/import` | Multipart-імпорт EPUB/FB2/DOCX/TXT/MD або `.speechproj` |
+| `POST` | `/v1/projects/import` | Multipart-імпорт EPUB/FB2/DOCX/PDF/TXT/MD або `.speechproj` |
 | `GET` | `/v1/projects/{id}` | Повний проєкт із главами |
 | `PUT` | `/v1/projects/{id}` | Метадані, налаштування синтезу, словник вимови |
 | `DELETE` | `/v1/projects/{id}` | Скасувати job-и глави та видалити проєкт |
@@ -211,6 +217,12 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt` | Субтитри глави |
 | `GET` | `/v1/projects/{id}/manifest` | JSON-манифест із посиланнями на аудіо/субтитри |
 | `GET` | `/v1/projects/{id}/speechproj` | Скачати `.speechproj` |
+| `GET` | `/v1/projects/{id}/exports` | Список export-job-ів проєкту |
+| `POST` | `/v1/projects/{id}/exports` | Створити експорт `{format, bitrate_kbps?, cover_base64?, ...}`; 409, якщо не всі глави `completed` |
+| `GET` | `/v1/projects/{id}/exports/{export_id}` | Статус, прогрес, тривалість, розмір, помилка |
+| `DELETE` | `/v1/projects/{id}/exports/{export_id}` | Видалити експорт і його файли: 204/404 |
+| `GET` | `/v1/projects/{id}/exports/{export_id}/audio` | Готовий M4B/MP3/OGG; 409, якщо експорт не завершений |
+| `GET` | `/v1/projects/{id}/exports/{export_id}/subtitles?format=srt\|vtt` | Об'єднані субтитри книги |
 | `GET` | `/v1/jobs?limit=50` | Останні завдання |
 | `GET` | `/v1/jobs/{id}` | Статус, прогрес, метадані |
 | `DELETE` | `/v1/jobs/{id}` | Скасувати: 204, 404 або 409 (уже завершено) |
@@ -220,6 +232,13 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `GET` | `/v1/audio/voices` | Голоси у форматі OpenAI-подібного списку |
 | `GET` | `/v1/models` | OpenAI-сумісний список моделей |
 | `POST` | `/mcp` | MCP JSON-RPC 2.0 (Streamable HTTP, stateless) |
+
+Потоковий синтез (`/api/synthesize/stream`, `/v1/tts/stream`, Wyoming) ділить
+текст на **окремі речення**: перший аудіочанк віддається після синтезу першого
+речення, а наступні генеруються послідовно, поки клієнт відтворює попередні.
+Сусідні речення не об'єднуються; `max_chars` (50–5000) обмежує лише занадто
+довге речення, яке додатково ріжеться за комами/тире/пробілами. Це зменшує
+затримку до першого звуку з десятків секунд до кількох секунд.
 
 ### Синтез
 
@@ -353,6 +372,57 @@ curl -X POST http://localhost:8010/v1/projects/import \
   -F 'file=@book.speechproj'
 ```
 
+### Експорт аудіокниг (v0.7)
+
+Експорт — асинхронний job, як і генерація глав. Вимагається, щоб **усі** глави
+проєкту мали статус `completed` і файл аудіо; інакше `POST` повертає `409` зі
+списком `pending_chapters`. Експорт прив'язаний до `project.updated_at`: якщо
+проєкт змінився після старту, запис позначається `stale` (аудіо лишається
+доступним, але його слід перегенерувати).
+
+Формати та типові бітрейти:
+
+| Формат | Кодек | Типово | Діапазон | Особливості |
+|---|---|---|---|---|
+| `m4b` | AAC-LC | 96 кбіт/с | 32–256 | глави `chpl`, обкладинка `covr`, `stik=9`, metadata |
+| `mp3` | MPEG-1/2 Layer III | 64 кбіт/с | 32–160 | ID3v2.4 `CHAP`/`CTOC`/`APIC` |
+| `ogg` | Opus | 48 кбіт/с | 16–128 | OpusTags, глави, обкладинка |
+
+```bash
+# Створити експорт (metadata опційна; cover_base64 — data URI або base64)
+curl -X POST http://localhost:8010/v1/projects/<id>/exports \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{
+    "format": "m4b",
+    "bitrate_kbps": 96,
+    "title": "Моя книга",
+    "author": "Автор",
+    "album": "Моя книга",
+    "narrator": "Диктор",
+    "year": "2026",
+    "description": "Опис"
+  }'
+# -> 202 {"id":"...","status":"queued","format":"m4b","bitrate_kbps":96,...}
+
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/exports/<export_id>
+# статуси: queued, running, completed, failed, cancelled; progress 0-100
+
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/exports/<export_id>/audio -o book.m4b
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8010/v1/projects/<id>/exports/<export_id>/subtitles?format=srt' -o book.srt
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8010/v1/projects/<id>/exports/<export_id>/subtitles?format=vtt' -o book.vtt
+```
+
+Файли лежать у `<projects>/<id>/exports/<export_id>.{m4b,mp3,ogg,srt,vtt,json}`;
+під час роботи поруч є `.part`. Після рестарту незавершені експорти позначаються
+`failed`, завершені лишаються доступними. `PROMIN_EXPORT_CONCURRENCY` (типово 1)
+обмежує одночасне кодування. Без `cover_base64` вбудовується стандартна
+обкладинка 600×600 PNG.
+
 ### OpenAI-сумісний API
 
 ```bash
@@ -418,7 +488,8 @@ MCP audio content (`audio/wav` base64) і текст із метаданими.
 | `PROMIN_SPEAKERS_DIR` | `<models>/speakers` | Клоновані голоси |
 | `PROMIN_JOBS_DIR` | `<models>/jobs` | Job-и та аудіо |
 | `PROMIN_JOBS_CONCURRENCY` | `1` | Одночасних job-ів |
-| `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV) |
+| `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV + exports) |
+| `PROMIN_EXPORT_CONCURRENCY` | `1` | Одночасних експортів аудіокниг |
 | `PROMIN_PRONUNCIATION_FILE` | `<data>/pronunciation.json` | Глобальний словник вимови |
 | `PROMIN_LOUDNESS_TARGET` | `-19` | Ціль LUFS для нових проєктів |
 | `PROMIN_TRUE_PEAK` | `-3` | Ціль dBTP для нових проєктів |
@@ -442,7 +513,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Golden-тести accentor/Gemma/voice encoder потребують моделей і запускаються
 окремо (див. `crates/*/tests`). Імпорт книг перевіряється синтетичними
-EPUB2/EPUB3/FB2/DOCX/ZIP-фікстурами, LUFS — еталонним синусом і сплесками.
+EPUB2/EPUB3/FB2/DOCX/PDF/ZIP-фікстурами, LUFS — еталонним синусом і сплесками,
+експорт — синтетичними WAV-главами з перевіркою контейнерів і субтитрів.
 
 ## Ліцензія та застереження
 
