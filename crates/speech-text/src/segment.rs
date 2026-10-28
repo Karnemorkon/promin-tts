@@ -273,6 +273,35 @@ pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Розбити текст на окремі речення для потокового синтезу.
+///
+/// На відміну від [`chunk_text`], сусідні речення не об'єднуються: перший
+/// аудіочанк можна віддати одразу після синтезу першого речення, а решту
+/// генерувати послідовно, поки клієнт відтворює попередні. Занадто довге
+/// речення ріжеться за комами/тире/пробілами, щоб не перевищити `max_chars`
+/// (0 — не обмежувати довжину речення).
+pub fn sentence_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let sentences = split_sentences(text);
+    if sentences.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::with_capacity(sentences.len());
+    for sentence in sentences {
+        if max_chars > 0 && sentence.chars().count() > max_chars {
+            chunks.extend(split_long_sentence(&sentence, max_chars));
+        } else {
+            chunks.push(sentence);
+        }
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +406,40 @@ mod tests {
     #[test]
     fn zero_limit_keeps_text() {
         assert_eq!(chunk_text("А. Б.", 0), vec!["А. Б."]);
+    }
+
+    #[test]
+    fn sentence_chunks_keep_every_sentence_separate() {
+        assert_eq!(
+            sentence_chunks("Привіт, світе! Як справи? Добре.", 1200),
+            vec!["Привіт, світе!", "Як справи?", "Добре."]
+        );
+    }
+
+    #[test]
+    fn sentence_chunks_split_only_long_sentences() {
+        let text = "Коротке речення. Це дуже довге речення, яке містить багато слів, і його треба розбити на частини.";
+        let chunks = sentence_chunks(text, 25);
+        assert_eq!(chunks[0], "Коротке речення.");
+        assert!(chunks.len() > 2);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 25, "chunk too long: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn sentence_chunks_handle_text_without_terminal_punctuation() {
+        let text = "Це текст без крапки який треба розбити на безпечні частини";
+        let chunks = sentence_chunks(text, 20);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 20, "chunk too long: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn sentence_chunks_are_empty_for_blank_text() {
+        assert!(sentence_chunks("   ", 100).is_empty());
+        assert!(sentence_chunks("", 100).is_empty());
     }
 }

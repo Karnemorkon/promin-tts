@@ -17,7 +17,7 @@ use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
 use speech_text::pronunciation::Pronouncer;
-use speech_text::segment::chunk_text;
+use speech_text::segment::{chunk_text, sentence_chunks};
 use speech_text::tokenizer::CharTokenizer;
 use speech_text::verbalize;
 
@@ -965,7 +965,7 @@ impl SynthService {
             None => self.resolve_voice(voice)?,
         };
         let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, None);
-        let chunks = chunk_text(&verbalized, max_chars);
+        let chunks = sentence_chunks(&verbalized, max_chars);
         if chunks.is_empty() {
             return Err(SynthError::BadRequest(
                 "text contains no speakable content".into(),
