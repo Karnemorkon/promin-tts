@@ -29,7 +29,7 @@ RUN cargo build --release -p speech-server --bins
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/models /data/speakers /data/jobs /data/projects
 
@@ -52,7 +52,8 @@ ENV LD_LIBRARY_PATH=/opt/ort/lib \
 
 EXPOSE 8010 10200
 
+# curl is intentionally not installed: bash + /dev/tcp keeps the image small.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8010/healthz || exit 1
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8010 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q '200'"]
 
 ENTRYPOINT ["/usr/local/bin/speech-server"]
