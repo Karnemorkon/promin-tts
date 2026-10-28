@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::projects::{ProjectSettings, PronunciationRule};
+use crate::projects::{ProjectSettings, PronunciationRule, Role};
 
 /// Стан завдання.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +132,9 @@ pub struct JobRecord {
     /// Знімок проєктних правил вимови на момент постановки.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pronunciation: Vec<PronunciationRule>,
+    /// Знімок ролей діалогу на момент постановки.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Role>,
 }
 
 impl JobRecord {
@@ -154,6 +157,7 @@ impl JobRecord {
             audio_location: AudioLocation::Job,
             project_settings: None,
             pronunciation: Vec::new(),
+            roles: Vec::new(),
         }
     }
 
@@ -165,6 +169,7 @@ impl JobRecord {
         chapter_index: usize,
         project_settings: Option<ProjectSettings>,
         pronunciation: Vec<PronunciationRule>,
+        roles: Vec<Role>,
     ) -> Self {
         let mut job = Self::new(id, request);
         job.audio_location = AudioLocation::ProjectChapter {
@@ -173,6 +178,7 @@ impl JobRecord {
         };
         job.project_settings = project_settings;
         job.pronunciation = pronunciation;
+        job.roles = roles;
         job
     }
 
@@ -455,11 +461,13 @@ mod tests {
                 regex: false,
                 case_sensitive: true,
             }],
+            vec![Role::with_voice("Іван", "Speaker_1")],
         );
         assert_eq!(job.project_id(), Some("book-1"));
         assert_eq!(job.chapter_index(), Some(3));
         assert!(job.project_settings.is_some());
         assert_eq!(job.pronunciation.len(), 1);
+        assert_eq!(job.roles.len(), 1);
 
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("project_chapter"));
@@ -467,6 +475,7 @@ mod tests {
         assert_eq!(parsed.project_id(), Some("book-1"));
         assert_eq!(parsed.chapter_index(), Some(3));
         assert_eq!(parsed.pronunciation.len(), 1);
+        assert_eq!(parsed.roles.len(), 1);
         assert_eq!(parsed.audio_location, job.audio_location);
 
         let plain = JobRecord::new("job-2".into(), sample_request());

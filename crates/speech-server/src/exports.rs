@@ -1363,6 +1363,7 @@ mod tests {
                     start_ms: 0,
                     end_ms: 900,
                     text,
+                    role: None,
                 }],
             );
         }
@@ -1394,6 +1395,7 @@ mod tests {
                 start_ms: 0,
                 end_ms: 900,
                 text,
+                role: None,
             }],
         );
         store.create(&project).unwrap();

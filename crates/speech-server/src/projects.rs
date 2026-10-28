@@ -1,4 +1,4 @@
-//! REST API проєктів аудіокниг (v0.6).
+//! REST API проєктів аудіокниг (v0.8).
 //!
 //! Проєкт — це набір глав із текстом і налаштуваннями синтезу. Аудіо глав
 //! генерується через `JobManager` (job-и з `AudioLocation::ProjectChapter`),
@@ -16,8 +16,8 @@ use serde::Deserialize;
 use serde_json::json;
 use speech_core::jobs::JobRequest;
 use speech_core::projects::{
-    now_rfc3339, valid_project_id, Chapter, ChapterStatus, LoudnessSettings, Project,
-    ProjectSettings, ProjectStore, PronunciationRule, MAX_TITLE_CHARS,
+    now_rfc3339, valid_project_id, validate_roles, Chapter, ChapterStatus, LoudnessSettings,
+    Project, ProjectSettings, ProjectStore, PronunciationRule, Role, MAX_TITLE_CHARS,
 };
 use speech_text::import::{import_book, ImportError, ImportedBook};
 
@@ -138,6 +138,8 @@ pub struct CreateProjectRequest {
     settings: Option<ProjectSettings>,
     #[serde(default)]
     pronunciation: Vec<PronunciationRule>,
+    #[serde(default)]
+    roles: Vec<Role>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +154,8 @@ pub struct UpdateProjectRequest {
     settings: Option<ProjectSettings>,
     #[serde(default)]
     pronunciation: Option<Vec<PronunciationRule>>,
+    #[serde(default)]
+    roles: Option<Vec<Role>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +220,7 @@ pub async fn create_project(
         .settings
         .unwrap_or_else(|| default_settings(&state.default_loudness));
     project.pronunciation = request.pronunciation;
+    project.roles = request.roles;
     project.chapters = request
         .chapters
         .into_iter()
@@ -440,6 +445,16 @@ pub async fn update_project(
             stale = true;
         }
     }
+    if let Some(mut roles) = request.roles {
+        for role in &mut roles {
+            role.normalize();
+        }
+        validate_roles(&roles).map_err(|error| ProjectApiError::bad(error.to_string()))?;
+        if roles != project.roles {
+            project.roles = roles;
+            stale = true;
+        }
+    }
 
     if stale {
         project.mark_all_stale();
@@ -504,6 +519,7 @@ pub async fn generate_project(
     let mut pending: Vec<(usize, String, JobRequest)> = Vec::new();
     let settings;
     let pronunciation;
+    let roles;
     let project_id;
 
     // Спершу під lock фіксуємо `queued`-статуси та зберігаємо проєкт.
@@ -534,6 +550,7 @@ pub async fn generate_project(
 
         settings = project.settings.clone();
         pronunciation = project.pronunciation.clone();
+        roles = project.roles.clone();
         project_id = project.id.clone();
 
         for index in indices {
@@ -603,6 +620,7 @@ pub async fn generate_project(
                 job_request,
                 Some(settings.clone()),
                 pronunciation.clone(),
+                roles.clone(),
             )
             .await
         {

@@ -132,6 +132,7 @@ mod tests {
             start_ms,
             end_ms,
             text: text.to_string(),
+            role: None,
         }
     }
 

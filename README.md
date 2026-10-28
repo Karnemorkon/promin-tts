@@ -1,15 +1,16 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.7 adds PDF import (text layer) and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.8 adds dialogue roles with per-role voices, on top of v0.7 PDF import (text layer) and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.7 «PDF & Export»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
+**v0.8 «Діалоги та ролі»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
-озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF та
-експорт готової аудіокниги в M4B/MP3/OGG.
+озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
+експорт готової аудіокниги в M4B/MP3/OGG та багатоголосий синтез діалогів
+із ролями персонажів.
 
 Реалізовано:
 
@@ -17,6 +18,8 @@
   2.9 млн форм), українська IPA-транскрипція. Фонеми звірені 1:1 з `holos-tts-core`.
 - `speech-text::segment` — нарізка довгого тексту на речення/чанки з урахуванням
   скорочень, ініціалів, дробів і лапок.
+- `speech-text::dialogue` — розмітка діалогів `Ім'я: репліка` та `[Ім'я] репліка`
+  для зареєстрованих ролей; невідомі префікси лишаються нарацією.
 - `speech-inference::accentor` — accentor-lite (ONNX LSTM, 1.2 MB): наголос для
   OOV-слів; словник має пріоритет. Golden-тест 54/54 проти C++ `holos::Accentor`.
 - `speech-inference::voice_encoder` — ONNX voice encoder: wave float32 `[1,N]` @24 кГц
@@ -25,8 +28,9 @@
   numpy-сумісне): атомарний запис, рескан каталогу при кожному зверненні.
 - `speech-core::jobs` — файлове сховище завдань `<jobs>/<id>.json` + `<id>.wav`,
   атомарний запис, відновлення перерваних завдань після рестарту.
-- `speech-core::projects` — модель книги/глав, статуси, `.speechproj` (JSON),
-  атомарне сховище `<projects>/<id>/project.json` + `chapters/<n>.wav`.
+- `speech-core::projects` — модель книги/глав, ролі діалогів (ім'я → голос),
+  статуси, `.speechproj` (JSON), атомарне сховище
+  `<projects>/<id>/project.json` + `chapters/<n>.wav`.
 - `speech-text::import` — EPUB 2/3, FB2 (UTF-8/CP1251), DOCX, PDF (текстовий
   шар), TXT, Markdown; захист ZIP, ліміти розміру/глав, розбиття великих XHTML
   за заголовками. PDF: закладки → евристика заголовків → групування сторінок;
@@ -48,8 +52,8 @@
   об'єднані SRT/VTT. Pure-Rust енкодери, без ffmpeg у рантаймі.
 - `speech-server` — Axum: REST, streaming WAV, асинхронні job-и + SSE, webhook-и,
   OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP,
-  API проєктів книг, імпорт, генерація глав, SRT/VTT, `.speechproj`,
-  асинхронні export-job-и аудіокниг.
+  API проєктів книг, імпорт, генерація глав, багатоголосий синтез діалогів,
+  SRT/VTT, `.speechproj`, асинхронні export-job-и аудіокниг.
 
 ## Архітектура
 
@@ -289,7 +293,7 @@ Job-и зберігаються у `PROMIN_JOBS_DIR`; після рестарт�
 `failed` («server restarted before completion»), завершені лишаються доступними.
 `PROMIN_JOBS_CONCURRENCY` (типово 1) обмежує одночасний синтез.
 
-### Книги та проєкти (v0.6)
+### Книги та проєкти (v0.6+)
 
 Проєкт — це книга з главами, налаштуваннями синтезу та власним словником вимови.
 Аудіо кожної глави генерується окремим job-ом і зберігається в
@@ -342,9 +346,10 @@ curl -H 'Authorization: Bearer change-me' \
 ```
 
 Статуси глави: `empty`, `queued`, `running`, `completed`, `failed`, `cancelled`,
-`stale`. Якщо текст, налаштування або словник вимови змінилися під час генерації,
-готова глава стає `stale` і потребує перегенерації (`force: true`). Після рестарту
-активні глави позначаються `failed`, а `completed` без файлу аудіо — `stale`.
+`stale`. Якщо текст, налаштування, ролі або словник вимови змінилися під час
+генерації, готова глава стає `stale` і потребує перегенерації (`force: true`).
+Після рестарту активні глави позначаються `failed`, а `completed` без файлу
+аудіо — `stale`.
 
 Нормалізація гучності типово ACX: **−19 LUFS** та **−3 dBTP** (можна змінити
 `PROMIN_LOUDNESS_TARGET`/`PROMIN_TRUE_PEAK` або `settings.loudness` проєкту).
@@ -371,6 +376,38 @@ curl -X POST http://localhost:8010/v1/projects/import \
   -H 'Authorization: Bearer change-me' \
   -F 'file=@book.speechproj'
 ```
+
+### Діалоги та ролі (v0.8)
+
+Ролі задаються на рівні проєкту: ім'я в тексті → голос. У главі репліка
+позначається на початку рядка як `Іван: текст` або `[Іван] текст`; усе інше —
+нарація голосом проєкту. Порівняння імен регістронезалежне, невідомі префікси
+не змінюють текст. Порожній рядок розділяє абзаци.
+
+```bash
+# Додати/замінити ролі (готові глави стануть stale)
+curl -X PUT http://localhost:8010/v1/projects/<id> \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"roles":[
+    {"name":"Іван","voice":"Speaker_0"},
+    {"name":"Марія","voice":"Speaker_1"}
+  ]}'
+```
+
+Текст глави може виглядати так:
+
+```text
+Був теплий вечір.
+Іван: Привіт, Маріє!
+Марія: Привіт, Іване.
+```
+
+Кожен голос резолвиться в ембеддінг один раз на главу; чанки різних ролей
+склеюються тим самим кросфейдом, а `chunk_timings[].role` зберігає автора
+репліки для субтитрів і майбутнього редактора. Якщо `voice` ролі не задано,
+використовується голос проєкту. Ролі входять у `.speechproj` і у знімок job-а:
+зміна ролей під час генерації позначає главу `stale`.
 
 ### Експорт аудіокниг (v0.7)
 

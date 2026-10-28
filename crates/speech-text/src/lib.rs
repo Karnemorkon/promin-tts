@@ -1,3 +1,4 @@
+pub mod dialogue;
 pub mod gemma_prep;
 #[cfg(feature = "import")]
 pub mod import;

@@ -11,7 +11,10 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use speech_audio::loudness::LoudnessTarget;
 use speech_core::jobs::{AudioLocation, JobRecord, JobRequest, JobStatus, JobStore};
-use speech_core::projects::{valid_project_id, ProjectSettings, ProjectStore, PronunciationRule};
+use speech_core::projects::{
+    valid_project_id, ProjectSettings, ProjectStore, PronunciationRule, Role,
+};
+use speech_text::dialogue::split_dialogue;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
 use crate::pronunciation::PronunciationStore;
@@ -221,6 +224,7 @@ impl JobManager {
         request: JobRequest,
         project_settings: Option<ProjectSettings>,
         pronunciation: Vec<PronunciationRule>,
+        roles: Vec<Role>,
     ) -> Result<JobRecord, String> {
         validate_job_request(&request)?;
         if !valid_project_id(project_id) {
@@ -233,6 +237,7 @@ impl JobManager {
             chapter_index,
             project_settings,
             pronunciation,
+            roles,
         );
         self.enqueue(job).await
     }
@@ -545,6 +550,10 @@ impl JobManager {
         let mode = VerbalizerMode::parse(request.auto_verbalize.as_ref());
         let max_chars = request.max_chars.unwrap_or(1_200).clamp(50, 5_000);
         let crossfade_ms = request.crossfade_ms.unwrap_or(40).min(200);
+        let role_names: Vec<&str> = job.roles.iter().map(|role| role.name.as_str()).collect();
+        let segments = split_dialogue(&request.text, &role_names);
+        let has_dialogue = segments.iter().any(|segment| segment.role.is_some());
+        let roles = job.roles.clone();
 
         let service = Arc::clone(&self.service);
         let state = Arc::clone(&self.state);
@@ -555,19 +564,35 @@ impl JobManager {
 
         let result = tokio::task::spawn_blocking(move || {
             let mut progress = progress_callback(state, store, events, cancel, job_id);
-            service.synthesize_chapter_pcm(
-                &request.text,
-                request.voice.as_deref(),
-                None,
-                request.speed,
-                mode,
-                request.raw_stress,
-                max_chars,
-                crossfade_ms,
-                Some(pronouncer.as_ref()),
-                loudness_target,
-                Some(&mut progress),
-            )
+            if has_dialogue {
+                service.synthesize_dialogue_chapter_pcm(
+                    &segments,
+                    request.voice.as_deref(),
+                    &roles,
+                    request.speed,
+                    mode,
+                    request.raw_stress,
+                    max_chars,
+                    crossfade_ms,
+                    Some(pronouncer.as_ref()),
+                    loudness_target,
+                    Some(&mut progress),
+                )
+            } else {
+                service.synthesize_chapter_pcm(
+                    &request.text,
+                    request.voice.as_deref(),
+                    None,
+                    request.speed,
+                    mode,
+                    request.raw_stress,
+                    max_chars,
+                    crossfade_ms,
+                    Some(pronouncer.as_ref()),
+                    loudness_target,
+                    Some(&mut progress),
+                )
+            }
         })
         .await;
 
@@ -702,6 +727,7 @@ impl JobManager {
         let text_changed = chapter.text != job.request.text;
         let settings_changed = job.project_settings.as_ref() != Some(&project.settings);
         let pronunciation_changed = job.pronunciation != project.pronunciation;
+        let roles_changed = job.roles != project.roles;
 
         self.projects
             .save_chapter_audio(project_id, chapter_index, wav)
@@ -716,7 +742,7 @@ impl JobManager {
             output.loudness.clone(),
             output.chunk_timings.clone(),
         );
-        if text_changed || settings_changed || pronunciation_changed {
+        if text_changed || settings_changed || pronunciation_changed || roles_changed {
             chapter.mark_stale();
             if text_changed {
                 chapter.error = Some("chapter text changed after generation".to_string());

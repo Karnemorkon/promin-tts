@@ -1,6 +1,6 @@
 //! Синтез-сервіс: моделі, голоси, повний ланцюжок текст -> WAV.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -12,8 +12,9 @@ use speech_audio::{
     pcm16_bytes, resample_to_24k, wav_bytes, SAMPLE_RATE,
 };
 use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
-use speech_core::projects::{ChunkTiming, LoudnessReport as ProjectLoudnessReport};
+use speech_core::projects::{ChunkTiming, LoudnessReport as ProjectLoudnessReport, Role};
 use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
+use speech_text::dialogue::DialogueSegment;
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
 use speech_text::pronunciation::Pronouncer;
@@ -126,6 +127,22 @@ pub struct SynthChapterOutput {
     /// `None`, якщо нормалізацію вимкнено або сигнал надто короткий.
     pub loudness: Option<ProjectLoudnessReport>,
     pub duration_ms: u64,
+}
+
+/// Запланований чанк глави: яким голосом озвучити та що показати в субтитрах.
+struct PlannedChunk {
+    voice: Option<String>,
+    spoken: String,
+    timing: String,
+    role: Option<String>,
+}
+
+/// Готове аудіо глави до формування [`SynthChapterOutput`].
+struct ChapterAudio {
+    pcm: Vec<i16>,
+    chunk_timings: Vec<ChunkTiming>,
+    loudness: Option<ProjectLoudnessReport>,
+    duration_ms: u64,
 }
 
 /// Метадані, готові до відправки клієнту перед першим аудіо-чанком.
@@ -849,9 +866,9 @@ impl SynthService {
         let text = self.validate_long_text(text)?;
         self.validate_speed(speed)?;
 
-        let voice_vector = match audio_base64 {
-            Some(reference) => self.encode_reference(reference)?,
-            None => self.resolve_voice(voice)?,
+        let reference = match audio_base64 {
+            Some(reference) => Some(self.encode_reference(reference)?),
+            None => None,
         };
         let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
         tracing::debug!(verbalizer, vb_ms, "chapter text verbalized");
@@ -862,8 +879,175 @@ impl SynthService {
                 "text contains no speakable content".into(),
             ));
         }
-        let total = chunks.len();
         let timing_texts = timing_texts(text, &chunks, max_chars);
+        let plan: Vec<PlannedChunk> = chunks
+            .into_iter()
+            .zip(timing_texts)
+            .map(|(spoken, timing)| PlannedChunk {
+                voice: voice.map(str::to_string),
+                spoken,
+                timing,
+                role: None,
+            })
+            .collect();
+
+        let audio = self.synthesize_planned_chunks(
+            &plan,
+            reference.as_deref(),
+            speed,
+            raw_stress,
+            crossfade_ms,
+            loudness_target,
+            &mut progress,
+        )?;
+
+        Ok(SynthChapterOutput {
+            pcm: audio.pcm,
+            verbalizer,
+            vb_ms,
+            chunks: plan.len(),
+            chunk_timings: audio.chunk_timings,
+            loudness: audio.loudness,
+            duration_ms: audio.duration_ms,
+        })
+    }
+
+    /// Синтез глави з діалогами: кожен сегмент озвучується голосом своєї ролі.
+    ///
+    /// Нарація (`role = None`) використовує голос проєкту, репліки — голос ролі
+    /// з `roles`; якщо голос ролі не заданий, береться голос проєкту. Таймінги
+    /// зберігають роль кожного чанка для субтитрів і майбутнього редактора.
+    #[allow(clippy::too_many_arguments)]
+    pub fn synthesize_dialogue_chapter_pcm(
+        &self,
+        segments: &[DialogueSegment],
+        default_voice: Option<&str>,
+        roles: &[Role],
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        max_chars: usize,
+        crossfade_ms: u32,
+        pronunciation: Option<&Pronouncer>,
+        loudness_target: Option<speech_audio::loudness::LoudnessTarget>,
+        mut progress: Option<&mut dyn FnMut(usize, usize) -> bool>,
+    ) -> Result<SynthChapterOutput, SynthError> {
+        self.validate_speed(speed)?;
+        let total_chars: usize = segments
+            .iter()
+            .map(|segment| segment.text.chars().count())
+            .sum();
+        if total_chars == 0 {
+            return Err(SynthError::BadRequest("text must not be empty".into()));
+        }
+        if total_chars > MAX_JOB_TEXT_CHARS {
+            return Err(SynthError::BadRequest(format!(
+                "text is too long: max {MAX_JOB_TEXT_CHARS} characters"
+            )));
+        }
+
+        let role_voices: HashMap<String, Option<String>> = roles
+            .iter()
+            .map(|role| (role.name.to_lowercase(), role.voice.clone()))
+            .collect();
+
+        let mut plan = Vec::new();
+        let mut verbalizer = None;
+        let mut vb_ms = 0u64;
+        for segment in segments {
+            let (verbalized, label, segment_vb_ms) =
+                self.apply_verbalizer(&segment.text, mode, pronunciation);
+            vb_ms = vb_ms.saturating_add(segment_vb_ms);
+            verbalizer = Some(match verbalizer {
+                None => label,
+                Some(previous) if previous == label => previous,
+                Some(_) => "mixed",
+            });
+
+            let chunks = chunk_text(&verbalized, max_chars);
+            if chunks.is_empty() {
+                continue;
+            }
+            let timing_texts = timing_texts(&segment.text, &chunks, max_chars);
+            let voice = segment
+                .role
+                .as_ref()
+                .and_then(|role| role_voices.get(&role.to_lowercase()))
+                .cloned()
+                .flatten()
+                .or_else(|| default_voice.map(str::to_string));
+            for (spoken, timing) in chunks.into_iter().zip(timing_texts) {
+                plan.push(PlannedChunk {
+                    voice: voice.clone(),
+                    spoken,
+                    timing,
+                    role: segment.role.clone(),
+                });
+            }
+        }
+        if plan.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+        tracing::debug!(
+            segments = segments.len(),
+            chunks = plan.len(),
+            vb_ms,
+            "dialogue chapter verbalized"
+        );
+
+        let audio = self.synthesize_planned_chunks(
+            &plan,
+            None,
+            speed,
+            raw_stress,
+            crossfade_ms,
+            loudness_target,
+            &mut progress,
+        )?;
+
+        Ok(SynthChapterOutput {
+            pcm: audio.pcm,
+            verbalizer: verbalizer.unwrap_or("off"),
+            vb_ms,
+            chunks: plan.len(),
+            chunk_timings: audio.chunk_timings,
+            loudness: audio.loudness,
+            duration_ms: audio.duration_ms,
+        })
+    }
+
+    /// Озвучити план чанків, за потреби різними голосами, і зібрати главу.
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_planned_chunks(
+        &self,
+        chunks: &[PlannedChunk],
+        reference: Option<&[f32]>,
+        speed: f32,
+        raw_stress: bool,
+        crossfade_ms: u32,
+        loudness_target: Option<speech_audio::loudness::LoudnessTarget>,
+        progress: &mut Option<&mut dyn FnMut(usize, usize) -> bool>,
+    ) -> Result<ChapterAudio, SynthError> {
+        let total = chunks.len();
+        if total == 0 {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+
+        // Голоси резолвимо один раз на унікальне ім'я: `.npy` не перечитується
+        // для кожної репліки.
+        let mut voices: HashMap<Option<String>, Vec<f32>> = HashMap::new();
+        if reference.is_none() {
+            for chunk in chunks {
+                if !voices.contains_key(&chunk.voice) {
+                    let vector = self.resolve_voice(chunk.voice.as_deref())?;
+                    voices.insert(chunk.voice.clone(), vector);
+                }
+            }
+        }
 
         if let Some(cb) = progress.as_deref_mut() {
             if !cb(0, total) {
@@ -873,8 +1057,14 @@ impl SynthService {
 
         let mut audio_chunks = Vec::with_capacity(total);
         for (index, chunk) in chunks.iter().enumerate() {
+            let voice = match reference {
+                Some(vector) => vector,
+                None => voices
+                    .get(&chunk.voice)
+                    .expect("voice was resolved before synthesis"),
+            };
             let samples =
-                self.synthesize_verbalized_f32(chunk, &voice_vector, speed, raw_stress)?;
+                self.synthesize_verbalized_f32(&chunk.spoken, voice, speed, raw_stress)?;
             audio_chunks.push(samples);
             if let Some(cb) = progress.as_deref_mut() {
                 if !cb(index + 1, total) {
@@ -896,7 +1086,8 @@ impl SynthService {
             chunk_timings.push(ChunkTiming {
                 start_ms: samples_to_ms(start),
                 end_ms: samples_to_ms(end),
-                text: timing_texts[index].clone(),
+                text: chunks[index].timing.clone(),
+                role: chunks[index].role.clone(),
             });
             cursor = end;
         }
@@ -926,11 +1117,8 @@ impl SynthService {
             float_to_pcm16(&samples)
         };
 
-        Ok(SynthChapterOutput {
+        Ok(ChapterAudio {
             pcm,
-            verbalizer,
-            vb_ms,
-            chunks: total,
             chunk_timings,
             loudness,
             duration_ms,

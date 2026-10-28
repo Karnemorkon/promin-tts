@@ -5,6 +5,7 @@
 //! (унікальний `.tmp` + rename), тому перерваний процес не залишає
 //! напівфайлів.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -12,7 +13,9 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Версія схеми проєкту.
-pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 додає ролі діалогів (`Project::roles`); проєкти v1 читаються без змін.
+pub const PROJECT_SCHEMA_VERSION: u32 = 2;
 /// Максимальна кількість глав у проєкті.
 pub const MAX_CHAPTERS: usize = 2_000;
 /// Максимальна довжина тексту однієї глави (символів).
@@ -21,6 +24,10 @@ pub const MAX_CHAPTER_CHARS: usize = 200_000;
 pub const MAX_TOTAL_CHARS: usize = 2_000_000;
 /// Максимальна кількість правил вимови.
 pub const MAX_PRONUNCIATION_RULES: usize = 1_000;
+/// Максимальна кількість ролей діалогу в проєкті.
+pub const MAX_ROLES: usize = 100;
+/// Максимальна довжина назви ролі.
+pub const MAX_ROLE_NAME_CHARS: usize = 100;
 /// Максимальна довжина назви проєкту/глави.
 pub const MAX_TITLE_CHARS: usize = 500;
 /// Максимальна довжина id проєкту.
@@ -106,6 +113,89 @@ impl PronunciationRule {
         }
         Ok(())
     }
+}
+
+/// Роль діалогу: ім'я в тексті та голос, яким її озвучувати.
+///
+/// У главі репліка позначається як `Ім'я: текст` або `[Ім'я] текст`.
+/// Якщо `voice` не задано, використовується голос проєкту.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Role {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+}
+
+impl Role {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            voice: None,
+        }
+    }
+
+    pub fn with_voice(name: impl Into<String>, voice: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            voice: Some(voice.into()),
+        }
+    }
+
+    /// Обрізати пробіли в імені та голосі; порожній голос стає `None`.
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        if let Some(voice) = &mut self.voice {
+            *voice = voice.trim().to_string();
+            if voice.is_empty() {
+                self.voice = None;
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("role name must not be empty");
+        }
+        if self.name != self.name.trim() {
+            bail!("role name must not have leading or trailing whitespace");
+        }
+        if self.name.chars().count() > MAX_ROLE_NAME_CHARS {
+            bail!("role name is too long");
+        }
+        if self.name.chars().any(char::is_control) {
+            bail!("role name contains control characters");
+        }
+        if self.name.contains([':', '[', ']']) {
+            bail!("role name must not contain ':', '[' or ']'");
+        }
+        if let Some(voice) = &self.voice {
+            if voice.trim().is_empty() {
+                bail!("role voice must not be empty");
+            }
+            if voice != voice.trim() {
+                bail!("role voice must not have leading or trailing whitespace");
+            }
+            if voice.chars().count() > 100 {
+                bail!("role voice name is too long");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Перевірити набір ролей: ліміти, коректність імен і унікальність.
+pub fn validate_roles(roles: &[Role]) -> Result<()> {
+    if roles.len() > MAX_ROLES {
+        bail!("too many roles: {}", roles.len());
+    }
+    let mut seen = HashSet::with_capacity(roles.len());
+    for role in roles {
+        role.validate()?;
+        if !seen.insert(role.name.to_lowercase()) {
+            bail!("duplicate role name: {}", role.name);
+        }
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -258,6 +348,9 @@ pub struct ChunkTiming {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
+    /// Роль діалогу, якій належить чанк (`None` — нарація).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl ChunkTiming {
@@ -396,6 +489,9 @@ pub struct Project {
     pub source: SourceInfo,
     #[serde(default)]
     pub settings: ProjectSettings,
+    /// Ролі діалогу: ім'я в тексті -> голос.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Role>,
     #[serde(default)]
     pub chapters: Vec<Chapter>,
     #[serde(default)]
@@ -415,6 +511,7 @@ impl Project {
             language: default_language(),
             source: SourceInfo::default(),
             settings: ProjectSettings::default(),
+            roles: Vec::new(),
             chapters: Vec::new(),
             pronunciation: Vec::new(),
             created_at: now.clone(),
@@ -433,9 +530,13 @@ impl Project {
         self.updated_at = now_rfc3339();
     }
 
-    /// Привести індекси глав до порядку та оновити версію.
+    /// Привести індекси глав до порядку, назви ролей — до канонічного вигляду
+    /// та оновити версію.
     pub fn normalize(&mut self) {
         self.version = PROJECT_SCHEMA_VERSION;
+        for role in &mut self.roles {
+            role.normalize();
+        }
         for (position, chapter) in self.chapters.iter_mut().enumerate() {
             chapter.index = position;
         }
@@ -488,6 +589,7 @@ impl Project {
         for rule in &self.pronunciation {
             rule.validate()?;
         }
+        validate_roles(&self.roles)?;
         self.settings.validate()?;
         Ok(())
     }
@@ -811,6 +913,7 @@ mod tests {
                 start_ms: 0,
                 end_ms: 1_000,
                 text: "Привіт, світе!".into(),
+                role: None,
             }],
         );
         store.save(&mut project).unwrap();
@@ -943,5 +1046,50 @@ mod tests {
         assert_eq!(summary.total_duration_ms, 1_500);
         assert_eq!(summary.status, "draft");
         assert_eq!(summary.total_chars, project.total_chars());
+    }
+
+    #[test]
+    fn roles_roundtrip_and_normalize() {
+        let store = temp_store();
+        let mut project = sample_project();
+        project.roles = vec![Role::with_voice(" Іван ", " Speaker_1 ")];
+        project.normalize();
+        store.create(&project).unwrap();
+
+        let loaded = store.load(&project.id).unwrap().unwrap();
+        assert_eq!(loaded.roles, vec![Role::with_voice("Іван", "Speaker_1")]);
+        assert_eq!(loaded.version, PROJECT_SCHEMA_VERSION);
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_roles() {
+        let mut project = sample_project();
+
+        project.roles = vec![Role::new("")];
+        assert!(project.validate().is_err());
+
+        project.roles = vec![Role::new("Іван"), Role::new("іван")];
+        assert!(project.validate().is_err());
+
+        project.roles = vec![Role::new("Іван:")];
+        assert!(project.validate().is_err());
+
+        project.roles = vec![Role::new("Іван"), Role::new("Марія")];
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_v1_project_without_roles_loads() {
+        let json = r#"{
+            "id": "legacy",
+            "version": 1,
+            "title": "Книга",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "updated_at": "2026-01-01T00:00:00.000Z"
+        }"#;
+        let project: Project = serde_json::from_str(json).unwrap();
+        assert!(project.roles.is_empty());
+        assert!(project.validate().is_ok());
     }
 }
