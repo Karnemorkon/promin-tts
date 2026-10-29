@@ -17,6 +17,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::model::ModelIdentity;
 use crate::projects::{now_rfc3339, ProjectSettings, PronunciationRule, Role};
 
 /// Версія схеми маніфесту тейків.
@@ -34,8 +35,11 @@ pub const MAX_UNIT_TEXT_CHARS: usize = 20_000;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TakeManifest {
     pub version: u32,
-    /// Відбиток тексту глави, налаштувань, ролей і словника вимови.
+    /// Відбиток тексту глави, налаштувань, ролей, словника вимови та моделі.
     pub fingerprint: String,
+    /// Модель, якою згенеровано тейки. Відсутня в маніфестах до v0.10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelIdentity>,
     pub units: Vec<UnitTakes>,
     #[serde(default = "now_rfc3339")]
     pub updated_at: String,
@@ -75,9 +79,24 @@ impl TakeManifest {
         Self {
             version: TAKES_SCHEMA_VERSION,
             fingerprint: fingerprint.into(),
+            model: None,
             units,
             updated_at: now_rfc3339(),
         }
+    }
+
+    /// Записати модель, якою згенеровано тейки.
+    pub fn with_model(mut self, model: ModelIdentity) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    /// Чи збігається модель маніфесту з поточною.
+    ///
+    /// `None` (маніфест до v0.10) вважається невідомим і не збігається:
+    /// краще перегенерувати главу, ніж змішати аудіо двох моделей.
+    pub fn matches_model(&self, current: &ModelIdentity) -> bool {
+        self.model.as_ref() == Some(current)
     }
 
     pub fn touch(&mut self) {
@@ -103,6 +122,9 @@ impl TakeManifest {
         }
         if self.fingerprint.trim().is_empty() {
             bail!("takes fingerprint must not be empty");
+        }
+        if let Some(model) = &self.model {
+            model.validate()?;
         }
         if self.units.is_empty() {
             bail!("takes manifest has no units");
@@ -202,20 +224,26 @@ struct FingerprintSource<'a> {
     settings: &'a ProjectSettings,
     roles: &'a [Role],
     pronunciation: &'a [PronunciationRule],
+    model: Option<&'a ModelIdentity>,
 }
 
 /// SHA-256 відбиток глави для інвалідації кешу тейків.
+///
+/// `model` входить у відбиток: аудіо, згенероване іншою моделлю, не можна
+/// змішувати з новим навіть за однакового тексту й голосу.
 pub fn chapter_fingerprint(
     text: &str,
     settings: &ProjectSettings,
     roles: &[Role],
     pronunciation: &[PronunciationRule],
+    model: Option<&ModelIdentity>,
 ) -> String {
     let source = FingerprintSource {
         text,
         settings,
         roles,
         pronunciation,
+        model,
     };
     match serde_json::to_vec(&source) {
         Ok(bytes) => sha256_hex(&bytes),
@@ -311,12 +339,12 @@ mod tests {
     fn fingerprint_tracks_plan_inputs() {
         let chapter = Chapter::new(0, "Розділ", "Текст глави.");
         let roles = vec![Role::with_voice("Іван", "Speaker_1")];
-        let base = chapter_fingerprint(&chapter.text, &settings(), &roles, &[]);
+        let base = chapter_fingerprint(&chapter.text, &settings(), &roles, &[], None);
         assert_eq!(base.len(), 64);
 
         assert_ne!(
             base,
-            chapter_fingerprint("Інший текст.", &settings(), &roles, &[])
+            chapter_fingerprint("Інший текст.", &settings(), &roles, &[], None)
         );
         assert_ne!(
             base,
@@ -324,14 +352,15 @@ mod tests {
                 &chapter.text,
                 &settings(),
                 &[Role::with_voice("Іван", "Speaker_3")],
-                &[]
+                &[],
+                None
             )
         );
         let mut changed = settings();
         changed.speed = 1.1;
         assert_ne!(
             base,
-            chapter_fingerprint(&chapter.text, &changed, &roles, &[])
+            chapter_fingerprint(&chapter.text, &changed, &roles, &[], None)
         );
         assert_ne!(
             base,
@@ -344,9 +373,61 @@ mod tests {
                     replacement: "ай-ті".into(),
                     regex: false,
                     case_sensitive: true,
-                }]
+                }],
+                None
             )
         );
+    }
+
+    #[test]
+    fn fingerprint_tracks_model_identity() {
+        let model = ModelIdentity {
+            schema: crate::model::MODEL_IDENTITY_SCHEMA,
+            id: "holos-tts".into(),
+            variant: "holos_cpu_int8".into(),
+            sha256: "a".repeat(64),
+            vocab_sha256: "b".repeat(64),
+            sample_rate: 24_000,
+            voice_dim: 256,
+            license: "MIT".into(),
+        };
+        let base = chapter_fingerprint("Текст.", &settings(), &[], &[], Some(&model));
+        assert_eq!(base.len(), 64);
+        assert_ne!(
+            base,
+            chapter_fingerprint("Текст.", &settings(), &[], &[], None)
+        );
+
+        let mut other = model.clone();
+        other.sha256 = "c".repeat(64);
+        assert_ne!(
+            base,
+            chapter_fingerprint("Текст.", &settings(), &[], &[], Some(&other))
+        );
+    }
+
+    #[test]
+    fn manifest_records_model() {
+        let model = ModelIdentity {
+            schema: crate::model::MODEL_IDENTITY_SCHEMA,
+            id: "holos-tts".into(),
+            variant: "holos_cpu_int8".into(),
+            sha256: "a".repeat(64),
+            vocab_sha256: "b".repeat(64),
+            sample_rate: 24_000,
+            voice_dim: 256,
+            license: "MIT".into(),
+        };
+        let with_model = manifest().with_model(model.clone());
+        assert!(with_model.matches_model(&model));
+        let mut other = model.clone();
+        other.variant = "onnx".into();
+        assert!(!with_model.matches_model(&other));
+        assert!(!manifest().matches_model(&model));
+
+        let json = serde_json::to_string(&with_model).unwrap();
+        let parsed: TakeManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model, Some(model));
     }
 
     #[test]

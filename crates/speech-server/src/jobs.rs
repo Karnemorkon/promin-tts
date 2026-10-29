@@ -244,8 +244,9 @@ impl JobManager {
         self.enqueue(job).await
     }
 
-    async fn enqueue(&self, job: JobRecord) -> Result<JobRecord, String> {
+    async fn enqueue(&self, mut job: JobRecord) -> Result<JobRecord, String> {
         let id = job.id.clone();
+        job.model = Some(self.service.model_identity().clone());
         self.store.save(&job).map_err(|error| error.to_string())?;
         self.state
             .lock()
@@ -729,8 +730,23 @@ impl JobManager {
             ));
         }
         let settings = job.project_settings.clone().unwrap_or_default();
-        let fingerprint =
-            chapter_fingerprint(&job.request.text, &settings, &job.roles, &job.pronunciation);
+        let model = self.service.model_identity();
+        if let Some(job_model) = &job.model {
+            if job_model != model {
+                return Err(format!(
+                    "model changed while the job was running ({} -> {}); regenerate the chapter",
+                    job_model.short(),
+                    model.short()
+                ));
+            }
+        }
+        let fingerprint = chapter_fingerprint(
+            &job.request.text,
+            &settings,
+            &job.roles,
+            &job.pronunciation,
+            Some(model),
+        );
         if fingerprint.is_empty() {
             return Err("cannot compute takes fingerprint".into());
         }
@@ -763,7 +779,7 @@ impl JobManager {
                 takes: vec![take],
             });
         }
-        let manifest = TakeManifest::new(fingerprint, units);
+        let manifest = TakeManifest::new(fingerprint, units).with_model(model.to_owned());
         self.projects
             .save_takes(project_id, chapter_index, &manifest)
             .map_err(|error| error.to_string())
@@ -830,6 +846,7 @@ impl JobManager {
             output.duration_ms,
             output.loudness.clone(),
             output.chunk_timings.clone(),
+            job.model.clone(),
         );
         if text_changed || settings_changed || pronunciation_changed || roles_changed {
             chapter.mark_stale();

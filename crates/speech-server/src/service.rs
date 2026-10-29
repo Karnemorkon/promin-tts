@@ -12,6 +12,7 @@ use speech_audio::{
     pcm16_bytes, resample_to_24k, wav_bytes, SAMPLE_RATE,
 };
 use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
+use speech_core::model::ModelIdentity;
 use speech_core::projects::{ChunkTiming, LoudnessReport as ProjectLoudnessReport, Role};
 use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
 use speech_text::dialogue::DialogueSegment;
@@ -337,6 +338,8 @@ fn custom_voice_error(error: CustomVoiceError) -> SynthError {
 /// Завантажені моделі + стан синтезу.
 pub struct SynthService {
     engine: Mutex<TtsEngine>,
+    /// Відбиток завантаженої моделі (входить у fingerprint тейків).
+    model_identity: ModelIdentity,
     tokenizer: CharTokenizer,
     phonemizer: Phonemizer,
     voices: BTreeMap<String, Vec<f32>>,
@@ -415,10 +418,24 @@ impl SynthService {
         };
         let custom_voices = CustomVoices::new(speakers_dir);
 
+        let model_identity = ModelIdentity::compute(
+            &paths.model,
+            &paths.vocab,
+            SAMPLE_RATE,
+            speech_core::custom_voices::VOICE_DIM,
+        )
+        .context("compute model identity")?;
+        model_identity
+            .validate()
+            .context("validate model identity")?;
+
         tracing::info!(
             voices = voices.len(),
             default_voice = %default_voice,
             vocab = tokenizer.vocab_len(),
+            model = %model_identity.short(),
+            sample_rate = model_identity.sample_rate,
+            voice_dim = model_identity.voice_dim,
             verbalizer = if neural.is_some() { "neural+rule" } else { "rule" },
             verbalizer_dir = ?paths.verbalizer,
             accentor = if phonemizer.has_accentor() { "on" } else { "off" },
@@ -431,6 +448,7 @@ impl SynthService {
 
         Ok(Self {
             engine: Mutex::new(engine),
+            model_identity,
             tokenizer,
             phonemizer,
             voices,
@@ -461,6 +479,11 @@ impl SynthService {
 
     pub fn sample_rate(&self) -> u32 {
         SAMPLE_RATE
+    }
+
+    /// Незмінна ідентичність завантаженої моделі.
+    pub fn model_identity(&self) -> &ModelIdentity {
+        &self.model_identity
     }
 
     /// Фактично доступний вербалізатор для `/healthz`.

@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::model::ModelIdentity;
 use crate::projects::{ProjectSettings, PronunciationRule, Role};
 
 /// Стан завдання.
@@ -135,6 +136,9 @@ pub struct JobRecord {
     /// Знімок ролей діалогу на момент постановки.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<Role>,
+    /// Модель, якою буде виконано завдання (знімок на момент постановки).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelIdentity>,
 }
 
 impl JobRecord {
@@ -158,7 +162,14 @@ impl JobRecord {
             project_settings: None,
             pronunciation: Vec::new(),
             roles: Vec::new(),
+            model: None,
         }
+    }
+
+    /// Зафіксувати модель, якою виконуватиметься завдання.
+    pub fn with_model(mut self, model: ModelIdentity) -> Self {
+        self.model = Some(model);
+        self
     }
 
     /// Завдання для глави проєкту зі знімком налаштувань.

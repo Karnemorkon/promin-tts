@@ -176,6 +176,7 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "engine": "promin-tts",
         "version": env!("CARGO_PKG_VERSION"),
+        "model": state.service.model_identity(),
         "voices": state.service.voice_count(),
         "custom_voices": state.service.custom_voice_count(),
         "sample_rate": state.service.sample_rate(),
@@ -184,6 +185,11 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "voice_encoder": state.service.voice_encoder_name(),
         "pronunciation_rules": state.pronunciation.rule_count(),
     }))
+}
+
+/// `GET /v1/model`: ідентичність завантаженої моделі.
+async fn model(State(state): State<AppState>) -> Json<speech_core::model::ModelIdentity> {
+    Json(state.service.model_identity().clone())
 }
 
 async fn voices(State(state): State<AppState>) -> Json<VoicesResponse> {
@@ -1045,7 +1051,11 @@ async fn main() -> anyhow::Result<()> {
         concurrency = args.jobs_concurrency.max(1),
         "async jobs ready"
     );
-    let exports = exports::ExportManager::new(Arc::clone(&projects), args.export_concurrency)?;
+    let exports = exports::ExportManager::new(
+        Arc::clone(&projects),
+        service.model_identity().clone(),
+        args.export_concurrency,
+    )?;
     tracing::info!(
         concurrency = args.export_concurrency.max(1),
         "audiobook exports ready"
@@ -1100,6 +1110,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/model", get(model))
+        .route("/v1/model", get(model))
         .route("/api/voices", get(voices).post(enroll_voice))
         .route("/api/voices/{name}", delete(delete_voice))
         .route("/api/verbalize", post(verbalize))

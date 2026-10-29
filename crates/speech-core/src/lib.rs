@@ -2,6 +2,7 @@
 
 pub mod custom_voices;
 pub mod jobs;
+pub mod model;
 pub mod projects;
 pub mod takes;
 
