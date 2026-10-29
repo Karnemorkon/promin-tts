@@ -234,7 +234,35 @@ pub async fn ensure_models(
         ModelLayout::Bundle => ensure_bundle(&client, options, models_dir, &mut report).await?,
     }
 
+    if options.optional {
+        ensure_optional(&client, options, models_dir, &mut report).await;
+    }
+
     Ok(report)
+}
+
+/// Опційні моделі (клонування, neural-наголос, Gemma-вербалізатор).
+///
+/// Вони не залежать від формату TTS-моделі, тому потрібні обом режимам.
+async fn ensure_optional(
+    client: &reqwest::Client,
+    options: &DownloadOptions,
+    models_dir: &Path,
+    report: &mut DownloadReport,
+) {
+    for file in OPTIONAL_FILES {
+        if file_present(models_dir, file) {
+            report.skipped.push((*file).to_string());
+            continue;
+        }
+        match download_file(client, options, models_dir, file).await {
+            Ok(()) => report.downloaded.push((*file).to_string()),
+            Err(error) => {
+                tracing::warn!(file, error = %error, "optional model download failed");
+                report.failed_optional.push((*file).to_string());
+            }
+        }
+    }
 }
 
 async fn ensure_legacy(
@@ -252,22 +280,6 @@ async fn ensure_legacy(
             .await
             .with_context(|| format!("download required model {file}"))?;
         report.downloaded.push((*file).to_string());
-    }
-
-    if options.optional {
-        for file in OPTIONAL_FILES {
-            if file_present(models_dir, file) {
-                report.skipped.push((*file).to_string());
-                continue;
-            }
-            match download_file(client, options, models_dir, file).await {
-                Ok(()) => report.downloaded.push((*file).to_string()),
-                Err(error) => {
-                    tracing::warn!(file, error = %error, "optional model download failed");
-                    report.failed_optional.push((*file).to_string());
-                }
-            }
-        }
     }
 
     Ok(())
