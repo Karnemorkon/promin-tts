@@ -131,4 +131,26 @@ fn holos_streaming_matches_exact() {
         max_error <= 1e-4,
         "streaming differs from exact decoding: max error {max_error}"
     );
+
+    // Колбековий шлях мусить дати ті самі шматки, що й пакетний.
+    let mut callback_chunks = Vec::new();
+    let completed = streaming
+        .synthesize_stream(&ids, &voice, 1.0, None, |chunk| {
+            callback_chunks.push(chunk.to_vec());
+            true
+        })
+        .expect("callback streaming");
+    assert!(completed);
+    let from_callback: Vec<f32> = callback_chunks.into_iter().flatten().collect();
+    assert_eq!(
+        from_callback.len(),
+        actual.len(),
+        "callback streaming length differs from synthesize_chunks"
+    );
+    let max_error = from_callback
+        .iter()
+        .zip(&actual)
+        .map(|(callback, batch)| (callback - batch).abs())
+        .fold(0.0f32, f32::max);
+    assert_eq!(max_error, 0.0, "callback streaming is not deterministic");
 }

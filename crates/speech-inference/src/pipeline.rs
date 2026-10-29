@@ -253,6 +253,46 @@ impl HolosPipeline {
         }
     }
 
+    /// Стрімінг: колбек отримує кожен готовий шматок; `false` — клієнт відключився.
+    ///
+    /// Для exact-декодера буде рівно один шматок (без обрізання тиші, як у
+    /// `generate`), для віконного — по одному на вікно з тим самим обрізанням
+    /// стартової тиші, що й у `synthesize_chunks`.
+    pub fn synthesize_stream<F>(
+        &self,
+        phoneme_ids: &[i64],
+        voice: &[f32],
+        speed: f32,
+        chunk_frames: Option<usize>,
+        mut on_chunk: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&[f32]) -> bool,
+    {
+        let encoded = self.encode(phoneme_ids, voice, speed)?;
+        match &self.decoder {
+            DecoderStage::Exact(_) => {
+                let audio = self.decode_exact(&encoded)?;
+                Ok(on_chunk(&audio))
+            }
+            DecoderStage::Streaming { .. } => {
+                let skip = stream_silence_skip(
+                    &encoded.durations,
+                    self.bundle.samples_per_frame(),
+                    self.bundle.sample_rate(),
+                );
+                let fade = if skip > 0 { STREAM_FADE_IN_SAMPLES } else { 0 };
+                let mut trimmer = LeadingTrimmer::new(skip, fade);
+                self.decode_windows_with(&encoded, chunk_frames, &mut |chunk| match trimmer
+                    .apply(chunk)
+                {
+                    Some(trimmed) => on_chunk(&trimmed),
+                    None => true,
+                })
+            }
+        }
+    }
+
     fn encode(&self, phoneme_ids: &[i64], voice: &[f32], speed: f32) -> Result<Encoded> {
         if voice.len() != self.bundle.voice_dim() {
             bail!(
@@ -438,6 +478,24 @@ impl HolosPipeline {
         encoded: &Encoded,
         chunk_frames: Option<usize>,
     ) -> Result<Vec<Vec<f32>>> {
+        let mut chunks = Vec::new();
+        self.decode_windows_with(encoded, chunk_frames, &mut |chunk| {
+            chunks.push(chunk.to_vec());
+            true
+        })?;
+        Ok(chunks)
+    }
+
+    /// Декодувати вікна, віддаючи кожне колбеку; `false` — зупинитись.
+    fn decode_windows_with<F>(
+        &self,
+        encoded: &Encoded,
+        chunk_frames: Option<usize>,
+        on_chunk: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&[f32]) -> bool,
+    {
         let DecoderStage::Streaming {
             source,
             decoder,
@@ -477,7 +535,6 @@ impl HolosPipeline {
         }
         let source: Vec<f32> = source_value.iter().copied().collect();
 
-        let mut chunks = Vec::new();
         for (start, end, window_start, window_end) in stream_windows(frames, chunk, *context_frames)
         {
             let window = window_end - window_start;
@@ -535,9 +592,11 @@ impl HolosPipeline {
             if !chunk.iter().all(|sample| sample.is_finite()) {
                 bail!("decoder_window produced NaN or Inf");
             }
-            chunks.push(chunk.to_vec());
+            if !on_chunk(chunk) {
+                return Ok(false);
+            }
         }
-        Ok(chunks)
+        Ok(true)
     }
 }
 
@@ -644,6 +703,46 @@ fn stream_windows(
     windows
 }
 
+/// Стан обрізання стартової тиші для потокових вікон.
+struct LeadingTrimmer {
+    skip: usize,
+    fade: usize,
+    faded: usize,
+}
+
+impl LeadingTrimmer {
+    fn new(skip: usize, fade: usize) -> Self {
+        Self {
+            skip,
+            fade,
+            faded: 0,
+        }
+    }
+
+    /// Обробити шматок; `None`, якщо після обрізання він порожній.
+    fn apply(&mut self, chunk: &[f32]) -> Option<Vec<f32>> {
+        let mut start = 0;
+        if self.skip > 0 {
+            let dropped = self.skip.min(chunk.len());
+            start = dropped;
+            self.skip -= dropped;
+        }
+        let mut out = chunk[start..].to_vec();
+        if self.faded < self.fade && !out.is_empty() {
+            let count = (self.fade - self.faded).min(out.len());
+            for (index, sample) in out.iter_mut().take(count).enumerate() {
+                *sample *= (self.faded + index + 1) as f32 / self.fade as f32;
+            }
+            self.faded += count;
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
 /// Зрізати стартову тишу та зробити фейд-ін (як `_trim_leading` у Python).
 pub fn trim_leading_silence(chunks: &mut [Vec<f32>], skip: usize, fade: usize) {
     let mut remaining = skip;
@@ -717,6 +816,31 @@ mod tests {
         assert_eq!(chunks[1].len(), 5);
         assert!((chunks[1][0] - 0.25).abs() < 1e-6);
         assert!((chunks[1][3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trimmer_matches_batch_trimming() {
+        let mut batch = vec![vec![1.0; 10], vec![1.0; 10], vec![1.0; 10]];
+        trim_leading_silence(&mut batch, 12, 4);
+        let batch: Vec<Vec<f32>> = batch
+            .into_iter()
+            .filter(|chunk| !chunk.is_empty())
+            .collect();
+
+        let mut trimmer = LeadingTrimmer::new(12, 4);
+        let streamed: Vec<Vec<f32>> = [vec![1.0; 10], vec![1.0; 10], vec![1.0; 10]]
+            .iter()
+            .filter_map(|chunk| trimmer.apply(chunk))
+            .collect();
+
+        assert_eq!(streamed, batch);
+    }
+
+    #[test]
+    fn trimmer_without_skip_keeps_fade_disabled() {
+        let mut trimmer = LeadingTrimmer::new(0, 0);
+        assert_eq!(trimmer.apply(&[0.5, 0.5]), Some(vec![0.5, 0.5]));
+        assert_eq!(trimmer.apply(&[]), None);
     }
 
     #[test]

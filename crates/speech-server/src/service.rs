@@ -467,6 +467,28 @@ impl Engine {
             Self::Holos(pipeline) => pipeline.is_streaming(),
         }
     }
+
+    /// Синтез із віддачею готових шматків; `false` — клієнт відключився.
+    fn stream<F>(
+        &self,
+        phoneme_ids: &[i64],
+        voice: &[f32],
+        speed: f32,
+        mut on_samples: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(&[f32]) -> bool,
+    {
+        match self {
+            Self::Legacy(engine) => {
+                let samples = engine.generate(phoneme_ids, voice, speed)?;
+                Ok(on_samples(&samples))
+            }
+            Self::Holos(pipeline) => {
+                pipeline.synthesize_stream(phoneme_ids, voice, speed, None, on_samples)
+            }
+        }
+    }
 }
 
 /// Завантажені моделі + стан синтезу.
@@ -908,6 +930,59 @@ impl SynthService {
             )));
         }
         Ok(samples)
+    }
+
+    /// Як `synthesize_verbalized_f32`, але віддає аудіо шматками.
+    ///
+    /// Для віконного бандла шматок — це одне декодоване вікно, тому перше
+    /// аудіо з'являється, не чекаючи кінця речення.
+    fn stream_verbalized_f32<G>(
+        &self,
+        text: &str,
+        voice_vector: &[f32],
+        speed: f32,
+        raw_stress: bool,
+        mut on_samples: G,
+    ) -> Result<bool, SynthError>
+    where
+        G: FnMut(&[f32]) -> bool,
+    {
+        let parts = self.phonemizer.phonemize(text, raw_stress);
+        if parts.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+
+        let mut produced = false;
+        for part in parts {
+            let ids = self.tokenizer.encode(&part);
+            if ids.is_empty() {
+                continue;
+            }
+            // Один важкий ONNX-виклик за раз: модель int8 і так вантажить усі ядра.
+            let engine = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let keep = engine
+                .stream(&ids, voice_vector, speed, |samples| {
+                    produced = true;
+                    on_samples(samples)
+                })
+                .with_context(|| format!("stream audio for phonemes {part:?}"))?;
+            drop(engine);
+            if !keep {
+                return Ok(false);
+            }
+        }
+
+        if !produced {
+            return Err(SynthError::Internal(anyhow::anyhow!(
+                "model produced no audio samples"
+            )));
+        }
+        Ok(true)
     }
 
     /// Короткий синтез (без нарізки тексту) у PCM16.
@@ -1390,11 +1465,13 @@ impl SynthService {
 
         let mut audio_ms = 0u64;
         for chunk in &chunks {
-            let samples =
-                self.synthesize_verbalized_f32(chunk, &voice_vector, speed, raw_stress)?;
-            let pcm = float_to_pcm16(&samples);
-            audio_ms += pcm.len() as u64 * 1000 / SAMPLE_RATE as u64;
-            if !on_chunk(&pcm16_bytes(&pcm)) {
+            let keep =
+                self.stream_verbalized_f32(chunk, &voice_vector, speed, raw_stress, |samples| {
+                    let pcm = float_to_pcm16(samples);
+                    audio_ms += pcm.len() as u64 * 1000 / SAMPLE_RATE as u64;
+                    on_chunk(&pcm16_bytes(&pcm))
+                })?;
+            if !keep {
                 break;
             }
         }
