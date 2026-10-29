@@ -130,21 +130,30 @@ impl DownloadOptions {
 
 /// Відсутні файли бандла: маніфест або будь-який етап, який він називає.
 fn missing_bundle(models_dir: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    let stress = "stress/stress.trie";
+    if !file_present(models_dir, stress) {
+        missing.push(stress.to_string());
+    }
+
     let dir = find_bundle(models_dir).unwrap_or_else(|| models_dir.join(BUNDLE_DIR));
     let manifest_path = dir.join(BUNDLE_MANIFEST);
     let manifest_rel = local_rel(models_dir, &dir, BUNDLE_MANIFEST);
     if !non_empty(&manifest_path) {
-        return vec![manifest_rel];
+        missing.push(manifest_rel);
+        return missing;
     }
     match BundleManifest::load(&dir) {
-        Ok(manifest) => manifest
-            .files()
-            .iter()
-            .map(|file| local_rel(models_dir, &dir, file))
-            .filter(|file| !non_empty(&models_dir.join(file)))
-            .collect(),
-        Err(_) => vec![manifest_rel],
+        Ok(manifest) => missing.extend(
+            manifest
+                .files()
+                .iter()
+                .map(|file| local_rel(models_dir, &dir, file))
+                .filter(|file| !non_empty(&models_dir.join(file))),
+        ),
+        Err(_) => missing.push(manifest_rel),
     }
+    missing
 }
 
 /// Локальний шлях файлу бандла відносно каталогу моделей (`/`-розділювач).
@@ -580,10 +589,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("promin-dl-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let options = DownloadOptions::default();
+        // Словник наголосів не входить у бандл, але потрібен і йому.
         assert_eq!(
             options.missing_required(&dir, ModelLayout::Bundle),
-            vec![format!("{BUNDLE_DIR}/{BUNDLE_MANIFEST}")]
+            vec![
+                "stress/stress.trie".to_string(),
+                format!("{BUNDLE_DIR}/{BUNDLE_MANIFEST}")
+            ]
         );
+        std::fs::create_dir_all(dir.join("stress")).unwrap();
+        std::fs::write(dir.join("stress/stress.trie"), b"x").unwrap();
 
         std::fs::create_dir_all(dir.join(BUNDLE_DIR)).unwrap();
         std::fs::write(
