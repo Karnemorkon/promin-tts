@@ -126,6 +126,41 @@ impl DownloadOptions {
             ModelLayout::Bundle => missing_bundle(models_dir),
         }
     }
+
+    /// Чи є маніфест бандла у віддаленому репозиторії.
+    ///
+    /// Потрібен режиму `auto` на порожньому каталозі моделей: якщо бандл уже
+    /// опубліковано, свіже розгортання має взяти його, а не legacy-граф.
+    /// Будь-яка помилка (мережа, 404) означає «бандла немає».
+    pub async fn remote_bundle_available(&self) -> bool {
+        let url = resolve_url(self, &remote_path(self, BUNDLE_MANIFEST));
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent("promin-tts-downloader/0.10")
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(error = %error, "bundle probe client failed");
+                return false;
+            }
+        };
+        let mut request = client.head(&url);
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) => {
+                tracing::debug!(url, status = %response.status(), "remote bundle not found");
+                false
+            }
+            Err(error) => {
+                tracing::debug!(url, error = %error, "remote bundle probe failed");
+                false
+            }
+        }
+    }
 }
 
 /// Відсутні файли бандла: маніфест або будь-який етап, який він називає.
@@ -190,6 +225,14 @@ fn non_empty(path: &Path) -> bool {
             .metadata()
             .map(|metadata| metadata.len() > 0)
             .unwrap_or(false)
+}
+
+/// Чи є локальний legacy-граф (навіть якщо решта файлів відсутня).
+///
+/// Використовується лише для вибору формату в `auto`: наявний legacy-граф
+/// означає, що це вже розгорнутий legacy-інстанс і його не треба міняти.
+pub fn legacy_model_present(models_dir: &Path) -> bool {
+    file_present(models_dir, "tts/holos_cpu_int8.onnx")
 }
 
 /// Файл є або у вкладеній, або у плоскій розкладці.
@@ -657,6 +700,15 @@ mod tests {
         assert_eq!(remote_path(&options, "encoder.onnx"), "onnx/encoder.onnx");
         options.bundle_prefix = String::new();
         assert_eq!(remote_path(&options, "encoder.onnx"), "encoder.onnx");
+    }
+
+    #[tokio::test]
+    async fn probes_remote_bundle_manifest() {
+        let base = serve_once(Vec::new(), "200 OK".to_string(), String::new()).await;
+        assert!(options(base).remote_bundle_available().await);
+
+        let base = serve_once(Vec::new(), "404 Not Found".to_string(), String::new()).await;
+        assert!(!options(base).remote_bundle_available().await);
     }
 
     #[test]

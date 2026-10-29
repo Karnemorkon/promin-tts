@@ -35,7 +35,7 @@ mod service;
 mod subtitles;
 mod wyoming;
 
-use downloader::{ensure_models, DownloadOptions, ModelLayout};
+use downloader::{ensure_models, legacy_model_present, DownloadOptions, ModelLayout};
 use jobs::{CancelOutcome, JobManager};
 use pronunciation::{
     PronunciationFile, PronunciationPayload, PronunciationStore, PronunciationStoreError,
@@ -934,13 +934,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Бандл не потребує старих обов'язкових файлів, тому не тягнемо їх
     // з Hugging Face даремно. Словник наголосів усе одно має бути локально.
-    let use_bundle = match args.model_format.trim().to_ascii_lowercase().as_str() {
+    let requested = args.model_format.trim().to_ascii_lowercase();
+    let mut use_bundle = match requested.as_str() {
         "bundle" | "holos-onnx" | "onnx" => true,
         "legacy" | "holos-cpu" | "int8" => false,
         _ => ModelPaths::bundle_present(&args.models_dir),
     };
 
     let download_options = DownloadOptions::from_env();
+    // На порожньому каталозі `auto` не знає, чи бандл уже опубліковано.
+    // Питаємо маніфест, щоб свіже розгортання одразу взяло новий формат,
+    // а поки його немає — так само тихо завантажило legacy.
+    if download_options.enabled
+        && !use_bundle
+        && requested == "auto"
+        && !legacy_model_present(&args.models_dir)
+        && download_options.remote_bundle_available().await
+    {
+        tracing::info!("remote Holos bundle found, using bundle layout");
+        use_bundle = true;
+    }
+
     if download_options.enabled {
         let layout = if use_bundle {
             ModelLayout::Bundle
