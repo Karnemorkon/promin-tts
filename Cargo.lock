@@ -103,6 +103,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "asr-features"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99686812b7392d85b54ed7c96dbfad99655d98ce81dd88eee2f7ec9525dde658"
+dependencies = [
+ "anyhow",
+ "audioadapter-buffers 3.0.0",
+ "log",
+ "rubato 2.0.0",
+ "rustfft",
+ "sha2",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -137,6 +151,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1254ebf6529f3763c491acfb5ab6e960809e3c75a38584cc664f8c5667fb7107"
 
 [[package]]
+name = "audio-core"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f93ebbf82d06013f4c41fe71303feb980cddd78496d904d06be627972de51a24"
+
+[[package]]
+name = "audioadapter"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91f87b70b051c5866680ad79f6743a42ccab264c009d1a71f4d33a3872ae60c8"
+dependencies = [
+ "audio-core",
+ "num-traits",
+]
+
+[[package]]
 name = "audioadapter"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -144,12 +174,33 @@ checksum = "d1292ef9edf681b7426ed089004b021a42896492f58bd0c909ad44e5faec9ac4"
 
 [[package]]
 name = "audioadapter-buffers"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9097d67933fb083d382ce980430afdb758aada60846010aee6be068c06cef0ca"
+dependencies = [
+ "audioadapter 3.0.0",
+ "audioadapter-sample 3.0.0",
+ "num-traits",
+]
+
+[[package]]
+name = "audioadapter-buffers"
 version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46289a81a3bfa26d0f8b2415f8ca9decde9a66308a150568af5c102381b3c8ce"
 dependencies = [
- "audioadapter",
- "audioadapter-sample",
+ "audioadapter 5.0.0",
+ "audioadapter-sample 5.2.0",
+ "num-traits",
+]
+
+[[package]]
+name = "audioadapter-sample"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ab94f2bc04a14e1f49ee5f222f66460e8a1b51627bdfedf34eed394d747938"
+dependencies = [
+ "audio-core",
  "num-traits",
 ]
 
@@ -1785,12 +1836,28 @@ dependencies = [
 
 [[package]]
 name = "rubato"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce96ead1a91f7895704a9f08ea5947dfc8bd7c1f2936a22295b655ec67e5c6ef"
+dependencies = [
+ "audioadapter 3.0.0",
+ "audioadapter-buffers 3.0.0",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "realfft",
+ "visibility",
+ "windowfunctions",
+]
+
+[[package]]
+name = "rubato"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc1e951b9f5432ec1422f4dcfa5733fc501265902612edf5ef8bd8ecdd960930"
 dependencies = [
- "audioadapter",
- "audioadapter-buffers",
+ "audioadapter 5.0.0",
+ "audioadapter-buffers 5.2.0",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -2073,13 +2140,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "speech-asr"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "asr-features",
+ "hound",
+ "ndarray",
+ "ort",
+ "sentencepiece",
+ "serde",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "speech-audio"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "ebur128",
  "hound",
- "rubato",
+ "rubato 5.0.1",
  "serde",
  "thiserror 2.0.21",
  "tracing",
@@ -2087,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "speech-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2101,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "speech-export"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2123,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "speech-inference"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "ndarray",
@@ -2139,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "speech-server"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2151,6 +2232,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "speech-asr",
  "speech-audio",
  "speech-core",
  "speech-export",
@@ -2167,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "speech-text"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "encoding_rs",

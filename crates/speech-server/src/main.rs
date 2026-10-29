@@ -25,12 +25,14 @@ use speech_core::jobs::{JobRequest, JobStatus};
 use speech_core::projects::{LoudnessSettings, ProjectStore};
 use tokio::sync::{broadcast, mpsc};
 
+mod asr;
 mod downloader;
 mod exports;
 mod jobs;
 mod mcp;
 mod projects;
 mod pronunciation;
+mod qc;
 mod service;
 mod subtitles;
 mod wyoming;
@@ -77,6 +79,58 @@ struct Args {
     #[arg(long, env = "PROMIN_EXPORT_CONCURRENCY", default_value_t = 1)]
     export_concurrency: usize,
 
+    /// Directory with the Back-ASR model; default `<models>/asr/w2v-bert-v3`
+    #[arg(long, env = "PROMIN_ASR_MODEL_DIR")]
+    asr_model_dir: Option<PathBuf>,
+
+    /// Back-ASR model id used in reports
+    #[arg(
+        long,
+        env = "PROMIN_ASR_MODEL_ID",
+        default_value = "speech-uk/w2v-bert-v3-onnx"
+    )]
+    asr_model_id: String,
+
+    /// Hugging Face repository for the Back-ASR model
+    #[arg(
+        long,
+        env = "PROMIN_ASR_REPO",
+        default_value = "speech-uk/w2v-bert-v3-onnx"
+    )]
+    asr_repo: String,
+
+    /// Back-ASR model revision
+    #[arg(long, env = "PROMIN_ASR_REVISION", default_value = "main")]
+    asr_revision: String,
+
+    /// ONNX intra-op threads for Back-ASR
+    #[arg(long, env = "PROMIN_ASR_THREADS", default_value_t = 4)]
+    asr_threads: i16,
+
+    /// Number of Back-ASR checks processed concurrently
+    #[arg(long, env = "PROMIN_QC_CONCURRENCY", default_value_t = 1)]
+    qc_concurrency: usize,
+
+    /// Maximum QC window in milliseconds
+    #[arg(long, env = "PROMIN_QC_MAX_SEGMENT_MS", default_value_t = 25_000)]
+    qc_max_segment_ms: u64,
+
+    /// WER warning threshold (0..1)
+    #[arg(long, env = "PROMIN_QC_WER_WARN", default_value_t = 0.10)]
+    qc_wer_warn: f32,
+
+    /// WER failure threshold (0..1)
+    #[arg(long, env = "PROMIN_QC_WER_FAIL", default_value_t = 0.25)]
+    qc_wer_fail: f32,
+
+    /// CER warning threshold (0..1)
+    #[arg(long, env = "PROMIN_QC_CER_WARN", default_value_t = 0.05)]
+    qc_cer_warn: f32,
+
+    /// CER failure threshold (0..1)
+    #[arg(long, env = "PROMIN_QC_CER_FAIL", default_value_t = 0.15)]
+    qc_cer_fail: f32,
+
     /// Public base URL used in webhook payloads and job audio links
     #[arg(long, env = "PROMIN_PUBLIC_URL")]
     public_url: Option<String>,
@@ -112,6 +166,8 @@ struct AppState {
     jobs: Arc<JobManager>,
     projects: Arc<ProjectStore>,
     exports: Arc<exports::ExportManager>,
+    asr: Arc<asr::AsrService>,
+    qc: Arc<qc::QcManager>,
     project_lock: Arc<tokio::sync::Mutex<()>>,
     pronunciation: Arc<PronunciationStore>,
     default_loudness: LoudnessSettings,
@@ -188,6 +244,8 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "accentor": state.service.accentor_name(),
         "voice_encoder": state.service.voice_encoder_name(),
         "pronunciation_rules": state.pronunciation.rule_count(),
+        "asr": state.asr.status(),
+        "qc_active": state.qc.active_count(),
     }))
 }
 
@@ -1096,6 +1154,33 @@ async fn main() -> anyhow::Result<()> {
         concurrency = args.export_concurrency.max(1),
         "audiobook exports ready"
     );
+    let asr = Arc::new(asr::AsrService::new(asr::AsrOptions::new(
+        &args.models_dir,
+        args.asr_model_dir.clone(),
+        args.asr_model_id.clone(),
+        args.asr_repo.clone(),
+        args.asr_revision.clone(),
+        args.asr_threads,
+    )));
+    let qc = qc::QcManager::new(
+        Arc::clone(&projects),
+        Arc::clone(&asr),
+        args.qc_concurrency,
+        qc::QcThresholds {
+            wer_warn: args.qc_wer_warn,
+            wer_fail: args.qc_wer_fail,
+            cer_warn: args.qc_cer_warn,
+            cer_fail: args.qc_cer_fail,
+        },
+        args.qc_max_segment_ms,
+    )?;
+    tracing::info!(
+        asr_model = %asr.model_id(),
+        asr_dir = %asr.model_dir().display(),
+        asr_threads = args.asr_threads.max(1),
+        qc_concurrency = args.qc_concurrency.max(1),
+        "Back-ASR quality control ready"
+    );
 
     let api_keys: Arc<Vec<String>> = Arc::new(
         args.api_keys
@@ -1114,6 +1199,8 @@ async fn main() -> anyhow::Result<()> {
         jobs,
         projects,
         exports,
+        asr,
+        qc,
         project_lock,
         pronunciation,
         default_loudness,
@@ -1190,6 +1277,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/projects/{id}/chapters/{index}/diagnostics",
             get(projects::chapter_diagnostics),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/verify",
+            get(qc::latest_verify).post(qc::start_verify),
+        )
+        .route("/v1/projects/{id}/qc", get(qc::list_jobs))
+        .route(
+            "/v1/projects/{id}/qc/{job_id}",
+            get(qc::get_job).delete(qc::cancel_job),
         )
         .route(
             "/v1/projects/{id}/chapters/{index}/takes",

@@ -1,12 +1,12 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.11 «Експорт і контроль якості»** — повний ланцюжок
+**v0.12 «Back-ASR контроль якості»** — повний ланцюжок
 `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
@@ -15,6 +15,15 @@
 A/B-вибором і перегенерацією окремого речення. ASS-субтитри містять
 послівну караоке-розмітку, а діагностика глав знаходить кліпінг, довгі
 паузи, постійну складову та проблеми рівня.
+
+v0.12 додає зворотне розпізнавання готових глав: компактна українська
+W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує аудіо вікнами ~25 с,
+текст зіставляється з тим, що реально пішло в синтез (тейк або скрипт),
+а звіт містить WER/CER, помилки на рівні слів (заміна/пропуск/вставка),
+сегменти з таймінгами та аудіо-діагностику. Перевірки асинхронні,
+зберігаються в `<project>/qc/`, переживають рестарт і скасовуються
+кооперативно. Модель не входить до Docker-образу: вона завантажується
+ліниво при першому QC-запиті (або монтується вручну).
 
 Нова багатоетапна архітектура HolosTTS: замість одного графа — бандл
 `holos_onnx.json` + `encoder` / `prosody` / `decoder` (exact) або
@@ -51,6 +60,10 @@ A/B-вибором і перегенерацією окремого реченн
   скановані та зашифровані PDF відхиляються.
 - `speech-text::pronunciation` — глобальні та проєктні правила вимови
   (підрядок/regex, регістронезалежність), проєктні перекривають глобальні.
+- `speech-asr` — українське розпізнавання для Back-ASR: W2V-BERT frontend
+  (80 mel × stride 2, ресемплінг у 16 кГц), greedy CTC + SentencePiece,
+  нормалізація тексту, WER/CER і построкове вирівнювання (заміни, пропуски,
+  вставки). Модель — `speech-uk/w2v-bert-v3-onnx` (Apache-2.0).
 - `speech-audio` — PCM16 з піковою нормалізацією + WAV 24 кГц mono; декодування
   WAV (PCM 8/16/24/32, float32, багатоканальне → моно), ресемплінг через `rubato`,
   рівнопотужний кросфейд між чанками.
@@ -78,7 +91,8 @@ A/B-вибором і перегенерацією окремого реченн
   OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP,
   API проєктів книг, імпорт, генерація глав, багатоголосий синтез діалогів,
   SRT/VTT/ASS, `.speechproj`, тейки й перегенерація речень, асинхронні
-  export-job-и аудіокниг, діагностика готових глав.
+  export-job-и аудіокниг, діагностика готових глав, Back-ASR перевірки
+  з WER/CER і збереженням історії.
 
 ## Архітектура
 
@@ -87,6 +101,7 @@ crates/
 ├── speech-core/        # Голоси (.npy), job-и, проєкти книг, `.speechproj`
 ├── speech-text/        # Препроцесинг, вербалізація, наголоси, IPA, чанки, імпорт, вимова
 ├── speech-inference/   # ONNX Runtime: TTS-генератор, Gemma, accentor, voice encoder
+├── speech-asr/         # Back-ASR: W2V-BERT CTC, SentencePiece, WER/CER, diff
 ├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP, діагностика
 ├── speech-export/      # M4B (AAC), MP3, OGG/Opus, FLAC, глави, обкладинка, SRT/VTT/ASS
 └── speech-server/      # Axum + Wyoming + MCP (HTTP і stdio-проксі promin-mcp)
@@ -120,6 +135,10 @@ models/
 │   ├── model.onnx
 │   ├── tokenizer.model
 │   └── config.json
+├── asr/w2v-bert-v3/         # опційно: Back-ASR, ліниве завантаження
+│   ├── model.onnx           # граф CTC
+│   ├── model.onnx_data      # зовнішні ваги (~2.3 ГБ)
+│   └── tokenizer.model      # SentencePiece
 ├── speakers/                 # клоновані голоси: <name>.npy (float32[256])
 ├── jobs/                     # асинхронні завдання: <id>.json + <id>.wav
 └── projects/                 # книги: <id>/project.json + chapters/<n>.wav
@@ -148,6 +167,12 @@ legacy-інстанс автоматично не перемикається. Ф
 (override: `PROMIN_PRONUNCIATION_FILE`). Без `voice_encoder.onnx` клонування вимкнено
 (`/healthz` → `"voice_encoder":"off"`, енролмент → HTTP 503).
 
+Back-ASR модель лежить окремо від TTS: `PROMIN_ASR_MODEL_DIR` (типово
+`<models>/asr/w2v-bert-v3`). Вона не потрібна для синтезу й завантажується
+ліниво — при першому `POST .../verify`, якщо `PROMIN_ASR_AUTO_DOWNLOAD`
+не вимкнено. `/healthz` показує `asr.loaded`, `asr.files_present` і
+`asr.missing`, тому стан можна перевірити без запуску перевірки.
+
 ### Автозавантаження моделей
 
 Якщо обов'язкових файлів немає, сервер завантажує їх із
@@ -170,6 +195,14 @@ legacy-інстанс автоматично не перемикається. Ф
 
 Якщо каталог моделей read-only і чогось не вистачає, сервер завершиться з
 зрозумілою помилкою; для автозавантаження потрібен writable volume.
+
+Back-ASR модель завантажується з `PROMIN_ASR_REPO` (типово
+`speech-uk/w2v-bert-v3-onnx`) у `PROMIN_ASR_MODEL_DIR`. Потрібні три файли:
+`model.onnx`, `model.onnx_data`, `tokenizer.model`. Якщо
+`PROMIN_ASR_AUTO_DOWNLOAD=0`, а файлів немає, `POST .../verify` поверне
+HTTP 503 із переліком відсутніх файлів; синтез і експорт при цьому працюють.
+Для повторного завантаження після обриву використовується той самий
+`.part`-механізм із HTTP Range.
 
 ## Швидкий старт (Docker)
 
@@ -600,6 +633,54 @@ ASS містить заголовок, стиль `Default` і `Dialogue`-под
 Пороги орієнтовані на аудіокниги: тиша — нижче −50 dBFS, довга пауза — понад
 2 с, кліпінг — семпли ≥ 0.999.
 
+### Back-ASR контроль якості (v0.12)
+
+Перевірка виконується для готової глави (`status=completed`). Аудіо ріжеться
+на вікна до `PROMIN_QC_MAX_SEGMENT_MS` (типово 25 с) за `chunk_timings`,
+кожне вікно розпізнається українською W2V-BERT CTC-моделлю, після чого
+транскрипт порівнюється з еталоном:
+
+- `reference_source="takes"` — `spoken` активного тейку з `takes.json`
+  (те, що реально пішло в синтез, з урахуванням вербалізації);
+- `reference_source="script"` — `verbalize(chunk.text)`, якщо маніфесту тейків
+  немає або він не збігається з таймінгами.
+
+```bash
+# Запустити перевірку: 202 + job; повторний запит повертає наявний job (200)
+curl -X POST 'http://localhost:8010/v1/projects/<id>/chapters/0/verify'
+
+# Примусово перезапустити навіть для того самого аудіо
+curl -X POST 'http://localhost:8010/v1/projects/<id>/chapters/0/verify?force=true'
+
+# Останній звіт глави, історія проєкту, конкретний job
+curl 'http://localhost:8010/v1/projects/<id>/chapters/0/verify'
+curl 'http://localhost:8010/v1/projects/<id>/qc'
+curl 'http://localhost:8010/v1/projects/<id>/qc/<job_id>'
+
+# Скасувати активну перевірку (кооперативно)
+curl -X DELETE 'http://localhost:8010/v1/projects/<id>/qc/<job_id>'
+```
+
+Статуси job-а: `queued`, `running`, `completed`, `failed`, `cancelled`.
+Записи лежать у `<project>/qc/<job_id>.json`; після рестарту активні job-и
+позначаються `failed` (`quality check interrupted by server restart`),
+завершені лишаються доступними. `?force=true` для активного job-а ставить
+його в чергу на скасування і створює новий.
+
+Звіт (`report`) містить `diff` з `wer`, `cer`, `reference_words`,
+`substitutions`/`deletions`/`insertions` і масивом `errors` (кожна помилка —
+`kind`, індекси та слова з обох боків), `segments` із таймінгами,
+`script`/`reference`/`recognized` та власним `diff`, `diagnostics` (ті самі
+перевірки, що й у `/diagnostics`), `issues` і застосовані `thresholds`.
+Пороги: WER warn/fail — `0.10`/`0.25`, CER — `0.05`/`0.15`; перевизначаються
+через `PROMIN_QC_WER_WARN`, `PROMIN_QC_WER_FAIL`, `PROMIN_QC_CER_WARN`,
+`PROMIN_QC_CER_FAIL`. `elapsed_ms` включає завантаження моделі, `asr_ms` —
+лише інференс, `rtf = elapsed_ms / duration_ms`.
+
+`/healthz` додає `asr` (`model`, `model_dir`, `loaded`, `files_present`,
+`missing`, `auto_download`, `threads`) і `qc_active`. Видалення проєкту
+скасовує його активні перевірки.
+
 ### OpenAI-сумісний API
 
 ```bash
@@ -667,6 +748,18 @@ MCP audio content (`audio/wav` base64) і текст із метаданими.
 | `PROMIN_JOBS_CONCURRENCY` | `1` | Одночасних job-ів |
 | `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV + тейки + exports) |
 | `PROMIN_EXPORT_CONCURRENCY` | `1` | Одночасних експортів аудіокниг |
+| `PROMIN_ASR_MODEL_DIR` | `<models>/asr/w2v-bert-v3` | Каталог Back-ASR моделі |
+| `PROMIN_ASR_MODEL_ID` | `speech-uk/w2v-bert-v3-onnx` | Id моделі у звітах |
+| `PROMIN_ASR_REPO` | `speech-uk/w2v-bert-v3-onnx` | HF-репозиторій ASR |
+| `PROMIN_ASR_REVISION` | `main` | Гілка/тег/коміт ASR |
+| `PROMIN_ASR_THREADS` | `4` | ONNX intra-op threads для ASR |
+| `PROMIN_ASR_AUTO_DOWNLOAD` | як `PROMIN_AUTO_DOWNLOAD` | Автозавантаження ASR |
+| `PROMIN_QC_CONCURRENCY` | `1` | Одночасних Back-ASR перевірок |
+| `PROMIN_QC_MAX_SEGMENT_MS` | `25000` | Максимальне вікно розпізнавання |
+| `PROMIN_QC_WER_WARN` | `0.10` | WER warning |
+| `PROMIN_QC_WER_FAIL` | `0.25` | WER failure |
+| `PROMIN_QC_CER_WARN` | `0.05` | CER warning |
+| `PROMIN_QC_CER_FAIL` | `0.15` | CER failure |
 | `PROMIN_PRONUNCIATION_FILE` | `<data>/pronunciation.json` | Глобальний словник вимови |
 | `PROMIN_LOUDNESS_TARGET` | `-19` | Ціль LUFS для нових проєктів |
 | `PROMIN_TRUE_PEAK` | `-3` | Ціль dBTP для нових проєктів |
@@ -693,7 +786,16 @@ Golden-тести accentor/Gemma/voice encoder потребують моделе
 EPUB2/EPUB3/FB2/DOCX/PDF/ZIP-фікстурами, LUFS — еталонним синусом і сплесками,
 експорт — синтетичними WAV-главами з перевіркою контейнерів і субтитрів.
 
+Back-ASR E2E-тест (реальна модель + WAV) запускається окремо:
+
+```bash
+PROMIN_ASR_TEST_MODEL_DIR=/models/asr/w2v-bert-v3 \
+PROMIN_ASR_TEST_WAV=/path/to/chapter.wav \
+cargo test -p speech-asr --release -- --ignored --nocapture
+```
+
 ## Ліцензія та застереження
 
 - Код: [MIT](LICENSE).
+- Back-ASR: модель [`speech-uk/w2v-bert-v3-onnx`](https://huggingface.co/speech-uk/w2v-bert-v3-onnx) — Apache-2.0; крейт `asr-features` — MIT.
 - Ваги нейромереж належать їхнім авторам (див. [Morkon/holos-native-models](https://huggingface.co/Morkon/holos-native-models), [patriotyk/HolosTTS](https://github.com/patriotyk/HolosTTS)); проєкт не афілійований з авторами моделей і надається «як є».

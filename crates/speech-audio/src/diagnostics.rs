@@ -5,7 +5,7 @@
 //! обрізані піки, постійна складова та занадто тихий/гучний матеріал.
 
 use anyhow::{bail, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Поріг, вище якого семпл вважається обрізаним.
 pub const CLIPPING_THRESHOLD: f32 = 0.999;
@@ -25,7 +25,7 @@ pub const LOW_RMS_DBFS: f32 = -40.0;
 pub const NEAR_FULL_SCALE_DBFS: f32 = -0.1;
 
 /// Важливість діагностичної знахідки.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,
@@ -34,7 +34,7 @@ pub enum Severity {
 }
 
 /// Одна знахідка діагностики.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticIssue {
     pub code: String,
     pub severity: Severity,
@@ -42,7 +42,7 @@ pub struct DiagnosticIssue {
 }
 
 /// Інтервал тиші у таймлайні глави.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SilenceSpan {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -50,7 +50,7 @@ pub struct SilenceSpan {
 }
 
 /// Повний звіт про главу.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioDiagnostics {
     pub sample_rate: u32,
     pub sample_count: usize,

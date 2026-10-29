@@ -13,7 +13,7 @@ speech-text = { path = "../speech-text" }
 anyhow.workspace = true
 ndarray.workspace = true
 ort.workspace = true
-sentencepiece = { version = "0.14", features = ["static"] }
+sentencepiece.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -23,12 +23,23 @@ services:
       - PROMIN_API_KEYS=${PROMIN_API_KEYS:-}
       - PROMIN_AUTO_DOWNLOAD=${PROMIN_AUTO_DOWNLOAD:-auto}
       - PROMIN_DOWNLOAD_OPTIONAL=${PROMIN_DOWNLOAD_OPTIONAL:-1}
+      # Back-ASR (W2V-BERT) quality control; model auto-downloaded on first verify.
+      - PROMIN_ASR_MODEL_DIR=/data/asr/w2v-bert-v3
+      - PROMIN_ASR_THREADS=4
+      - PROMIN_ASR_AUTO_DOWNLOAD=${PROMIN_ASR_AUTO_DOWNLOAD:-auto}
+      - PROMIN_QC_CONCURRENCY=${PROMIN_QC_CONCURRENCY:-1}
+      - PROMIN_QC_MAX_SEGMENT_MS=${PROMIN_QC_MAX_SEGMENT_MS:-25000}
+      - PROMIN_QC_WER_WARN=${PROMIN_QC_WER_WARN:-0.10}
+      - PROMIN_QC_WER_FAIL=${PROMIN_QC_WER_FAIL:-0.25}
+      - PROMIN_QC_CER_WARN=${PROMIN_QC_CER_WARN:-0.05}
+      - PROMIN_QC_CER_FAIL=${PROMIN_QC_CER_FAIL:-0.15}
       - RUST_LOG=info
     volumes:
       - promin_models:/data/models
       - promin_speakers:/data/speakers
       - promin_jobs:/data/jobs
       - promin_projects:/data/projects
+      - promin_asr:/data/asr
     restart: unless-stopped
 
 volumes:
@@ -36,3 +47,4 @@ volumes:
   promin_speakers:
   promin_jobs:
   promin_projects:
+  promin_asr:

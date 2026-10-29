@@ -874,6 +874,11 @@ impl ProjectStore {
         Ok(true)
     }
 
+    /// Каталог Back-ASR перевірок: `<projects>/<id>/qc/`.
+    pub fn qc_dir(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.project_dir(id)?.join("qc"))
+    }
+
     /// Каталог тейків глави: `<projects>/<id>/chapters/<index>/`.
     pub fn takes_dir(&self, id: &str, index: usize) -> Result<PathBuf> {
         if index >= MAX_CHAPTERS {

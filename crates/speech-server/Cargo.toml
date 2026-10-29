@@ -17,6 +17,7 @@ path = "src/bin/promin-mcp.rs"
 
 [dependencies]
 speech-audio = { path = "../speech-audio" }
+speech-asr = { path = "../speech-asr" }
 speech-core = { path = "../speech-core" }
 speech-export = { path = "../speech-export" }
 speech-inference = { path = "../speech-inference" }

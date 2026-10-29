@@ -501,6 +501,7 @@ pub async fn delete_project(
     }
     let cancelled = state.jobs.cancel_project_jobs(&id);
     state.exports.cancel_project(&id);
+    state.qc.cancel_project(&id);
     state
         .projects
         .delete(&id)

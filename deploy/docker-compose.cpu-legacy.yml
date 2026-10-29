@@ -26,6 +26,16 @@ services:
       # `auto` downloads missing models into a writable models volume.
       - PROMIN_AUTO_DOWNLOAD=${PROMIN_AUTO_DOWNLOAD:-auto}
       - PROMIN_DOWNLOAD_OPTIONAL=${PROMIN_DOWNLOAD_OPTIONAL:-1}
+      # Back-ASR (W2V-BERT) quality control; model auto-downloaded on first verify.
+      - PROMIN_ASR_MODEL_DIR=/data/asr/w2v-bert-v3
+      - PROMIN_ASR_THREADS=4
+      - PROMIN_ASR_AUTO_DOWNLOAD=${PROMIN_ASR_AUTO_DOWNLOAD:-auto}
+      - PROMIN_QC_CONCURRENCY=${PROMIN_QC_CONCURRENCY:-1}
+      - PROMIN_QC_MAX_SEGMENT_MS=${PROMIN_QC_MAX_SEGMENT_MS:-25000}
+      - PROMIN_QC_WER_WARN=${PROMIN_QC_WER_WARN:-0.10}
+      - PROMIN_QC_WER_FAIL=${PROMIN_QC_WER_FAIL:-0.25}
+      - PROMIN_QC_CER_WARN=${PROMIN_QC_CER_WARN:-0.05}
+      - PROMIN_QC_CER_FAIL=${PROMIN_QC_CER_FAIL:-0.15}
       - RUST_LOG=info
     volumes:
       # Host directory with tts/ + stress/ (or flat layout). Writable so that
@@ -38,6 +48,8 @@ services:
       - ${PROMIN_JOBS_HOST:-../models/jobs}:/data/jobs
       # Audiobook projects (`<id>/project.json` + chapter WAV files).
       - ${PROMIN_PROJECTS_HOST:-../models/projects}:/data/projects
+      # Back-ASR model (`model.onnx`, `model.onnx_data`, `tokenizer.model`).
+      - ${PROMIN_ASR_HOST:-../models/asr}:/data/asr
     restart: unless-stopped
     # The image ships a bash /dev/tcp healthcheck that follows PROMIN_HTTP_ADDR;
     # do not override it with curl, which is intentionally absent from the image.
