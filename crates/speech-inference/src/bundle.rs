@@ -125,6 +125,20 @@ impl BundleManifest {
                 bail!("bundle streaming section must name source and decoder stages");
             }
         }
+        for (field, file) in [
+            ("encoder", self.encoder.as_str()),
+            ("prosody", self.prosody.as_str()),
+            ("decoder", self.decoder.as_str()),
+        ] {
+            validate_relative_path(field, file)?;
+        }
+        if let Some(voices) = &self.voices {
+            validate_relative_path("voices", voices)?;
+        }
+        if let Some(streaming) = &self.streaming {
+            validate_relative_path("streaming.source", &streaming.source)?;
+            validate_relative_path("streaming.decoder", &streaming.decoder)?;
+        }
         Ok(())
     }
 
@@ -132,6 +146,47 @@ impl BundleManifest {
     pub fn stage_path(&self, dir: &Path, file: &str) -> PathBuf {
         dir.join(file)
     }
+
+    /// Усі файли, від яких залежить аудіо (без самого маніфесту).
+    ///
+    /// Потрібен автозавантаженню: список етапів задає маніфест, а не код.
+    pub fn files(&self) -> Vec<&str> {
+        let mut files = vec![
+            self.encoder.as_str(),
+            self.prosody.as_str(),
+            self.decoder.as_str(),
+        ];
+        if let Some(voices) = &self.voices {
+            files.push(voices);
+        }
+        if let Some(streaming) = &self.streaming {
+            files.push(streaming.source.as_str());
+            files.push(streaming.decoder.as_str());
+        }
+        files
+    }
+}
+
+/// Ім'я файлу в маніфесті мусить бути безпечним відносним шляхом.
+///
+/// Маніфест приходить із мережі, тому `../` або абсолютний шлях не повинні
+/// дозволяти читати/перезаписувати файли поза каталогом бандла.
+fn validate_relative_path(field: &str, file: &str) -> Result<()> {
+    let path = Path::new(file);
+    if file.trim().is_empty() {
+        bail!("bundle manifest {field} must not be empty");
+    }
+    if path.is_absolute() {
+        bail!("bundle manifest {field} must be a relative path, got {file:?}");
+    }
+    for component in path.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            bail!(
+                "bundle manifest {field} must not contain '.', '..' or a root prefix, got {file:?}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Завантажений бандл: маніфест, словник і пресети голосів.
@@ -483,6 +538,10 @@ mod tests {
             streaming: None,
         };
         manifest.validate().unwrap();
+        assert_eq!(
+            manifest.files(),
+            vec!["encoder.onnx", "prosody.onnx", "decoder.onnx", "voices.npz"]
+        );
 
         let mut broken = manifest.clone();
         broken.format_version = 3;
@@ -491,5 +550,36 @@ mod tests {
         let mut broken = manifest;
         broken.samples_per_frame = 0;
         assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_manifest_paths() {
+        let manifest = BundleManifest {
+            format: BUNDLE_FORMAT.into(),
+            format_version: BUNDLE_FORMAT_VERSION,
+            encoder: "encoder.onnx".into(),
+            prosody: "prosody.onnx".into(),
+            decoder: "decoder.onnx".into(),
+            voices: Some("voices.npz".into()),
+            vocab: vec!["a".into()],
+            sample_rate: 24_000,
+            samples_per_frame: 480,
+            max_frames: 1_000,
+            decoder_mode: "exact".into(),
+            alignment_format: "gather".into(),
+            streaming: None,
+        };
+        for unsafe_path in ["../encoder.onnx", "/etc/passwd", "a/../../b.onnx", ""] {
+            let mut broken = manifest.clone();
+            broken.encoder = unsafe_path.into();
+            assert!(
+                broken.validate().is_err(),
+                "accepted unsafe path {unsafe_path:?}"
+            );
+        }
+        // Вкладені каталоги всередині бандла дозволені.
+        let mut nested = manifest;
+        nested.encoder = "stages/encoder.onnx".into();
+        nested.validate().unwrap();
     }
 }

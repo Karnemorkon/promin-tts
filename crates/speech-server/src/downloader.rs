@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
+use speech_inference::{BundleManifest, BUNDLE_MANIFEST};
 use tokio::io::AsyncWriteExt;
+
+use crate::service::find_bundle;
 
 /// Обов'язкові файли для базового синтезу.
 pub const REQUIRED_FILES: &[&str] = &[
@@ -18,6 +21,18 @@ pub const REQUIRED_FILES: &[&str] = &[
     "tts/voices.json",
     "stress/stress.trie",
 ];
+
+/// Локальний каталог багатоетапного бандла.
+pub const BUNDLE_DIR: &str = "holos-onnx";
+
+/// Яку розкладку моделі забезпечує автозавантаження.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLayout {
+    /// Один ONNX-граф + `vocab.json` + `voices.json`.
+    Legacy,
+    /// Каталог `holos-onnx/` з маніфестом і кількома графами.
+    Bundle,
+}
 
 /// Опційні моделі (клонування, neural-наголос, Gemma-вербалізатор).
 pub const OPTIONAL_FILES: &[&str] = &[
@@ -40,6 +55,8 @@ pub struct DownloadOptions {
     pub revision: String,
     pub token: Option<String>,
     pub base_url: String,
+    /// Каталог бандла у репозиторії HF (`holos-onnx`, `onnx`, …).
+    pub bundle_prefix: String,
     pub timeout: Duration,
 }
 
@@ -52,6 +69,7 @@ impl Default for DownloadOptions {
             revision: "main".to_string(),
             token: None,
             base_url: "https://huggingface.co".to_string(),
+            bundle_prefix: BUNDLE_DIR.to_string(),
             timeout: Duration::from_secs(3600),
         }
     }
@@ -87,6 +105,8 @@ impl DownloadOptions {
                 .unwrap_or_else(|_| "https://huggingface.co".to_string())
                 .trim_end_matches('/')
                 .to_string(),
+            bundle_prefix: std::env::var("PROMIN_HF_BUNDLE_PREFIX")
+                .unwrap_or_else(|_| BUNDLE_DIR.to_string()),
             timeout: std::env::var("PROMIN_DOWNLOAD_TIMEOUT")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -96,12 +116,44 @@ impl DownloadOptions {
     }
 
     /// Чи потрібно завантажувати хоч один обов'язковий файл.
-    pub fn missing_required(&self, models_dir: &Path) -> Vec<String> {
-        REQUIRED_FILES
+    pub fn missing_required(&self, models_dir: &Path, layout: ModelLayout) -> Vec<String> {
+        match layout {
+            ModelLayout::Legacy => REQUIRED_FILES
+                .iter()
+                .filter(|file| !file_present(models_dir, file))
+                .map(|file| (*file).to_string())
+                .collect(),
+            ModelLayout::Bundle => missing_bundle(models_dir),
+        }
+    }
+}
+
+/// Відсутні файли бандла: маніфест або будь-який етап, який він називає.
+fn missing_bundle(models_dir: &Path) -> Vec<String> {
+    let dir = find_bundle(models_dir).unwrap_or_else(|| models_dir.join(BUNDLE_DIR));
+    let manifest_path = dir.join(BUNDLE_MANIFEST);
+    let manifest_rel = local_rel(models_dir, &dir, BUNDLE_MANIFEST);
+    if !non_empty(&manifest_path) {
+        return vec![manifest_rel];
+    }
+    match BundleManifest::load(&dir) {
+        Ok(manifest) => manifest
+            .files()
             .iter()
-            .filter(|file| !file_present(models_dir, file))
-            .map(|file| (*file).to_string())
-            .collect()
+            .map(|file| local_rel(models_dir, &dir, file))
+            .filter(|file| !non_empty(&models_dir.join(file)))
+            .collect(),
+        Err(_) => vec![manifest_rel],
+    }
+}
+
+/// Локальний шлях файлу бандла відносно каталогу моделей (`/`-розділювач).
+fn local_rel(models_dir: &Path, bundle_dir: &Path, file: &str) -> String {
+    match bundle_dir.strip_prefix(models_dir) {
+        Ok(rel) if !rel.as_os_str().is_empty() => {
+            format!("{}/{}", rel.to_string_lossy().replace('\\', "/"), file)
+        }
+        _ => file.to_string(),
     }
 }
 
@@ -122,15 +174,17 @@ fn flat_equivalent(file: &str) -> Option<&'static str> {
     })
 }
 
+/// Файл існує і не порожній.
+fn non_empty(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+}
+
 /// Файл є або у вкладеній, або у плоскій розкладці.
 fn file_present(models_dir: &Path, file: &str) -> bool {
-    let non_empty = |path: &Path| {
-        path.is_file()
-            && path
-                .metadata()
-                .map(|metadata| metadata.len() > 0)
-                .unwrap_or(false)
-    };
     if non_empty(&models_dir.join(file)) {
         return true;
     }
@@ -148,13 +202,17 @@ pub struct DownloadReport {
 }
 
 /// Перевірити/завантажити моделі. Повертає помилку лише для обов'язкових файлів.
-pub async fn ensure_models(models_dir: &Path, options: &DownloadOptions) -> Result<DownloadReport> {
+pub async fn ensure_models(
+    models_dir: &Path,
+    options: &DownloadOptions,
+    layout: ModelLayout,
+) -> Result<DownloadReport> {
     let mut report = DownloadReport::default();
     if !options.enabled {
         return Ok(report);
     }
     if !writable_dir(models_dir) {
-        let missing = options.missing_required(models_dir);
+        let missing = options.missing_required(models_dir, layout);
         if missing.is_empty() {
             return Ok(report);
         }
@@ -171,12 +229,26 @@ pub async fn ensure_models(models_dir: &Path, options: &DownloadOptions) -> Resu
         .build()
         .context("build downloader HTTP client")?;
 
+    match layout {
+        ModelLayout::Legacy => ensure_legacy(&client, options, models_dir, &mut report).await?,
+        ModelLayout::Bundle => ensure_bundle(&client, options, models_dir, &mut report).await?,
+    }
+
+    Ok(report)
+}
+
+async fn ensure_legacy(
+    client: &reqwest::Client,
+    options: &DownloadOptions,
+    models_dir: &Path,
+    report: &mut DownloadReport,
+) -> Result<()> {
     for file in REQUIRED_FILES {
         if file_present(models_dir, file) {
             report.skipped.push((*file).to_string());
             continue;
         }
-        download_file(&client, options, models_dir, file)
+        download_file(client, options, models_dir, file)
             .await
             .with_context(|| format!("download required model {file}"))?;
         report.downloaded.push((*file).to_string());
@@ -188,7 +260,7 @@ pub async fn ensure_models(models_dir: &Path, options: &DownloadOptions) -> Resu
                 report.skipped.push((*file).to_string());
                 continue;
             }
-            match download_file(&client, options, models_dir, file).await {
+            match download_file(client, options, models_dir, file).await {
                 Ok(()) => report.downloaded.push((*file).to_string()),
                 Err(error) => {
                     tracing::warn!(file, error = %error, "optional model download failed");
@@ -198,7 +270,66 @@ pub async fn ensure_models(models_dir: &Path, options: &DownloadOptions) -> Resu
         }
     }
 
-    Ok(report)
+    Ok(())
+}
+
+/// Завантажити бандл: спершу маніфест, далі етапи, які він перелічує.
+///
+/// Словник наголосів не входить до бандла й потрібен обом режимам.
+async fn ensure_bundle(
+    client: &reqwest::Client,
+    options: &DownloadOptions,
+    models_dir: &Path,
+    report: &mut DownloadReport,
+) -> Result<()> {
+    let stress = "stress/stress.trie";
+    if file_present(models_dir, stress) {
+        report.skipped.push(stress.to_string());
+    } else {
+        download_file(client, options, models_dir, stress)
+            .await
+            .with_context(|| format!("download required model {stress}"))?;
+        report.downloaded.push(stress.to_string());
+    }
+
+    let dir = find_bundle(models_dir).unwrap_or_else(|| models_dir.join(BUNDLE_DIR));
+    let local_manifest = local_rel(models_dir, &dir, BUNDLE_MANIFEST);
+    if non_empty(&models_dir.join(&local_manifest)) {
+        report.skipped.push(local_manifest);
+    } else {
+        let remote = remote_path(options, BUNDLE_MANIFEST);
+        download_file_to(client, options, models_dir, &remote, &local_manifest)
+            .await
+            .with_context(|| format!("download bundle manifest {remote}"))?;
+        report.downloaded.push(local_manifest);
+    }
+
+    let manifest = BundleManifest::load(&dir)
+        .with_context(|| format!("read bundle manifest in {}", dir.display()))?;
+    for file in manifest.files() {
+        let local = local_rel(models_dir, &dir, file);
+        if non_empty(&models_dir.join(&local)) {
+            report.skipped.push(local);
+            continue;
+        }
+        let remote = remote_path(options, file);
+        download_file_to(client, options, models_dir, &remote, &local)
+            .await
+            .with_context(|| format!("download bundle stage {remote}"))?;
+        report.downloaded.push(local);
+    }
+
+    Ok(())
+}
+
+/// Шлях файлу в репозиторії HF з урахуванням каталогу бандла.
+fn remote_path(options: &DownloadOptions, file: &str) -> String {
+    let prefix = options.bundle_prefix.trim_matches('/');
+    if prefix.is_empty() {
+        file.to_string()
+    } else {
+        format!("{prefix}/{file}")
+    }
 }
 
 fn writable_dir(dir: &Path) -> bool {
@@ -227,19 +358,30 @@ pub async fn download_file(
     models_dir: &Path,
     file: &str,
 ) -> Result<()> {
-    let final_path = models_dir.join(file);
+    download_file_to(client, options, models_dir, file, file).await
+}
+
+/// Завантажити `remote` з HF у локальний шлях `local` (з докачкою).
+pub async fn download_file_to(
+    client: &reqwest::Client,
+    options: &DownloadOptions,
+    models_dir: &Path,
+    remote: &str,
+    local: &str,
+) -> Result<()> {
+    let final_path = models_dir.join(local);
     if let Some(parent) = final_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("create {}", parent.display()))?;
     }
-    let part_path = part_path(models_dir, file);
+    let part_path = part_path(models_dir, local);
 
     let mut offset = tokio::fs::metadata(&part_path)
         .await
         .map(|meta| meta.len())
         .unwrap_or(0);
-    let url = resolve_url(options, file);
+    let url = resolve_url(options, remote);
     let mut request = client.get(&url);
     if let Some(token) = &options.token {
         request = request.bearer_auth(token);
@@ -248,7 +390,7 @@ pub async fn download_file(
         request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
     }
 
-    tracing::info!(file, offset, "downloading model");
+    tracing::info!(file = remote, offset, "downloading model");
     let response = request.send().await.with_context(|| format!("GET {url}"))?;
     let status = response.status();
 
@@ -294,7 +436,7 @@ pub async fn download_file(
             match total {
                 Some(total) if total > 0 => {
                     tracing::info!(
-                        file,
+                        file = remote,
                         downloaded_mb = downloaded / 1_048_576,
                         total_mb = total / 1_048_576,
                         percent = downloaded * 100 / total,
@@ -303,7 +445,7 @@ pub async fn download_file(
                 }
                 _ => {
                     tracing::info!(
-                        file,
+                        file = remote,
                         downloaded_mb = downloaded / 1_048_576,
                         "download progress"
                     );
@@ -318,17 +460,21 @@ pub async fn download_file(
     if let Some(total) = total {
         if downloaded != total {
             bail!(
-                "incomplete download for {file}: got {downloaded} of {total} bytes (will resume)"
+                "incomplete download for {remote}: got {downloaded} of {total} bytes (will resume)"
             );
         }
     }
     if downloaded == 0 {
-        bail!("downloaded empty file: {file}");
+        bail!("downloaded empty file: {remote}");
     }
     tokio::fs::rename(&part_path, &final_path)
         .await
         .with_context(|| format!("finalize {}", final_path.display()))?;
-    tracing::info!(file, size_mb = downloaded / 1_048_576, "model downloaded");
+    tracing::info!(
+        file = remote,
+        size_mb = downloaded / 1_048_576,
+        "model downloaded"
+    );
     Ok(())
 }
 
@@ -375,6 +521,7 @@ mod tests {
             revision: "main".into(),
             token: None,
             base_url,
+            bundle_prefix: BUNDLE_DIR.to_string(),
             timeout: Duration::from_secs(10),
         }
     }
@@ -417,11 +564,83 @@ mod tests {
     }
 
     #[test]
+    fn bundle_missing_tracks_manifest_stages() {
+        let dir = std::env::temp_dir().join(format!("promin-dl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let options = DownloadOptions::default();
+        assert_eq!(
+            options.missing_required(&dir, ModelLayout::Bundle),
+            vec![format!("{BUNDLE_DIR}/{BUNDLE_MANIFEST}")]
+        );
+
+        std::fs::create_dir_all(dir.join(BUNDLE_DIR)).unwrap();
+        std::fs::write(
+            dir.join(BUNDLE_DIR).join(BUNDLE_MANIFEST),
+            br#"{
+                "format": "holos-onnx",
+                "format_version": 2,
+                "encoder": "encoder.onnx",
+                "prosody": "prosody.onnx",
+                "decoder": "decoder.onnx",
+                "voices": "voices.npz",
+                "vocab": ["a"],
+                "sample_rate": 24000,
+                "samples_per_frame": 600,
+                "max_frames": 100,
+                "decoder_mode": "exact",
+                "alignment_format": "gather",
+                "streaming": {
+                    "source": "source.onnx",
+                    "decoder": "decoder_window.onnx",
+                    "chunk_frames": 10,
+                    "context_frames": 2
+                }
+            }"#,
+        )
+        .unwrap();
+        let missing = options.missing_required(&dir, ModelLayout::Bundle);
+        for file in [
+            "encoder.onnx",
+            "prosody.onnx",
+            "decoder.onnx",
+            "voices.npz",
+            "source.onnx",
+            "decoder_window.onnx",
+        ] {
+            assert!(
+                missing.contains(&format!("{BUNDLE_DIR}/{file}")),
+                "missing list has no {file}: {missing:?}"
+            );
+            std::fs::write(dir.join(BUNDLE_DIR).join(file), b"x").unwrap();
+        }
+        assert!(options
+            .missing_required(&dir, ModelLayout::Bundle)
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_remote_prefix_is_configurable() {
+        let mut options = DownloadOptions::default();
+        assert_eq!(
+            remote_path(&options, "encoder.onnx"),
+            format!("{BUNDLE_DIR}/encoder.onnx")
+        );
+        options.bundle_prefix = "/onnx/".into();
+        assert_eq!(remote_path(&options, "encoder.onnx"), "onnx/encoder.onnx");
+        options.bundle_prefix = String::new();
+        assert_eq!(remote_path(&options, "encoder.onnx"), "encoder.onnx");
+    }
+
+    #[test]
     fn manifest_url_and_missing() {
         let dir = std::env::temp_dir().join(format!("promin-dl-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let options = DownloadOptions::default();
-        assert_eq!(options.missing_required(&dir).len(), REQUIRED_FILES.len());
+        assert_eq!(
+            options.missing_required(&dir, ModelLayout::Legacy).len(),
+            REQUIRED_FILES.len()
+        );
         assert!(resolve_url(&options, "tts/vocab.json")
             .contains("Morkon/holos-native-models/resolve/main/tts/vocab.json"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -440,7 +659,9 @@ mod tests {
             std::fs::write(dir.join(file), b"x").unwrap();
         }
         let options = DownloadOptions::default();
-        assert!(options.missing_required(&dir).is_empty());
+        assert!(options
+            .missing_required(&dir, ModelLayout::Legacy)
+            .is_empty());
         assert!(!file_present(&dir, "tts/voice_encoder.onnx"));
         std::fs::write(dir.join("voice_encoder.onnx"), b"x").unwrap();
         assert!(file_present(&dir, "tts/voice_encoder.onnx"));

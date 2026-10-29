@@ -368,7 +368,7 @@ impl ModelPaths {
 }
 
 /// Знайти каталог бандла в типових розкладках.
-fn find_bundle(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_bundle(dir: &Path) -> Option<PathBuf> {
     ["", "tts", "onnx", "holos-onnx"]
         .iter()
         .map(|rel| dir.join(rel))

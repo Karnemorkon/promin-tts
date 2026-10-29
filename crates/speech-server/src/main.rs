@@ -35,7 +35,7 @@ mod service;
 mod subtitles;
 mod wyoming;
 
-use downloader::{ensure_models, DownloadOptions};
+use downloader::{ensure_models, DownloadOptions, ModelLayout};
 use jobs::{CancelOutcome, JobManager};
 use pronunciation::{
     PronunciationFile, PronunciationPayload, PronunciationStore, PronunciationStoreError,
@@ -941,16 +941,22 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let download_options = DownloadOptions::from_env();
-    if download_options.enabled && !use_bundle {
-        let missing = download_options.missing_required(&args.models_dir);
+    if download_options.enabled {
+        let layout = if use_bundle {
+            ModelLayout::Bundle
+        } else {
+            ModelLayout::Legacy
+        };
+        let missing = download_options.missing_required(&args.models_dir, layout);
         if !missing.is_empty() {
             tracing::info!(
                 missing = missing.len(),
                 repo = %download_options.repo,
+                layout = ?layout,
                 "required models are missing, downloading from Hugging Face"
             );
         }
-        let report = ensure_models(&args.models_dir, &download_options).await?;
+        let report = ensure_models(&args.models_dir, &download_options, layout).await?;
         if !report.downloaded.is_empty() {
             tracing::info!(
                 downloaded = report.downloaded.len(),
