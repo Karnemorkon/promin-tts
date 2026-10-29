@@ -39,8 +39,5 @@ services:
       # Audiobook projects (`<id>/project.json` + chapter WAV files).
       - ${PROMIN_PROJECTS_HOST:-../models/projects}:/data/projects
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8010/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    # The image ships a bash /dev/tcp healthcheck that follows PROMIN_HTTP_ADDR;
+    # do not override it with curl, which is intentionally absent from the image.
