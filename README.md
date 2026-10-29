@@ -1,17 +1,24 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.9 adds per-sentence audio takes with A/B switching and regeneration without re-synthesizing a whole chapter, on top of v0.8 dialogue roles, v0.7 PDF import (text layer) and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. It builds on v0.9 per-sentence takes, v0.8 dialogue roles, v0.7 PDF import and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.9 «Тейки та перегенерація речень»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
+**v0.10 «HolosTTS»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
 експорт готової аудіокниги в M4B/MP3/OGG, багатоголосий синтез діалогів
 із ролями персонажів та кеш аудіо по реченнях із кількома тейками,
 A/B-вибором і перегенерацією окремого речення.
+
+Нова багатоетапна архітектура HolosTTS: замість одного графа — бандл
+`holos_onnx.json` + `encoder` / `prosody` / `decoder` (exact) або
+`source` + `decoder_window` (стрімінг вікнами). Сервіс сам визначає формат,
+а `PROMIN_MODEL_FORMAT` дозволяє вибрати його явно. Ідентичність моделі
+(SHA-256 графів і вокабуляра) входить у відбиток глави й тейків, тому
+після заміни вагів застарілий кеш не змішується з новим аудіо.
 
 Реалізовано:
 
@@ -49,6 +56,13 @@ A/B-вибором і перегенерацією окремого реченн
 - `speech-text::verbalize` — rule-вербалізатор: числа, дати, час. Golden 68/68.
 - `speech-inference::gemma` — Gemma-3-270M INT8 з KV-кешем; golden 46/46,
   token IDs звірені 1:1 із системним SentencePiece 0.2.0.
+- `speech-inference::bundle` — читач бандла HolosTTS: `holos_onnx.json`
+  (формат 2, `decoder_mode=exact`, `alignment_format=gather`), `voices.npz`
+  (NPY `<f4`/`<U*`), безпечні відносні шляхи етапів.
+- `speech-inference::pipeline` — багатоетапний рушій: encoder → prosody →
+  exact decoder, а також віконний стрімінг `source` + `decoder_window`
+  з обрізанням стартової тиші до 10 мс і фейд-іном 5 мс (паритет із
+  Python-еталоном).
 - `speech-inference` — ONNX Runtime 1.31.0 (офіційний x64 build; перевірено на
   AVX-only Xeon E5-2650), автоматичний біндінг входів `tokens` / `voice` / `speed`.
 - `speech-export` — експорт книги в **M4B** (AAC, глави, обкладинка, метадані),
@@ -79,7 +93,15 @@ deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / 
 
 ```
 models/
-├── tts/
+├── holos-onnx/              # багатоетапний бандл HolosTTS (пріоритет у auto)
+│   ├── holos_onnx.json      # маніфест: вокабуляр, частота, етапи
+│   ├── encoder.onnx         # токени → acoustic/prosodic + durations
+│   ├── prosody.onnx         # frame_to_token → f0/energy
+│   ├── decoder.onnx         # exact-декодер на всю репліку
+│   ├── source.onnx          # опційно: збудження для віконного декодера
+│   ├── decoder_window.onnx  # опційно: декодер вікна
+│   └── voices.npz           # пресети голосів (names/values)
+├── tts/                     # старий однографовий формат (fallback)
 │   ├── holos_cpu_int8.onnx
 │   ├── vocab.json
 │   ├── voices.json
@@ -98,6 +120,18 @@ models/
                               #        + chapters/<n>/takes/ (тейки) + exports/
 ```
 
+Бандл шукається в корені `models/`, а також у `tts/`, `onnx/` і `holos-onnx/`.
+У режимі `auto` він має пріоритет над старим графом. Формат можна зафіксувати:
+
+| Значення `PROMIN_MODEL_FORMAT` | Опис |
+|---|---|
+| `auto` (типово) | бандл, якщо є `holos_onnx.json`, інакше legacy |
+| `bundle` / `holos-onnx` / `onnx` | тільки багатоетапний бандл |
+| `legacy` / `holos-cpu` / `int8` | тільки старий однографовий формат |
+
+Частота дискретизації бандла мусить збігатися з серверною (24 кГц).
+Розмірність голосу береться з `voices.npz`; наразі очікується 256.
+
 Шлях до моделей задається через `PROMIN_MODELS_DIR`; каталог клонованих голосів —
 `PROMIN_SPEAKERS_DIR` (типово `<models>/speakers`), job-ів — `PROMIN_JOBS_DIR`
 (типово `<models>/jobs`), проєктів — `PROMIN_PROJECTS_DIR` (типово
@@ -110,6 +144,8 @@ models/
 Якщо обов'язкових файлів немає, сервер завантажує їх із
 [`Morkon/holos-native-models`](https://huggingface.co/Morkon/holos-native-models)
 у `PROMIN_MODELS_DIR` (потоково, з `.part` і докачкою через HTTP Range).
+У режимі бандла спершу завантажується `holos_onnx.json`, а далі — усі етапи,
+які він перелічує; словник наголосів потрібен обом режимам.
 Опційні моделі (accentor, voice encoder, Gemma) завантажуються за наявності.
 
 | Змінна | Типово | Опис |
@@ -120,6 +156,7 @@ models/
 | `PROMIN_HF_REVISION` | `main` | Гілка/тег/коміт |
 | `PROMIN_HF_TOKEN` | — | Токен для приватних репозиторіїв |
 | `PROMIN_HF_BASE_URL` | `https://huggingface.co` | Дзеркало |
+| `PROMIN_HF_BUNDLE_PREFIX` | `holos-onnx` | Каталог бандла в репозиторії HF |
 | `PROMIN_DOWNLOAD_TIMEOUT` | `3600` | Таймаут завантаження, секунди |
 
 Якщо каталог моделей read-only і чогось не вистачає, сервер завершиться з
@@ -205,6 +242,7 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | Метод | Шлях | Опис |
 |---|---|---|
 | `GET` | `/healthz` | Стан сервера, версія, голоси, вербалізатор, accentor, voice encoder |
+| `GET` | `/v1/model`, `/api/model` | Ідентичність моделі: SHA-256 графів, вокабуляра, формат, стрімінг |
 | `GET` | `/api/voices` | Пресети + `custom` (клоновані) + голос за замовчуванням |
 | `POST` | `/api/voices` | `{name, audio_base64}` → `{name, dim}`; 400 — некоректні дані, 503 — енкодер вимкнено |
 | `DELETE` | `/api/voices/{name}` | Видалити клонований голос: 204 або 404 |
@@ -251,11 +289,14 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `POST` | `/mcp` | MCP JSON-RPC 2.0 (Streamable HTTP, stateless) |
 
 Потоковий синтез (`/api/synthesize/stream`, `/v1/tts/stream`, Wyoming) ділить
-текст на **окремі речення**: перший аудіочанк віддається після синтезу першого
-речення, а наступні генеруються послідовно, поки клієнт відтворює попередні.
+текст на **окремі речення**. З legacy-моделлю перший аудіочанк віддається після
+синтезу першого речення, а наступні генеруються послідовно, поки клієнт
+відтворює попередні. З бандлом HolosTTS (`source` + `decoder_window`) аудіо
+віддається ще дрібніше — по одному декодованому вікну, тому перший звук
+з'являється, не чекаючи кінця речення. Стартова тиша зрізається до 10 мс,
+після чого перші 5 мс отримують фейд-ін, щоб уникнути клацання.
 Сусідні речення не об'єднуються; `max_chars` (50–5000) обмежує лише занадто
-довге речення, яке додатково ріжеться за комами/тире/пробілами. Це зменшує
-затримку до першого звуку з десятків секунд до кількох секунд.
+довге речення, яке додатково ріжеться за комами/тире/пробілами.
 
 ### Синтез
 
