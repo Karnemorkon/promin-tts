@@ -10,7 +10,7 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,45 @@ pub fn sha256_file(path: impl AsRef<Path>) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// SHA-256 набору файлів: імена та вміст у заданому порядку.
+///
+/// Потрібен для багатоетапного бандла, де аудіо залежить від кількох графів.
+/// Ім'я файлу входить у геш, щоб перейменування або перестановка етапів
+/// змінювали ідентичність.
+pub fn sha256_files(paths: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("file name is not valid utf-8: {}", path.display()))?;
+        hasher.update(name.as_bytes());
+        hasher.update([0u8]);
+        let file =
+            File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .with_context(|| format!("read {} for hashing", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        hasher.update([0u8]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// SHA-256 довільного байтового буфера.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex(&hasher.finalize())
+}
+
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -220,6 +259,23 @@ mod tests {
         assert_eq!(parsed, identity);
         cleanup(&model);
         cleanup(&vocab);
+    }
+
+    #[test]
+    fn hashes_multiple_files_deterministically() {
+        let a = temp_file("a.onnx", b"alpha");
+        let b = temp_file("b.onnx", b"beta");
+        let first = sha256_files(&[a.clone(), b.clone()]).unwrap();
+        let second = sha256_files(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        // Порядок і вміст впливають на результат.
+        assert_ne!(first, sha256_files(&[b.clone(), a.clone()]).unwrap());
+        std::fs::write(&b, b"gamma").unwrap();
+        assert_ne!(first, sha256_files(&[a.clone(), b.clone()]).unwrap());
+        assert_eq!(sha256_bytes(b"alpha"), sha256_file(&a).unwrap());
+        cleanup(&a);
+        cleanup(&b);
     }
 
     #[test]

@@ -2059,9 +2059,12 @@ dependencies = [
  "ndarray",
  "ort",
  "sentencepiece",
+ "serde",
+ "serde_json",
  "speech-text",
  "thiserror 2.0.21",
  "tracing",
+ "zip 9.1.2",
 ]
 
 [[package]]

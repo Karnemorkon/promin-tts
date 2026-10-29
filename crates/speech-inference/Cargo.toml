@@ -14,5 +14,8 @@ anyhow.workspace = true
 ndarray.workspace = true
 ort.workspace = true
 sentencepiece = { version = "0.14", features = ["static"] }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

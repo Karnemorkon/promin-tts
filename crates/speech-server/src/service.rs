@@ -14,7 +14,10 @@ use speech_audio::{
 use speech_core::custom_voices::{CustomVoiceError, CustomVoices};
 use speech_core::model::ModelIdentity;
 use speech_core::projects::{ChunkTiming, LoudnessReport as ProjectLoudnessReport, Role};
-use speech_inference::{Accentor, GemmaVerbalizer, TtsEngine, VoiceEncoder};
+use speech_inference::{
+    Accentor, Bundle, BundleManifest, GemmaVerbalizer, HolosPipeline, TtsEngine, VoiceEncoder,
+    BUNDLE_MANIFEST,
+};
 use speech_text::dialogue::DialogueSegment;
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
@@ -214,12 +217,23 @@ pub enum SynthError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Джерело моделі синтезу.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSource {
+    /// Один ONNX-граф `holos_cpu_int8.onnx` + `vocab.json` + `voices.json`.
+    Legacy {
+        model: PathBuf,
+        vocab: PathBuf,
+        voices: PathBuf,
+    },
+    /// Багатоетапний бандл `holos-onnx`: `holos_onnx.json`, `*.onnx`, `voices.npz`.
+    Bundle { dir: PathBuf },
+}
+
 /// Шляхи до файлів моделей.
 #[derive(Debug, Clone)]
 pub struct ModelPaths {
-    pub model: PathBuf,
-    pub vocab: PathBuf,
-    pub voices: PathBuf,
+    pub source: ModelSource,
     pub stress_trie: PathBuf,
     /// Каталог Gemma-вербалізатора (`model.onnx` + `tokenizer.model`), якщо є.
     pub verbalizer: Option<PathBuf>,
@@ -231,7 +245,20 @@ pub struct ModelPaths {
 
 impl ModelPaths {
     /// `dir/tts/*` + `dir/stress/*`, з fallback на плоску розкладку `dir/*`.
+    ///
+    /// Якщо знайдено `holos_onnx.json`, перевага надається багатоетапному
+    /// бандлу; інакше — старому однографовому формату.
     pub fn discover(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::discover_with_format(dir, "auto")
+    }
+
+    /// Чи є під `dir` каталог багатоетапного бандла.
+    pub fn bundle_present(dir: impl AsRef<Path>) -> bool {
+        find_bundle(dir.as_ref()).is_some()
+    }
+
+    /// Те саме, але з явним вибором формату: `auto`, `legacy` або `bundle`.
+    pub fn discover_with_format(dir: impl AsRef<Path>, format: &str) -> Result<Self> {
         let dir = dir.as_ref();
         // Кожен обов'язковий файл шукаємо окремо: це підтримує змішану
         // розкладку (flat-моделі + опційний `tts/voice_encoder.onnx`).
@@ -276,10 +303,34 @@ impl ModelPaths {
         .into_iter()
         .find(|candidate| candidate.is_file());
 
+        let bundle = find_bundle(dir);
+        let source = match format.trim().to_ascii_lowercase().as_str() {
+            "auto" => match bundle {
+                Some(dir) => ModelSource::Bundle { dir },
+                None => ModelSource::Legacy {
+                    model: tts_file("holos_cpu_int8.onnx"),
+                    vocab: tts_file("vocab.json"),
+                    voices: tts_file("voices.json"),
+                },
+            },
+            "bundle" | "holos-onnx" | "onnx" => ModelSource::Bundle {
+                dir: bundle.with_context(|| {
+                    format!(
+                        "no {BUNDLE_MANIFEST} found under {} (looked in the root, tts/, onnx/ and holos-onnx/)",
+                        dir.display()
+                    )
+                })?,
+            },
+            "legacy" | "holos-cpu" | "int8" => ModelSource::Legacy {
+                model: tts_file("holos_cpu_int8.onnx"),
+                vocab: tts_file("vocab.json"),
+                voices: tts_file("voices.json"),
+            },
+            other => bail!("unknown model format {other:?} (expected auto, legacy or bundle)"),
+        };
+
         let paths = Self {
-            model: tts_file("holos_cpu_int8.onnx"),
-            vocab: tts_file("vocab.json"),
-            voices: tts_file("voices.json"),
+            source,
             stress_trie,
             verbalizer,
             accentor,
@@ -290,13 +341,38 @@ impl ModelPaths {
     }
 
     fn validate(&self) -> Result<()> {
-        for path in [&self.model, &self.vocab, &self.voices, &self.stress_trie] {
-            if !path.is_file() {
-                bail!("missing model file: {}", path.display());
+        if !self.stress_trie.is_file() {
+            bail!("missing model file: {}", self.stress_trie.display());
+        }
+        match &self.source {
+            ModelSource::Legacy {
+                model,
+                vocab,
+                voices,
+            } => {
+                for path in [model, vocab, voices] {
+                    if !path.is_file() {
+                        bail!("missing model file: {}", path.display());
+                    }
+                }
+            }
+            ModelSource::Bundle { dir } => {
+                let manifest = dir.join(BUNDLE_MANIFEST);
+                if !manifest.is_file() {
+                    bail!("missing model file: {}", manifest.display());
+                }
             }
         }
         Ok(())
     }
+}
+
+/// Знайти каталог бандла в типових розкладках.
+fn find_bundle(dir: &Path) -> Option<PathBuf> {
+    ["", "tts", "onnx", "holos-onnx"]
+        .iter()
+        .map(|rel| dir.join(rel))
+        .find(|candidate| candidate.join(BUNDLE_MANIFEST).is_file())
 }
 
 /// voices.json -> map; кожен голос мусить мати рівно 256 float.
@@ -323,6 +399,42 @@ fn load_voices(path: &Path) -> Result<BTreeMap<String, Vec<f32>>> {
     parse_voices(&json)
 }
 
+/// Ідентичність багатоетапного бандла.
+///
+/// Хешуємо всі файли, від яких залежить аудіо: маніфест, графи етапів і
+/// пресети голосів. Словник фонем входить окремим гешем, щоб зміна
+/// вокабуляра інвалідувала тейки навіть за незмінних графів.
+fn bundle_model_identity(dir: &Path, bundle: &Bundle) -> Result<ModelIdentity> {
+    let manifest: &BundleManifest = &bundle.manifest;
+    let mut files = vec![
+        dir.join(BUNDLE_MANIFEST),
+        bundle.stage(&manifest.encoder),
+        bundle.stage(&manifest.prosody),
+        bundle.stage(&manifest.decoder),
+    ];
+    if let Some(streaming) = &manifest.streaming {
+        files.push(bundle.stage(&streaming.source));
+        files.push(bundle.stage(&streaming.decoder));
+    }
+    if let Some(voices) = &manifest.voices {
+        files.push(dir.join(voices));
+    }
+    let sha256 = speech_core::model::sha256_files(&files)?;
+    let vocab_sha256 = speech_core::model::sha256_bytes(
+        &serde_json::to_vec(bundle.vocab()).context("serialize bundle vocabulary")?,
+    );
+    Ok(ModelIdentity {
+        schema: speech_core::model::MODEL_IDENTITY_SCHEMA,
+        id: speech_core::model::DEFAULT_MODEL_ID.to_string(),
+        variant: "onnx".to_string(),
+        sha256,
+        vocab_sha256,
+        sample_rate: manifest.sample_rate,
+        voice_dim: bundle.voice_dim(),
+        license: speech_core::model::DEFAULT_MODEL_LICENSE.to_string(),
+    })
+}
+
 /// Помилка сховища кастомних голосів -> HTTP-помилка сервісу.
 fn custom_voice_error(error: CustomVoiceError) -> SynthError {
     match error {
@@ -335,9 +447,31 @@ fn custom_voice_error(error: CustomVoiceError) -> SynthError {
     }
 }
 
+/// Рушій синтезу: старий однографовий або багатоетапний бандл.
+enum Engine {
+    Legacy(TtsEngine),
+    Holos(Box<HolosPipeline>),
+}
+
+impl Engine {
+    fn generate(&self, phoneme_ids: &[i64], voice: &[f32], speed: f32) -> Result<Vec<f32>> {
+        match self {
+            Self::Legacy(engine) => engine.generate(phoneme_ids, voice, speed),
+            Self::Holos(pipeline) => pipeline.synthesize(phoneme_ids, voice, speed),
+        }
+    }
+
+    fn is_streaming(&self) -> bool {
+        match self {
+            Self::Legacy(_) => false,
+            Self::Holos(pipeline) => pipeline.is_streaming(),
+        }
+    }
+}
+
 /// Завантажені моделі + стан синтезу.
 pub struct SynthService {
-    engine: Mutex<TtsEngine>,
+    engine: Mutex<Engine>,
     /// Відбиток завантаженої моделі (входить у fingerprint тейків).
     model_identity: ModelIdentity,
     tokenizer: CharTokenizer,
@@ -356,9 +490,48 @@ pub struct SynthService {
 
 impl SynthService {
     pub fn load(paths: &ModelPaths, intra_threads: i16, speakers_dir: PathBuf) -> Result<Self> {
-        let engine = TtsEngine::from_file(&paths.model, intra_threads)?;
-        let tokenizer = CharTokenizer::from_vocab_json(&paths.vocab)
-            .with_context(|| format!("load vocab {}", paths.vocab.display()))?;
+        let (engine, tokenizer, voices, model_identity) = match &paths.source {
+            ModelSource::Legacy {
+                model,
+                vocab,
+                voices,
+            } => {
+                let engine = Engine::Legacy(TtsEngine::from_file(model, intra_threads)?);
+                let tokenizer = CharTokenizer::from_vocab_json(vocab)
+                    .with_context(|| format!("load vocab {}", vocab.display()))?;
+                let voices = load_voices(voices)?;
+                let identity = ModelIdentity::compute(
+                    model,
+                    vocab,
+                    SAMPLE_RATE,
+                    speech_core::custom_voices::VOICE_DIM,
+                )
+                .context("compute model identity")?;
+                (engine, tokenizer, voices, identity)
+            }
+            ModelSource::Bundle { dir } => {
+                let bundle = Bundle::open(dir, speech_core::custom_voices::VOICE_DIM)
+                    .with_context(|| format!("open Holos bundle {}", dir.display()))?;
+                if bundle.sample_rate() != SAMPLE_RATE {
+                    bail!(
+                        "bundle sample rate {} does not match server rate {SAMPLE_RATE}",
+                        bundle.sample_rate()
+                    );
+                }
+                let engine =
+                    Engine::Holos(Box::new(HolosPipeline::open(dir, intra_threads, false)?));
+                let tokenizer = CharTokenizer::from_vocab(bundle.vocab());
+                let voices = bundle.voices.clone();
+                let identity = bundle_model_identity(dir, &bundle)?;
+                (engine, tokenizer, voices, identity)
+            }
+        };
+        model_identity
+            .validate()
+            .context("validate model identity")?;
+        if voices.is_empty() {
+            bail!("model has no voices");
+        }
 
         // accentor-lite опційний: без нього працює лише словниковий наголос.
         let accentor: Option<Arc<dyn NeuralStress>> = match &paths.accentor {
@@ -377,7 +550,6 @@ impl SynthService {
         };
         let phonemizer = Phonemizer::open_with_accentor(&paths.stress_trie, accentor)
             .with_context(|| format!("load stress dictionary {}", paths.stress_trie.display()))?;
-        let voices = load_voices(&paths.voices)?;
 
         let default_voice = if voices.contains_key(DEFAULT_VOICE) {
             DEFAULT_VOICE.to_string()
@@ -418,17 +590,6 @@ impl SynthService {
         };
         let custom_voices = CustomVoices::new(speakers_dir);
 
-        let model_identity = ModelIdentity::compute(
-            &paths.model,
-            &paths.vocab,
-            SAMPLE_RATE,
-            speech_core::custom_voices::VOICE_DIM,
-        )
-        .context("compute model identity")?;
-        model_identity
-            .validate()
-            .context("validate model identity")?;
-
         tracing::info!(
             voices = voices.len(),
             default_voice = %default_voice,
@@ -436,6 +597,7 @@ impl SynthService {
             model = %model_identity.short(),
             sample_rate = model_identity.sample_rate,
             voice_dim = model_identity.voice_dim,
+            streaming = engine.is_streaming(),
             verbalizer = if neural.is_some() { "neural+rule" } else { "rule" },
             verbalizer_dir = ?paths.verbalizer,
             accentor = if phonemizer.has_accentor() { "on" } else { "off" },
@@ -478,7 +640,7 @@ impl SynthService {
     }
 
     pub fn sample_rate(&self) -> u32 {
-        SAMPLE_RATE
+        self.model_identity.sample_rate
     }
 
     /// Незмінна ідентичність завантаженої моделі.
@@ -1470,7 +1632,14 @@ mod tests {
         }
 
         let paths = ModelPaths::discover(&root).expect("discover nested layout");
-        assert_eq!(paths.model, root.join("tts/holos_cpu_int8.onnx"));
+        assert_eq!(
+            paths.source,
+            ModelSource::Legacy {
+                model: root.join("tts/holos_cpu_int8.onnx"),
+                vocab: root.join("tts/vocab.json"),
+                voices: root.join("tts/voices.json"),
+            }
+        );
         assert_eq!(paths.stress_trie, root.join("stress/stress.trie"));
         assert!(paths.verbalizer.is_none());
         assert!(paths.accentor.is_none());
@@ -1607,6 +1776,38 @@ mod tests {
     }
 
     #[test]
+    fn discovers_holos_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "promin-models-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("holos-onnx")).unwrap();
+        std::fs::create_dir_all(root.join("stress")).unwrap();
+        std::fs::write(root.join("holos-onnx/holos_onnx.json"), b"{}").unwrap();
+        std::fs::write(root.join("stress/stress.trie"), b"x").unwrap();
+
+        let paths = ModelPaths::discover(&root).expect("discover bundle");
+        assert_eq!(
+            paths.source,
+            ModelSource::Bundle {
+                dir: root.join("holos-onnx"),
+            }
+        );
+
+        // Явний legacy ігнорує бандл, явний bundle без маніфесту — помилка.
+        assert!(ModelPaths::discover_with_format(&root, "legacy").is_err());
+        std::fs::remove_file(root.join("holos-onnx/holos_onnx.json")).unwrap();
+        assert!(ModelPaths::discover_with_format(&root, "bundle").is_err());
+        assert!(ModelPaths::discover_with_format(&root, "nonsense").is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn discovers_flat_layout() {
         let root = std::env::temp_dir().join(format!(
             "promin-models-flat-{}-{}",
@@ -1627,7 +1828,14 @@ mod tests {
         }
 
         let paths = ModelPaths::discover(&root).expect("discover flat layout");
-        assert_eq!(paths.model, root.join("holos_cpu_int8.onnx"));
+        assert_eq!(
+            paths.source,
+            ModelSource::Legacy {
+                model: root.join("holos_cpu_int8.onnx"),
+                vocab: root.join("vocab.json"),
+                voices: root.join("voices.json"),
+            }
+        );
         assert_eq!(paths.stress_trie, root.join("stress.trie"));
         assert!(paths.verbalizer.is_none());
         assert!(paths.accentor.is_none());
@@ -1657,9 +1865,14 @@ mod tests {
         std::fs::write(root.join("tts/voice_encoder.onnx"), b"x").unwrap();
 
         let paths = ModelPaths::discover(&root).expect("discover mixed layout");
-        assert_eq!(paths.model, root.join("holos_cpu_int8.onnx"));
-        assert_eq!(paths.vocab, root.join("vocab.json"));
-        assert_eq!(paths.voices, root.join("voices.json"));
+        assert_eq!(
+            paths.source,
+            ModelSource::Legacy {
+                model: root.join("holos_cpu_int8.onnx"),
+                vocab: root.join("vocab.json"),
+                voices: root.join("voices.json"),
+            }
+        );
         assert_eq!(paths.stress_trie, root.join("stress.trie"));
         assert_eq!(
             paths.voice_encoder.as_deref(),

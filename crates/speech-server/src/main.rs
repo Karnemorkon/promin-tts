@@ -53,6 +53,10 @@ struct Args {
     #[arg(long, env = "PROMIN_MODELS_DIR", default_value = "models")]
     models_dir: PathBuf,
 
+    /// Model format: `auto`, `legacy` (single graph) or `bundle` (holos-onnx)
+    #[arg(long, env = "PROMIN_MODEL_FORMAT", default_value = "auto")]
+    model_format: String,
+
     /// ONNX intra-op threads
     #[arg(long, env = "PROMIN_THREADS", default_value_t = 4)]
     threads: i16,
@@ -928,8 +932,16 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Бандл не потребує старих обов'язкових файлів, тому не тягнемо їх
+    // з Hugging Face даремно. Словник наголосів усе одно має бути локально.
+    let use_bundle = match args.model_format.trim().to_ascii_lowercase().as_str() {
+        "bundle" | "holos-onnx" | "onnx" => true,
+        "legacy" | "holos-cpu" | "int8" => false,
+        _ => ModelPaths::bundle_present(&args.models_dir),
+    };
+
     let download_options = DownloadOptions::from_env();
-    if download_options.enabled {
+    if download_options.enabled && !use_bundle {
         let missing = download_options.missing_required(&args.models_dir);
         if !missing.is_empty() {
             tracing::info!(
@@ -955,7 +967,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let paths = ModelPaths::discover(&args.models_dir)?;
+    let paths = if args.model_format.eq_ignore_ascii_case("auto") {
+        ModelPaths::discover(&args.models_dir)?
+    } else {
+        ModelPaths::discover_with_format(&args.models_dir, &args.model_format)?
+    };
     let speakers_dir = args
         .speakers_dir
         .unwrap_or_else(|| args.models_dir.join("speakers"));
