@@ -653,12 +653,20 @@ fn extract_f32(outputs: &[Value<'static>], index: usize, name: &str) -> Result<A
 }
 
 fn extract_i64(outputs: &[Value<'static>], index: usize, name: &str) -> Result<ArrayD<i64>> {
-    let tensor = outputs
+    let value = outputs
         .get(index)
-        .with_context(|| format!("model returned no {name:?} output"))?
-        .try_extract::<i64>()
-        .with_context(|| format!("extract {name} as i64"))?;
-    Ok(tensor.view().to_owned())
+        .with_context(|| format!("model returned no {name:?} output"))?;
+    if let Ok(tensor) = value.try_extract::<i64>() {
+        return Ok(tensor.view().to_owned());
+    }
+    // Python приймає будь-який цілий dtype; експорт може віддати int32.
+    if let Ok(tensor) = value.try_extract::<i32>() {
+        let view = tensor.view();
+        let shape = view.shape().to_vec();
+        let data: Vec<i64> = view.iter().map(|&value| value as i64).collect();
+        return Ok(ArrayD::from_shape_vec(IxDyn(&shape), data)?);
+    }
+    bail!("extract {name} as i64 or i32")
 }
 
 /// `frame_to_token`: індекс токена для кожного кадру, без padding.
