@@ -3,6 +3,7 @@
 pub mod custom_voices;
 pub mod jobs;
 pub mod projects;
+pub mod takes;
 
 pub fn crate_name() -> &'static str {
     "speech-core"

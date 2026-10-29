@@ -1,16 +1,17 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.8 adds dialogue roles with per-role voices, on top of v0.7 PDF import (text layer) and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.9 adds per-sentence audio takes with A/B switching and regeneration without re-synthesizing a whole chapter, on top of v0.8 dialogue roles, v0.7 PDF import (text layer) and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.8 «Діалоги та ролі»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
+**v0.9 «Тейки та перегенерація речень»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
-експорт готової аудіокниги в M4B/MP3/OGG та багатоголосий синтез діалогів
-із ролями персонажів.
+експорт готової аудіокниги в M4B/MP3/OGG, багатоголосий синтез діалогів
+із ролями персонажів та кеш аудіо по реченнях із кількома тейками,
+A/B-вибором і перегенерацією окремого речення.
 
 Реалізовано:
 
@@ -31,6 +32,9 @@
 - `speech-core::projects` — модель книги/глав, ролі діалогів (ім'я → голос),
   статуси, `.speechproj` (JSON), атомарне сховище
   `<projects>/<id>/project.json` + `chapters/<n>.wav`.
+- `speech-core::takes` — маніфест тейків глави (`chapters/<n>/takes.json`),
+  float32 WAV на кожен тейк, SHA-256, відбиток плану глави для інвалідації
+  кешу після зміни тексту, налаштувань, ролей або словника вимови.
 - `speech-text::import` — EPUB 2/3, FB2 (UTF-8/CP1251), DOCX, PDF (текстовий
   шар), TXT, Markdown; захист ZIP, ліміти розміру/глав, розбиття великих XHTML
   за заголовками. PDF: закладки → евристика заголовків → групування сторінок;
@@ -53,7 +57,8 @@
 - `speech-server` — Axum: REST, streaming WAV, асинхронні job-и + SSE, webhook-и,
   OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP,
   API проєктів книг, імпорт, генерація глав, багатоголосий синтез діалогів,
-  SRT/VTT, `.speechproj`, асинхронні export-job-и аудіокниг.
+  SRT/VTT, `.speechproj`, тейки й перегенерація речень, асинхронні
+  export-job-и аудіокниг.
 
 ## Архітектура
 
@@ -89,7 +94,8 @@ models/
 │   └── config.json
 ├── speakers/                 # клоновані голоси: <name>.npy (float32[256])
 ├── jobs/                     # асинхронні завдання: <id>.json + <id>.wav
-└── projects/                 # книги: <id>/project.json + chapters/<n>.wav + exports/
+└── projects/                 # книги: <id>/project.json + chapters/<n>.wav
+                              #        + chapters/<n>/takes/ (тейки) + exports/
 ```
 
 Шлях до моделей задається через `PROMIN_MODELS_DIR`; каталог клонованих голосів —
@@ -219,6 +225,13 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `GET`/`PUT` | `/v1/projects/{id}/chapters/{i}` | Отримати/змінити назву й текст глави |
 | `GET` | `/v1/projects/{id}/chapters/{i}/audio` | Готовий WAV глави |
 | `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt` | Субтитри глави |
+| `GET` | `/v1/projects/{id}/chapters/{i}/takes` | Маніфест тейків глави (усі речення й версії) |
+| `POST` | `/v1/projects/{id}/chapters/{i}/takes` | Скинути кеш тейків глави (204) |
+| `POST` | `/v1/projects/{id}/chapters/{i}/takes/units/{u}` | Перегенерувати речення `{voice?, speed?, text?}` як новий тейк |
+| `POST` | `/v1/projects/{id}/chapters/{i}/takes/units/{u}/takes/{t}/activate` | Зробити тейк активним і перезібрати главу |
+| `DELETE` | `/v1/projects/{id}/chapters/{i}/takes/units/{u}/takes/{t}` | Видалити тейк (204) |
+| `GET` | `/v1/projects/{id}/chapters/{i}/takes/units/{u}/takes/{t}/audio` | Float32 WAV окремого тейку |
+| `POST` | `/v1/projects/{id}/chapters/{i}/takes/rebuild` | Перезібрати главу з активних тейків без синтезу |
 | `GET` | `/v1/projects/{id}/manifest` | JSON-манифест із посиланнями на аудіо/субтитри |
 | `GET` | `/v1/projects/{id}/speechproj` | Скачати `.speechproj` |
 | `GET` | `/v1/projects/{id}/exports` | Список export-job-ів проєкту |
@@ -409,6 +422,64 @@ curl -X PUT http://localhost:8010/v1/projects/<id> \
 використовується голос проєкту. Ролі входять у `.speechproj` і у знімок job-а:
 зміна ролей під час генерації позначає главу `stale`.
 
+### Тейки та перегенерація речень (v0.9)
+
+Після генерації глави кожен чанк (речення) зберігається окремо як float32 WAV
+у `<projects>/<id>/chapters/<n>/takes/`, а `takes.json` описує версії. Глави
+нарізаються через `sentence_chunks`, тому один юніт — це одне речення; занадто
+довге речення ділиться за `max_chars`:
+
+```text
+chapters/0/
+├── takes.json          # маніфест: fingerprint, юніти, активні тейки
+├── u0-t1.wav           # речення 0, тейк 1
+├── u0-t2.wav           # речення 0, тейк 2 (перегенерований)
+└── u1-t1.wav
+```
+
+Маніфест містить SHA-256 кожного тейку, голос, темп і текст, що пішов у синтез.
+`fingerprint` — SHA-256 від тексту глави, `ProjectSettings`, ролей і словника
+вимови; якщо він не збігається з поточним проєктом, кеш вважається застарілим і
+видаляється (глави стають `stale`). Дублікат аудіо (той самий SHA-256) не
+створюється — `POST` повертає `409`.
+
+```bash
+# Усі тейки глави
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/chapters/0/takes
+
+# Перегенерувати речення 3 іншим голосом і темпом
+curl -X POST http://localhost:8010/v1/projects/<id>/chapters/0/takes/units/3 \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"voice":"Speaker_3","speed":1.05}'
+
+# Або з альтернативним текстом лише для озвучення (субтитри не змінюються)
+curl -X POST http://localhost:8010/v1/projects/<id>/chapters/0/takes/units/3 \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"text":"Текст із іншим наголосом або вимовою."}'
+
+# A/B: зробити тейк 2 активним (глава перезбирається з кешу)
+curl -X POST \
+  http://localhost:8010/v1/projects/<id>/chapters/0/takes/units/3/takes/2/activate \
+  -H 'Authorization: Bearer change-me'
+
+# Окремий тейк для прослуховування
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/chapters/0/takes/units/3/takes/2/audio -o take.wav
+
+# Видалити тейк
+curl -X DELETE \
+  http://localhost:8010/v1/projects/<id>/chapters/0/takes/units/3/takes/2 \
+  -H 'Authorization: Bearer change-me'
+```
+
+Перезбирання глави використовує той самий кросфейд і LUFS-нормалізацію, що й
+повний синтез, тому результат побайтово збігається з оригінальним WAV
+(за умови, що активні тейки — це тейки першого проходу). Перегенерація
+оновлює лише вибране речення; решта аудіо береться з кешу.
+
 ### Експорт аудіокниг (v0.7)
 
 Експорт — асинхронний job, як і генерація глав. Вимагається, щоб **усі** глави
@@ -525,7 +596,7 @@ MCP audio content (`audio/wav` base64) і текст із метаданими.
 | `PROMIN_SPEAKERS_DIR` | `<models>/speakers` | Клоновані голоси |
 | `PROMIN_JOBS_DIR` | `<models>/jobs` | Job-и та аудіо |
 | `PROMIN_JOBS_CONCURRENCY` | `1` | Одночасних job-ів |
-| `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV + exports) |
+| `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV + тейки + exports) |
 | `PROMIN_EXPORT_CONCURRENCY` | `1` | Одночасних експортів аудіокниг |
 | `PROMIN_PRONUNCIATION_FILE` | `<data>/pronunciation.json` | Глобальний словник вимови |
 | `PROMIN_LOUDNESS_TARGET` | `-19` | Ціль LUFS для нових проєктів |

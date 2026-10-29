@@ -127,6 +127,40 @@ pub struct SynthChapterOutput {
     /// `None`, якщо нормалізацію вимкнено або сигнал надто короткий.
     pub loudness: Option<ProjectLoudnessReport>,
     pub duration_ms: u64,
+    /// Сирі float32-семпли кожного чанка (до кросфейду) для кешу тейків.
+    ///
+    /// Порожній для глав, зібраних із готових тейків.
+    pub units: Vec<SynthUnit>,
+}
+
+/// Один синтезований юніт глави до склеювання.
+#[derive(Debug)]
+pub struct SynthUnit {
+    pub samples: Vec<f32>,
+    /// Оригінальний текст для субтитрів.
+    pub text: String,
+    /// Текст, який фактично пішов у синтез.
+    pub spoken: String,
+    pub voice: Option<String>,
+    pub role: Option<String>,
+}
+
+/// Юніт, готовий до перезбирання глави з кешу тейків.
+#[derive(Debug)]
+pub struct AssembledUnit {
+    pub samples: Vec<f32>,
+    pub text: String,
+    pub role: Option<String>,
+}
+
+/// Результат синтезу одного юніта (для перегенерації речення).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SynthUnitOutput {
+    pub samples: Vec<f32>,
+    pub spoken: String,
+    pub verbalizer: &'static str,
+    pub vb_ms: u64,
 }
 
 /// Запланований чанк глави: яким голосом озвучити та що показати в субтитрах.
@@ -143,6 +177,7 @@ struct ChapterAudio {
     chunk_timings: Vec<ChunkTiming>,
     loudness: Option<ProjectLoudnessReport>,
     duration_ms: u64,
+    units: Vec<SynthUnit>,
 }
 
 /// Метадані, готові до відправки клієнту перед першим аудіо-чанком.
@@ -623,6 +658,32 @@ impl SynthService {
         Ok(())
     }
 
+    /// Синтез одного юніта (речення) для кешу тейків.
+    ///
+    /// Повертає сирі float32-семпли до кросфейду та нормалізації, щоб глава
+    /// могла бути перезібрана з активних тейків без повторного синтезу.
+    pub fn synthesize_unit(
+        &self,
+        text: &str,
+        voice: Option<&str>,
+        speed: f32,
+        mode: VerbalizerMode,
+        raw_stress: bool,
+        pronunciation: Option<&Pronouncer>,
+    ) -> Result<SynthUnitOutput, SynthError> {
+        let text = self.validate_text_with_limit(text, MAX_TEXT_CHARS)?;
+        self.validate_speed(speed)?;
+        let voice_vector = self.resolve_voice(voice)?;
+        let (spoken, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
+        let samples = self.synthesize_verbalized_f32(&spoken, &voice_vector, speed, raw_stress)?;
+        Ok(SynthUnitOutput {
+            samples,
+            spoken,
+            verbalizer,
+            vb_ms,
+        })
+    }
+
     /// Фонеми -> ONNX -> float32-семпли (один або кілька викликів моделі).
     fn synthesize_verbalized_f32(
         &self,
@@ -873,7 +934,7 @@ impl SynthService {
         let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
         tracing::debug!(verbalizer, vb_ms, "chapter text verbalized");
 
-        let chunks = chunk_text(&verbalized, max_chars);
+        let chunks = sentence_chunks(&verbalized, max_chars);
         if chunks.is_empty() {
             return Err(SynthError::BadRequest(
                 "text contains no speakable content".into(),
@@ -909,6 +970,7 @@ impl SynthService {
             chunk_timings: audio.chunk_timings,
             loudness: audio.loudness,
             duration_ms: audio.duration_ms,
+            units: audio.units,
         })
     }
 
@@ -964,7 +1026,7 @@ impl SynthService {
                 Some(_) => "mixed",
             });
 
-            let chunks = chunk_text(&verbalized, max_chars);
+            let chunks = sentence_chunks(&verbalized, max_chars);
             if chunks.is_empty() {
                 continue;
             }
@@ -1015,6 +1077,7 @@ impl SynthService {
             chunk_timings: audio.chunk_timings,
             loudness: audio.loudness,
             duration_ms: audio.duration_ms,
+            units: audio.units,
         })
     }
 
@@ -1073,56 +1136,27 @@ impl SynthService {
             }
         }
 
-        let overlap = crossfade_samples(crossfade_ms.min(200), SAMPLE_RATE);
-        let mut chunk_timings = Vec::with_capacity(total);
-        let mut cursor = 0usize;
-        for (index, audio) in audio_chunks.iter().enumerate() {
-            let start = if index == 0 {
-                0
-            } else {
-                cursor.saturating_sub(overlap)
-            };
-            let end = start + audio.len();
-            chunk_timings.push(ChunkTiming {
-                start_ms: samples_to_ms(start),
-                end_ms: samples_to_ms(end),
-                text: chunks[index].timing.clone(),
-                role: chunks[index].role.clone(),
-            });
-            cursor = end;
-        }
-
-        let mut samples = crossfade_concat(&audio_chunks, overlap);
-        let duration_ms = samples_to_ms(samples.len());
-        let mut loudness = None;
-        if let Some(target) = loudness_target {
-            let report = speech_audio::loudness::normalize(&mut samples, SAMPLE_RATE, target)
-                .map_err(SynthError::Internal)?;
-            if report.normalized {
-                loudness = Some(ProjectLoudnessReport {
-                    input_lufs: report.input_lufs.unwrap_or(-70.0),
-                    output_lufs: report.output_lufs.unwrap_or(-70.0),
-                    input_true_peak_db: report.input_true_peak_db.unwrap_or(-120.0),
-                    output_true_peak_db: report.output_true_peak_db.unwrap_or(-120.0),
-                    gain_db: report.gain_db,
-                    target_lufs: target.target_lufs,
-                    target_true_peak_db: target.true_peak_db,
-                    limited: report.limited_samples > 0,
-                });
-            }
-        }
-        let pcm = if loudness.is_some() {
-            float_to_pcm16_clipped(&samples)
-        } else {
-            float_to_pcm16(&samples)
-        };
-
-        Ok(ChapterAudio {
-            pcm,
-            chunk_timings,
-            loudness,
-            duration_ms,
-        })
+        let timing_texts: Vec<String> = chunks.iter().map(|chunk| chunk.timing.clone()).collect();
+        let roles: Vec<Option<String>> = chunks.iter().map(|chunk| chunk.role.clone()).collect();
+        let mut audio = assemble_chapter_audio(
+            &audio_chunks,
+            &timing_texts,
+            &roles,
+            crossfade_ms,
+            loudness_target,
+        )?;
+        audio.units = chunks
+            .iter()
+            .zip(audio_chunks)
+            .map(|(chunk, samples)| SynthUnit {
+                samples,
+                text: chunk.timing.clone(),
+                spoken: chunk.spoken.clone(),
+                voice: chunk.voice.clone(),
+                role: chunk.role.clone(),
+            })
+            .collect();
+        Ok(audio)
     }
 
     /// Потоковий синтез: `on_ready` -> метадані, `on_chunk` -> PCM16-байти.
@@ -1193,10 +1227,133 @@ fn samples_to_ms(samples: usize) -> u64 {
     samples as u64 * 1000 / SAMPLE_RATE as u64
 }
 
-/// Текст для субтитрів: оригінальні чанки, якщо вербалізація зберегла
+/// Склеїти сирі чанки у PCM глави: кросфейд, таймінги та LUFS.
+fn assemble_chapter_audio(
+    audio_chunks: &[Vec<f32>],
+    timing_texts: &[String],
+    roles: &[Option<String>],
+    crossfade_ms: u32,
+    loudness_target: Option<speech_audio::loudness::LoudnessTarget>,
+) -> Result<ChapterAudio, SynthError> {
+    let total = audio_chunks.len();
+    if total == 0 {
+        return Err(SynthError::BadRequest(
+            "chapter has no speakable content".into(),
+        ));
+    }
+    if timing_texts.len() != total || roles.len() != total {
+        return Err(SynthError::Internal(anyhow::anyhow!(
+            "chapter plan is inconsistent: {} chunks, {} texts, {} roles",
+            total,
+            timing_texts.len(),
+            roles.len()
+        )));
+    }
+    if audio_chunks.iter().any(Vec::is_empty) {
+        return Err(SynthError::Internal(anyhow::anyhow!(
+            "chapter contains an empty audio unit"
+        )));
+    }
+
+    let overlap = crossfade_samples(crossfade_ms.min(200), SAMPLE_RATE);
+    let mut chunk_timings = Vec::with_capacity(total);
+    let mut cursor = 0usize;
+    for (index, audio) in audio_chunks.iter().enumerate() {
+        let start = if index == 0 {
+            0
+        } else {
+            cursor.saturating_sub(overlap)
+        };
+        let end = start + audio.len();
+        chunk_timings.push(ChunkTiming {
+            start_ms: samples_to_ms(start),
+            end_ms: samples_to_ms(end),
+            text: timing_texts[index].clone(),
+            role: roles[index].clone(),
+        });
+        cursor = end;
+    }
+
+    let mut samples = crossfade_concat(audio_chunks, overlap);
+    let duration_ms = samples_to_ms(samples.len());
+    let mut loudness = None;
+    if let Some(target) = loudness_target {
+        let report = speech_audio::loudness::normalize(&mut samples, SAMPLE_RATE, target)
+            .map_err(SynthError::Internal)?;
+        if report.normalized {
+            loudness = Some(ProjectLoudnessReport {
+                input_lufs: report.input_lufs.unwrap_or(-70.0),
+                output_lufs: report.output_lufs.unwrap_or(-70.0),
+                input_true_peak_db: report.input_true_peak_db.unwrap_or(-120.0),
+                output_true_peak_db: report.output_true_peak_db.unwrap_or(-120.0),
+                gain_db: report.gain_db,
+                target_lufs: target.target_lufs,
+                target_true_peak_db: target.true_peak_db,
+                limited: report.limited_samples > 0,
+            });
+        }
+    }
+    let pcm = if loudness.is_some() {
+        float_to_pcm16_clipped(&samples)
+    } else {
+        float_to_pcm16(&samples)
+    };
+
+    Ok(ChapterAudio {
+        pcm,
+        chunk_timings,
+        loudness,
+        duration_ms,
+        units: Vec::new(),
+    })
+}
+
+/// Перезібрати главу з готових юнітів (активних тейків).
+///
+/// Результат еквівалентний повному синтезу: кросфейд і LUFS застосовуються
+/// до всієї глави, а не до окремих тейків.
+pub fn assemble_chapter_pcm(
+    units: Vec<AssembledUnit>,
+    crossfade_ms: u32,
+    loudness_target: Option<speech_audio::loudness::LoudnessTarget>,
+) -> Result<SynthChapterOutput, SynthError> {
+    let chunks = units.len();
+    if chunks == 0 {
+        return Err(SynthError::BadRequest(
+            "chapter has no speakable content".into(),
+        ));
+    }
+    let mut audio_chunks = Vec::with_capacity(chunks);
+    let mut timing_texts = Vec::with_capacity(chunks);
+    let mut roles = Vec::with_capacity(chunks);
+    for unit in units {
+        audio_chunks.push(unit.samples);
+        timing_texts.push(unit.text);
+        roles.push(unit.role);
+    }
+    let audio = assemble_chapter_audio(
+        &audio_chunks,
+        &timing_texts,
+        &roles,
+        crossfade_ms,
+        loudness_target,
+    )?;
+    Ok(SynthChapterOutput {
+        pcm: audio.pcm,
+        verbalizer: "cache",
+        vb_ms: 0,
+        chunks,
+        chunk_timings: audio.chunk_timings,
+        loudness: audio.loudness,
+        duration_ms: audio.duration_ms,
+        units: Vec::new(),
+    })
+}
+
+/// Текст для субтитрів: оригінальні речення, якщо вербалізація зберегла
 /// кількість чанків; інакше — вербалізовані (номери вже розгорнуто).
 fn timing_texts(original: &str, spoken: &[String], max_chars: usize) -> Vec<String> {
-    let original_chunks = chunk_text(original, max_chars);
+    let original_chunks = sentence_chunks(original, max_chars);
     if original_chunks.len() == spoken.len() {
         original_chunks
     } else {
@@ -1487,5 +1644,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn float32_take_roundtrip_preserves_chapter_bytes() {
+        use speech_audio::{decode_wav_f32, wav_bytes_f32, LoudnessTarget, SAMPLE_RATE};
+
+        let first: Vec<f32> = (0..16_000)
+            .map(|i| (i as f32 * 0.013).sin() * 0.31)
+            .collect();
+        let second: Vec<f32> = (0..11_000)
+            .map(|i| (i as f32 * 0.021).cos() * 0.23)
+            .collect();
+        let target = LoudnessTarget::new(-16.0, -1.5);
+
+        let expected = assemble_chapter_pcm(
+            vec![
+                AssembledUnit {
+                    samples: first.clone(),
+                    text: "Перше речення.".into(),
+                    role: None,
+                },
+                AssembledUnit {
+                    samples: second.clone(),
+                    text: "Друге речення.".into(),
+                    role: Some("Іван".into()),
+                },
+            ],
+            40,
+            Some(target),
+        )
+        .unwrap();
+
+        let mut rebuilt = Vec::new();
+        for (samples, text, role) in [
+            (first, "Перше речення.", None),
+            (second, "Друге речення.", Some("Іван")),
+        ] {
+            let wav = wav_bytes_f32(&samples, SAMPLE_RATE).unwrap();
+            let (decoded, rate) = decode_wav_f32(&wav).unwrap();
+            assert_eq!(rate, SAMPLE_RATE);
+            rebuilt.push(AssembledUnit {
+                samples: decoded,
+                text: text.into(),
+                role: role.map(str::to_string),
+            });
+        }
+        let actual = assemble_chapter_pcm(rebuilt, 40, Some(target)).unwrap();
+
+        assert_eq!(expected.pcm, actual.pcm);
+        assert_eq!(expected.chunk_timings, actual.chunk_timings);
+        assert_eq!(expected.duration_ms, actual.duration_ms);
+        assert_eq!(expected.loudness, actual.loudness);
     }
 }

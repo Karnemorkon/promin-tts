@@ -75,6 +75,30 @@ pub fn wav_bytes(pcm: &[i16], sample_rate: u32) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+/// float32 mono -> байти WAV (IEEE float 32-bit).
+///
+/// Використовується для кешу тейків: зберігає семпли без квантування, тому
+/// перезбирання глави з тейків дає той самий результат, що й повний синтез.
+pub fn wav_bytes_f32(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).context("create WAV writer")?;
+        for &sample in samples {
+            writer
+                .write_sample(sample)
+                .context("write WAV float sample")?;
+        }
+        writer.finalize().context("finalize WAV")?;
+    }
+    Ok(cursor.into_inner())
+}
+
 /// PCM16 mono -> WAV-файл.
 pub fn write_wav(path: impl AsRef<Path>, pcm: &[i16], sample_rate: u32) -> Result<()> {
     let bytes = wav_bytes(pcm, sample_rate)?;

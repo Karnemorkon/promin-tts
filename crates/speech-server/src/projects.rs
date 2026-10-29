@@ -5,6 +5,7 @@
 //! а `.speechproj` є JSON-манифестом без аудіо.
 
 use std::path::Path as StdPath;
+use std::sync::Arc;
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -12,16 +13,20 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use speech_audio::{decode_wav_f32, LoudnessTarget, SAMPLE_RATE};
 use speech_core::jobs::JobRequest;
 use speech_core::projects::{
     now_rfc3339, valid_project_id, validate_roles, Chapter, ChapterStatus, LoudnessSettings,
     Project, ProjectSettings, ProjectStore, PronunciationRule, Role, MAX_TITLE_CHARS,
 };
+use speech_core::takes::{chapter_fingerprint, sha256_hex, Take, TakeManifest, MAX_TAKES_PER_UNIT};
 use speech_text::import::{import_book, ImportError, ImportedBook};
+use tokio::task;
 
 use crate::pronunciation::PronunciationPayload;
+use crate::service::{assemble_chapter_pcm, VerbalizerMode, SPEED_RANGE};
 use crate::subtitles::{render_srt, render_vtt};
 use crate::AppState;
 
@@ -462,6 +467,9 @@ pub async fn update_project(
         project.touch();
     }
     save_project(&state.projects, &mut project)?;
+    if stale {
+        let _ = state.projects.delete_all_takes(&id);
+    }
     Ok(Json(project))
 }
 
@@ -504,6 +512,7 @@ pub async fn put_project_pronunciation(
         project.pronunciation = rules;
         project.mark_all_stale();
         save_project(&state.projects, &mut project)?;
+        let _ = state.projects.delete_all_takes(&id);
     }
     Ok(Json(project))
 }
@@ -692,6 +701,7 @@ pub async fn update_chapter(
 ) -> Result<Json<Chapter>, ProjectApiError> {
     let _guard = state.project_lock.lock().await;
     let mut project = load_project(&state.projects, &id)?;
+    let mut text_changed = false;
     let chapter = project
         .chapter_mut(index)
         .ok_or(ProjectApiError::NotFound("unknown chapter"))?;
@@ -705,9 +715,13 @@ pub async fn update_chapter(
         if text != chapter.text {
             chapter.text = text;
             chapter.mark_stale();
+            text_changed = true;
         }
     }
     save_project(&state.projects, &mut project)?;
+    if text_changed {
+        let _ = state.projects.delete_chapter_takes(&id, index);
+    }
     Ok(Json(
         project
             .chapter(index)
@@ -790,6 +804,541 @@ pub async fn chapter_subtitles(
         .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
     Ok((headers, body).into_response())
+}
+
+/// Запит перегенерації одного юніта (речення) глави.
+#[derive(Debug, Deserialize, Default)]
+pub struct RegenerateUnitRequest {
+    /// Голос для цього тейку; відсутнє — голос активного тейку, а потім голос проєкту.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Темп; відсутнє — налаштування проєкту.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    /// Альтернативний текст лише для озвучення цього тейку.
+    ///
+    /// Субтитри й текст глави не змінюються; `spoken` тейку фіксує, що пішло в синтез.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Відповідь зі списком тейків глави.
+#[derive(Debug, Serialize)]
+pub struct ChapterTakesResponse {
+    pub chapter_index: usize,
+    pub units: Vec<UnitTakesResponse>,
+}
+
+/// Один юніт з тейками для клієнта.
+#[derive(Debug, Serialize)]
+pub struct UnitTakesResponse {
+    pub index: usize,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub active_take: u32,
+    pub takes: Vec<TakeResponse>,
+}
+
+/// Один тейк для клієнта.
+#[derive(Debug, Serialize)]
+pub struct TakeResponse {
+    pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    pub speed: f32,
+    pub spoken: String,
+    pub duration_ms: u64,
+    pub bytes: u64,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+impl ChapterTakesResponse {
+    fn new(chapter_index: usize, manifest: &TakeManifest) -> Self {
+        Self {
+            chapter_index,
+            units: manifest
+                .units
+                .iter()
+                .map(|unit| UnitTakesResponse {
+                    index: unit.index,
+                    text: unit.text.clone(),
+                    role: unit.role.clone(),
+                    active_take: unit.active_take,
+                    takes: unit
+                        .takes
+                        .iter()
+                        .map(|take| TakeResponse {
+                            id: take.id,
+                            voice: take.voice.clone(),
+                            speed: take.speed,
+                            spoken: take.spoken.clone(),
+                            duration_ms: take.duration_ms,
+                            bytes: take.bytes,
+                            sha256: take.sha256.clone(),
+                            created_at: take.created_at.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Поточний відбиток плану глави для інвалідації кешу тейків.
+fn chapter_takes_fingerprint(project: &Project, chapter: &Chapter) -> String {
+    chapter_fingerprint(
+        &chapter.text,
+        &project.settings,
+        &project.roles,
+        &project.pronunciation,
+    )
+}
+
+/// Перевірити, що кеш тейків актуальний; при невідповідності видалити його.
+fn ensure_takes_fresh(
+    state: &AppState,
+    project: &Project,
+    chapter: &Chapter,
+    id: &str,
+    index: usize,
+) -> Result<Option<TakeManifest>, ProjectApiError> {
+    let fingerprint = chapter_takes_fingerprint(project, chapter);
+    match state
+        .projects
+        .load_takes(id, index)
+        .map_err(|error| ProjectApiError::internal("read takes manifest", error))?
+    {
+        Some(manifest) if manifest.fingerprint == fingerprint => Ok(Some(manifest)),
+        Some(_) => {
+            let _ = state.projects.delete_chapter_takes(id, index);
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// `GET /v1/projects/{id}/chapters/{index}/takes`: маніфест тейків глави.
+pub async fn chapter_takes(
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+) -> Result<Json<ChapterTakesResponse>, ProjectApiError> {
+    let project = load_project(&state.projects, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "chapter is not completed (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let manifest = ensure_takes_fresh(&state, &project, chapter, &id, index)?;
+    let manifest = manifest
+        .unwrap_or_else(|| TakeManifest::new(chapter_takes_fingerprint(&project, chapter), vec![]));
+    Ok(Json(ChapterTakesResponse::new(index, &manifest)))
+}
+
+/// `POST /v1/projects/{id}/chapters/{index}/takes/units/{unit}`:
+/// перегенерувати один юніт (речення) як новий тейк.
+pub async fn regenerate_chapter_unit(
+    State(state): State<AppState>,
+    Path((id, index, unit)): Path<(String, usize, usize)>,
+    Json(request): Json<RegenerateUnitRequest>,
+) -> Result<Json<TakeResponse>, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let project = load_project(&state.projects, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "chapter is not completed (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let mut manifest = match ensure_takes_fresh(&state, &project, chapter, &id, index)? {
+        Some(manifest) => manifest,
+        None => {
+            return Err(ProjectApiError::conflict(
+                "takes cache is invalid or missing; regenerate the chapter first",
+            ))
+        }
+    };
+    let Some(unit_takes) = manifest.unit(unit) else {
+        return Err(ProjectApiError::NotFound("unknown unit"));
+    };
+    if unit_takes.takes.len() >= MAX_TAKES_PER_UNIT {
+        return Err(ProjectApiError::conflict(format!(
+            "unit {unit} already has {MAX_TAKES_PER_UNIT} takes; delete an old take first"
+        )));
+    }
+
+    let text = request
+        .text
+        .clone()
+        .unwrap_or_else(|| unit_takes.text.clone());
+    if text.trim().is_empty() {
+        return Err(ProjectApiError::bad("text must not be empty"));
+    }
+    let voice = request
+        .voice
+        .clone()
+        .or(unit_takes.active().and_then(|take| take.voice.clone()))
+        .or(project.settings.voice.clone());
+    let speed = request.speed.unwrap_or(project.settings.speed);
+    if !SPEED_RANGE.contains(&speed) {
+        return Err(ProjectApiError::bad(format!(
+            "speed must be in {}..={}",
+            SPEED_RANGE.start(),
+            SPEED_RANGE.end()
+        )));
+    }
+    let mode = VerbalizerMode::parse(project.settings.auto_verbalize.as_ref());
+    let pronouncer = state
+        .pronunciation
+        .merged_pronouncer(&project.pronunciation)
+        .map_err(|error| ProjectApiError::internal("pronunciation dictionary", error))?;
+
+    let service = Arc::clone(&state.service);
+    let synth_voice = voice.clone();
+    let raw_stress = project.settings.raw_stress;
+    let result = task::spawn_blocking(move || {
+        service.synthesize_unit(
+            &text,
+            synth_voice.as_deref(),
+            speed,
+            mode,
+            raw_stress,
+            Some(pronouncer.as_ref()),
+        )
+    })
+    .await
+    .map_err(|error| ProjectApiError::internal("join synthesis task", error))?
+    .map_err(|error| ProjectApiError::internal("synthesis", error))?;
+
+    let wav = speech_audio::wav_bytes_f32(&result.samples, SAMPLE_RATE)
+        .map_err(|error| ProjectApiError::internal("encode take audio", error))?;
+    let sha256 = sha256_hex(&wav);
+    if let Some(existing) = unit_takes
+        .takes
+        .iter()
+        .find(|existing| existing.sha256 == sha256)
+    {
+        return Err(ProjectApiError::conflict(format!(
+            "identical take already exists (take {}); change voice, speed or text",
+            existing.id
+        )));
+    }
+    let take = Take {
+        id: unit_takes
+            .next_take_id()
+            .map_err(|error| ProjectApiError::internal("allocate take id", error.to_string()))?,
+        voice: voice.clone(),
+        speed,
+        spoken: result.spoken.clone(),
+        duration_ms: result.samples.len() as u64 * 1000 / SAMPLE_RATE as u64,
+        bytes: wav.len() as u64,
+        sha256,
+        created_at: now_rfc3339(),
+    };
+    state
+        .projects
+        .save_take_audio(&id, index, unit, take.id, &wav)
+        .map_err(|error| ProjectApiError::internal("save take audio", error))?;
+
+    let unit_takes = manifest.unit_mut(unit).expect("unit exists");
+    unit_takes.takes.push(take.clone());
+    manifest.touch();
+    if let Err(error) = state.projects.save_takes(&id, index, &manifest) {
+        let _ = state.projects.delete_take_audio(&id, index, unit, take.id);
+        return Err(ProjectApiError::internal("save takes manifest", error));
+    }
+
+    Ok(Json(TakeResponse {
+        id: take.id,
+        voice: take.voice.clone(),
+        speed: take.speed,
+        spoken: take.spoken.clone(),
+        duration_ms: take.duration_ms,
+        bytes: take.bytes,
+        sha256: take.sha256.clone(),
+        created_at: take.created_at.clone(),
+    }))
+}
+
+/// `POST /v1/projects/{id}/chapters/{index}/takes/units/{unit}/takes/{take}/activate`:
+/// обрати активний тейк юніта та перезібрати главу.
+pub async fn activate_chapter_unit_take(
+    State(state): State<AppState>,
+    Path((id, index, unit, take)): Path<(String, usize, usize, u32)>,
+) -> Result<Json<ChapterTakesResponse>, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let mut project = load_project(&state.projects, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "chapter is not completed (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let mut manifest = match ensure_takes_fresh(&state, &project, chapter, &id, index)? {
+        Some(manifest) => manifest,
+        None => {
+            return Err(ProjectApiError::conflict(
+                "takes cache is invalid or missing; regenerate the chapter first",
+            ))
+        }
+    };
+    let previous = manifest.clone();
+    {
+        let Some(unit_takes) = manifest.unit_mut(unit) else {
+            return Err(ProjectApiError::NotFound("unknown unit"));
+        };
+        if unit_takes.take(take).is_none() {
+            return Err(ProjectApiError::NotFound("unknown take"));
+        }
+        unit_takes.active_take = take;
+    }
+    manifest.touch();
+    commit_rebuilt_chapter(&state, &mut project, &id, index, &manifest, &previous)?;
+
+    Ok(Json(ChapterTakesResponse::new(index, &manifest)))
+}
+
+/// `DELETE /v1/projects/{id}/chapters/{index}/takes/units/{unit}/takes/{take}`:
+/// видалити тейк. Якщо видалений активний — активним стає інший тейк того юніта.
+pub async fn delete_chapter_unit_take(
+    State(state): State<AppState>,
+    Path((id, index, unit, take)): Path<(String, usize, usize, u32)>,
+) -> Result<StatusCode, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let mut project = load_project(&state.projects, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "chapter is not completed (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let mut manifest = match ensure_takes_fresh(&state, &project, chapter, &id, index)? {
+        Some(manifest) => manifest,
+        None => return Ok(StatusCode::NO_CONTENT),
+    };
+    let previous = manifest.clone();
+    let was_active;
+    {
+        let Some(unit_takes) = manifest.unit_mut(unit) else {
+            return Err(ProjectApiError::NotFound("unknown unit"));
+        };
+        if unit_takes.take(take).is_none() {
+            return Err(ProjectApiError::NotFound("unknown take"));
+        }
+        if unit_takes.takes.len() == 1 {
+            return Err(ProjectApiError::conflict(
+                "cannot delete the last take of a unit; regenerate the unit instead",
+            ));
+        }
+        was_active = unit_takes.active_take == take;
+        unit_takes.takes.retain(|item| item.id != take);
+        if was_active {
+            unit_takes.active_take = unit_takes.takes[0].id;
+        }
+    }
+    manifest.touch();
+    if was_active {
+        commit_rebuilt_chapter(&state, &mut project, &id, index, &manifest, &previous)?;
+    } else {
+        state
+            .projects
+            .save_takes(&id, index, &manifest)
+            .map_err(|error| ProjectApiError::internal("save takes manifest", error))?;
+    }
+    let _ = state.projects.delete_take_audio(&id, index, unit, take);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/projects/{id}/chapters/{index}/takes/units/{unit}/takes/{take}/audio`:
+/// аудіо окремого тейку (float32 WAV).
+pub async fn chapter_unit_take_audio(
+    State(state): State<AppState>,
+    Path((id, index, unit, take)): Path<(String, usize, usize, u32)>,
+) -> Result<Response, ProjectApiError> {
+    let project = load_project(&state.projects, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "chapter is not completed (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let manifest = ensure_takes_fresh(&state, &project, chapter, &id, index)?;
+    let Some(manifest) = manifest else {
+        return Err(ProjectApiError::NotFound("takes cache is missing"));
+    };
+    let Some(unit_takes) = manifest.unit(unit) else {
+        return Err(ProjectApiError::NotFound("unknown unit"));
+    };
+    let Some(take) = unit_takes.take(take) else {
+        return Err(ProjectApiError::NotFound("unknown take"));
+    };
+    let bytes = state
+        .projects
+        .load_take_audio(&id, index, unit, take.id)
+        .map_err(|error| ProjectApiError::internal("read take audio", error))?
+        .ok_or(ProjectApiError::NotFound("take audio is missing"))?;
+    let take_id = take.id;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename=\"project-{id}-chapter-{index}-u{unit}-t{take_id}.wav\""
+        ))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    Ok((headers, bytes).into_response())
+}
+
+/// `POST /v1/projects/{id}/chapters/{index}/takes/rebuild`:
+/// перезібрати главу з поточних активних тейків без повторного синтезу.
+pub async fn rebuild_chapter_from_takes(
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+) -> Result<Json<ChapterTakesResponse>, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let mut project = load_project(&state.projects, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "chapter is not completed (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let manifest = match ensure_takes_fresh(&state, &project, chapter, &id, index)? {
+        Some(manifest) => manifest,
+        None => {
+            return Err(ProjectApiError::conflict(
+                "takes cache is invalid or missing; regenerate the chapter first",
+            ))
+        }
+    };
+    let previous = manifest.clone();
+    commit_rebuilt_chapter(&state, &mut project, &id, index, &manifest, &previous)?;
+
+    Ok(Json(ChapterTakesResponse::new(index, &manifest)))
+}
+
+/// `POST /v1/projects/{id}/chapters/{index}/takes/invalidate`:
+/// видалити кеш тейків глави (наприклад, після зміни тексту або ролей).
+pub async fn invalidate_chapter_takes(
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+) -> Result<StatusCode, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let project = load_project(&state.projects, &id)?;
+    let _chapter = load_chapter(&project, index)?;
+    let _ = state.projects.delete_chapter_takes(&id, index);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Зібрати главу з активних тейків кожного юніта.
+fn assemble_active_takes(
+    store: &ProjectStore,
+    id: &str,
+    index: usize,
+    manifest: &TakeManifest,
+    crossfade_ms: u32,
+    loudness_target: Option<speech_audio::loudness::LoudnessTarget>,
+) -> Result<crate::service::SynthChapterOutput, ProjectApiError> {
+    let mut units = Vec::with_capacity(manifest.units.len());
+    for unit in &manifest.units {
+        let take = unit.active().ok_or_else(|| {
+            ProjectApiError::internal(
+                "take audio is missing",
+                format!("unit {} has no active take", unit.index),
+            )
+        })?;
+        let bytes = store
+            .load_take_audio(id, index, unit.index, take.id)
+            .map_err(|error| ProjectApiError::internal("read take audio", error))?
+            .ok_or_else(|| {
+                ProjectApiError::internal(
+                    "take audio is missing",
+                    format!("unit {} take {}", unit.index, take.id),
+                )
+            })?;
+        let (samples, _rate) = decode_wav_f32(&bytes)
+            .map_err(|error| ProjectApiError::internal("decode take audio", error))?;
+        units.push(crate::service::AssembledUnit {
+            samples,
+            text: unit.text.clone(),
+            role: unit.role.clone(),
+        });
+    }
+    assemble_chapter_pcm(units, crossfade_ms.min(200), loudness_target)
+        .map_err(|error| ProjectApiError::internal("assemble chapter", error))
+}
+
+/// Перезібрати главу з тейків і атомарно зафіксувати маніфест, аудіо та проєкт.
+///
+/// Якщо запис аудіо або проєкту зривається, повертаємо попередній маніфест і
+/// попереднє аудіо, щоб глава не лишилася зі статусом, що не відповідає файлам.
+fn commit_rebuilt_chapter(
+    state: &AppState,
+    project: &mut Project,
+    id: &str,
+    index: usize,
+    manifest: &TakeManifest,
+    previous_manifest: &TakeManifest,
+) -> Result<(), ProjectApiError> {
+    let loudness_target = project.settings.loudness.enabled.then(|| {
+        LoudnessTarget::new(
+            project.settings.loudness.target_lufs,
+            project.settings.loudness.true_peak_db,
+        )
+    });
+    let output = assemble_active_takes(
+        &state.projects,
+        id,
+        index,
+        manifest,
+        project.settings.crossfade_ms,
+        loudness_target,
+    )?;
+    let wav = speech_audio::wav_bytes(&output.pcm, SAMPLE_RATE)
+        .map_err(|error| ProjectApiError::internal("encode chapter audio", error))?;
+    let previous_audio = state
+        .projects
+        .load_chapter_audio(id, index)
+        .map_err(|error| ProjectApiError::internal("read chapter audio", error))?;
+
+    state
+        .projects
+        .save_takes(id, index, manifest)
+        .map_err(|error| ProjectApiError::internal("save takes manifest", error))?;
+    if let Err(error) = state.projects.save_chapter_audio(id, index, &wav) {
+        let _ = state.projects.save_takes(id, index, previous_manifest);
+        return Err(ProjectApiError::internal("save chapter audio", error));
+    }
+
+    let chapter = project.chapter_mut(index).expect("chapter exists");
+    chapter.mark_completed(
+        wav.len() as u64,
+        output.duration_ms,
+        output.loudness,
+        output.chunk_timings,
+    );
+    if let Err(error) = state.projects.save(project) {
+        match previous_audio {
+            Some(bytes) => {
+                let _ = state.projects.save_chapter_audio(id, index, &bytes);
+            }
+            None => {
+                let _ = state.projects.delete_chapter_audio(id, index);
+            }
+        }
+        let _ = state.projects.save_takes(id, index, previous_manifest);
+        return Err(ProjectApiError::internal("save project", error));
+    }
+    Ok(())
 }
 
 /// `GET /v1/projects/{id}/manifest`: JSON із посиланнями на аудіо/субтитри.

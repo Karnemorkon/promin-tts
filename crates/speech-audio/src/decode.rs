@@ -76,6 +76,15 @@ mod tests {
     }
 
     #[test]
+    fn decodes_float32_roundtrip() {
+        let samples = [0.0, 0.25, -0.5, 1.0, -1.0];
+        let bytes = crate::wav_bytes_f32(&samples, 24_000).unwrap();
+        let (decoded, rate) = decode_wav_f32(&bytes).unwrap();
+        assert_eq!(rate, 24_000);
+        assert_eq!(decoded, samples);
+    }
+
+    #[test]
     fn averages_stereo_channels() {
         let spec = hound::WavSpec {
             channels: 2,

@@ -1140,6 +1140,30 @@ async fn main() -> anyhow::Result<()> {
             get(projects::chapter_subtitles),
         )
         .route(
+            "/v1/projects/{id}/chapters/{index}/takes",
+            get(projects::chapter_takes).post(projects::invalidate_chapter_takes),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/takes/units/{unit}",
+            post(projects::regenerate_chapter_unit),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/takes/units/{unit}/takes/{take}/activate",
+            post(projects::activate_chapter_unit_take),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/takes/units/{unit}/takes/{take}",
+            delete(projects::delete_chapter_unit_take),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/takes/units/{unit}/takes/{take}/audio",
+            get(projects::chapter_unit_take_audio),
+        )
+        .route(
+            "/v1/projects/{id}/chapters/{index}/takes/rebuild",
+            post(projects::rebuild_chapter_from_takes),
+        )
+        .route(
             "/v1/projects/{id}/manifest",
             get(projects::project_manifest),
         )

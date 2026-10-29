@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "speech-audio"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "ebur128",
@@ -2019,12 +2019,13 @@ dependencies = [
 
 [[package]]
 name = "speech-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
@@ -2032,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "speech-export"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2052,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "speech-inference"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "ndarray",
@@ -2065,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "speech-server"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2093,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "speech-text"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "encoding_rs",

@@ -12,6 +12,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::takes::{TakeManifest, MAX_TAKE_ID, MAX_UNITS};
+
 /// Версія схеми проєкту.
 ///
 /// v2 додає ролі діалогів (`Project::roles`); проєкти v1 читаються без змін.
@@ -846,6 +848,162 @@ impl ProjectStore {
         Ok(true)
     }
 
+    /// Каталог тейків глави: `<projects>/<id>/chapters/<index>/`.
+    pub fn takes_dir(&self, id: &str, index: usize) -> Result<PathBuf> {
+        if index >= MAX_CHAPTERS {
+            bail!("invalid chapter index");
+        }
+        Ok(self.chapters_dir(id)?.join(index.to_string()))
+    }
+
+    pub fn takes_manifest_path(&self, id: &str, index: usize) -> Result<PathBuf> {
+        Ok(self.takes_dir(id, index)?.join("takes.json"))
+    }
+
+    fn validate_take_coords(unit: usize, take: u32) -> Result<()> {
+        if unit >= MAX_UNITS {
+            bail!("invalid unit index");
+        }
+        if take == 0 || take > MAX_TAKE_ID {
+            bail!("invalid take id");
+        }
+        Ok(())
+    }
+
+    pub fn take_audio_path(
+        &self,
+        id: &str,
+        index: usize,
+        unit: usize,
+        take: u32,
+    ) -> Result<PathBuf> {
+        Self::validate_take_coords(unit, take)?;
+        Ok(self
+            .takes_dir(id, index)?
+            .join(format!("u{unit}-t{take}.wav")))
+    }
+
+    pub fn chapter_takes_exist(&self, id: &str, index: usize) -> bool {
+        self.takes_manifest_path(id, index)
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+    }
+
+    pub fn load_takes(&self, id: &str, index: usize) -> Result<Option<TakeManifest>> {
+        let path = self.takes_manifest_path(id, index)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let manifest: TakeManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse takes manifest {}", path.display()))?;
+        manifest.validate()?;
+        Ok(Some(manifest))
+    }
+
+    pub fn save_takes(&self, id: &str, index: usize, manifest: &TakeManifest) -> Result<()> {
+        let dir = self.project_dir(id)?;
+        if !dir.join("project.json").is_file() {
+            bail!("project {id} does not exist");
+        }
+        manifest.validate()?;
+        let path = self.takes_manifest_path(id, index)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create takes dir {}", parent.display()))?;
+        }
+        let json = serde_json::to_vec_pretty(manifest).context("serialize takes manifest")?;
+        write_atomic(&path, &json)
+    }
+
+    pub fn save_take_audio(
+        &self,
+        id: &str,
+        index: usize,
+        unit: usize,
+        take: u32,
+        bytes: &[u8],
+    ) -> Result<PathBuf> {
+        let dir = self.project_dir(id)?;
+        if !dir.join("project.json").is_file() {
+            bail!("project {id} does not exist");
+        }
+        let path = self.take_audio_path(id, index, unit, take)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create takes dir {}", parent.display()))?;
+        }
+        write_atomic(&path, bytes)?;
+        Ok(path)
+    }
+
+    pub fn load_take_audio(
+        &self,
+        id: &str,
+        index: usize,
+        unit: usize,
+        take: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.take_audio_path(id, index, unit, take)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        Ok(Some(bytes))
+    }
+
+    pub fn delete_take_audio(
+        &self,
+        id: &str,
+        index: usize,
+        unit: usize,
+        take: u32,
+    ) -> Result<bool> {
+        let path = self.take_audio_path(id, index, unit, take)?;
+        if !path.is_file() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Видалити всі тейки глави (наприклад, після зміни тексту).
+    pub fn delete_chapter_takes(&self, id: &str, index: usize) -> Result<bool> {
+        let dir = self.takes_dir(id, index)?;
+        if !dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove takes dir {}", dir.display()))?;
+        Ok(true)
+    }
+
+    /// Видалити тейки всіх глав (наприклад, після зміни налаштувань проєкту).
+    pub fn delete_all_takes(&self, id: &str) -> Result<()> {
+        let dir = self.chapters_dir(id)?;
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("read chapters dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(index) = name.to_str().and_then(|name| name.parse::<usize>().ok()) else {
+                continue;
+            };
+            if index >= MAX_CHAPTERS {
+                continue;
+            }
+            std::fs::remove_dir_all(entry.path())
+                .with_context(|| format!("remove takes dir {}", entry.path().display()))?;
+        }
+        Ok(())
+    }
+
     /// Серіалізувати `.speechproj` (JSON-манифест без аудіо).
     pub fn speechproj_bytes(project: &Project) -> Result<Vec<u8>> {
         project.validate()?;
@@ -928,6 +1086,72 @@ mod tests {
         assert!(store.delete(&project.id).unwrap());
         assert!(store.load(&project.id).unwrap().is_none());
         assert!(!store.delete(&project.id).unwrap());
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn takes_storage_lifecycle() {
+        use crate::takes::{sha256_hex, Take, TakeManifest, UnitTakes};
+
+        let store = temp_store();
+        let project = sample_project();
+        store.create(&project).unwrap();
+        assert!(!store.chapter_takes_exist(&project.id, 0));
+
+        let wav = b"RIFF-fake-float32-wav".to_vec();
+        let take = Take {
+            id: 1,
+            voice: Some("Speaker_1".into()),
+            speed: 1.0,
+            spoken: "привіт, світе".into(),
+            duration_ms: 900,
+            bytes: wav.len() as u64,
+            sha256: sha256_hex(&wav),
+            created_at: now_rfc3339(),
+        };
+        let manifest = TakeManifest::new(
+            "fingerprint",
+            vec![UnitTakes {
+                index: 0,
+                text: "Привіт, світе!".into(),
+                role: None,
+                active_take: take.id,
+                takes: vec![take.clone()],
+            }],
+        );
+        store
+            .save_take_audio(&project.id, 0, 0, take.id, &wav)
+            .unwrap();
+        store.save_takes(&project.id, 0, &manifest).unwrap();
+        assert!(store.chapter_takes_exist(&project.id, 0));
+
+        let loaded = store.load_takes(&project.id, 0).unwrap().unwrap();
+        assert_eq!(loaded, manifest);
+        assert_eq!(
+            store.load_take_audio(&project.id, 0, 0, take.id).unwrap(),
+            Some(wav.clone())
+        );
+
+        store.delete_take_audio(&project.id, 0, 0, take.id).unwrap();
+        assert!(store
+            .load_take_audio(&project.id, 0, 0, take.id)
+            .unwrap()
+            .is_none());
+
+        store
+            .save_take_audio(&project.id, 0, 0, take.id, &wav)
+            .unwrap();
+        assert!(store.delete_chapter_takes(&project.id, 0).unwrap());
+        assert!(!store.chapter_takes_exist(&project.id, 0));
+        assert!(!store.delete_chapter_takes(&project.id, 0).unwrap());
+
+        store
+            .save_take_audio(&project.id, 0, 0, take.id, &wav)
+            .unwrap();
+        store.save_takes(&project.id, 0, &manifest).unwrap();
+        store.delete_all_takes(&project.id).unwrap();
+        assert!(!store.chapter_takes_exist(&project.id, 0));
+
         std::fs::remove_dir_all(store.dir()).unwrap();
     }
 

@@ -10,10 +10,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use speech_audio::loudness::LoudnessTarget;
+use speech_audio::{wav_bytes_f32, SAMPLE_RATE};
 use speech_core::jobs::{AudioLocation, JobRecord, JobRequest, JobStatus, JobStore};
 use speech_core::projects::{
-    valid_project_id, ProjectSettings, ProjectStore, PronunciationRule, Role,
+    now_rfc3339, valid_project_id, ProjectSettings, ProjectStore, PronunciationRule, Role,
 };
+use speech_core::takes::{chapter_fingerprint, sha256_hex, Take, TakeManifest, UnitTakes};
 use speech_text::dialogue::split_dialogue;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
@@ -704,6 +706,69 @@ impl JobManager {
 
     /// Зберегти аудіо глави та оновити `project.json` під тим самим lock,
     /// що й видалення проєкту (щоб не відтворити видалений каталог).
+    /// Зберегти сирі тейки глави для перегенерації окремих речень.
+    ///
+    /// Кеш є допоміжним: якщо запис не вдався, глава все одно зберігається,
+    /// а користувач побачить звичайну помилку «takes are missing» під час
+    /// спроби перегенерації речення.
+    fn persist_chapter_takes(
+        &self,
+        job: &JobRecord,
+        project_id: &str,
+        chapter_index: usize,
+        output: &crate::service::SynthChapterOutput,
+    ) -> Result<(), String> {
+        if output.units.is_empty() {
+            return Ok(());
+        }
+        if output.units.len() != output.chunks {
+            return Err(format!(
+                "unit count mismatch: {} units, {} chunks",
+                output.units.len(),
+                output.chunks
+            ));
+        }
+        let settings = job.project_settings.clone().unwrap_or_default();
+        let fingerprint =
+            chapter_fingerprint(&job.request.text, &settings, &job.roles, &job.pronunciation);
+        if fingerprint.is_empty() {
+            return Err("cannot compute takes fingerprint".into());
+        }
+
+        self.projects
+            .delete_chapter_takes(project_id, chapter_index)
+            .map_err(|error| error.to_string())?;
+        let mut units = Vec::with_capacity(output.units.len());
+        for (index, unit) in output.units.iter().enumerate() {
+            let wav =
+                wav_bytes_f32(&unit.samples, SAMPLE_RATE).map_err(|error| error.to_string())?;
+            let take = Take {
+                id: 1,
+                voice: unit.voice.clone(),
+                speed: job.request.speed,
+                spoken: unit.spoken.clone(),
+                duration_ms: unit.samples.len() as u64 * 1000 / SAMPLE_RATE as u64,
+                bytes: wav.len() as u64,
+                sha256: sha256_hex(&wav),
+                created_at: now_rfc3339(),
+            };
+            self.projects
+                .save_take_audio(project_id, chapter_index, index, take.id, &wav)
+                .map_err(|error| error.to_string())?;
+            units.push(UnitTakes {
+                index,
+                text: unit.text.clone(),
+                role: unit.role.clone(),
+                active_take: take.id,
+                takes: vec![take],
+            });
+        }
+        let manifest = TakeManifest::new(fingerprint, units);
+        self.projects
+            .save_takes(project_id, chapter_index, &manifest)
+            .map_err(|error| error.to_string())
+    }
+
     async fn complete_project_chapter(
         &self,
         job: &JobRecord,
@@ -728,6 +793,30 @@ impl JobManager {
         let settings_changed = job.project_settings.as_ref() != Some(&project.settings);
         let pronunciation_changed = job.pronunciation != project.pronunciation;
         let roles_changed = job.roles != project.roles;
+
+        if text_changed || settings_changed || pronunciation_changed || roles_changed {
+            // Кеш відповідає старому знімку; він не має пережити зміну.
+            if let Err(error) = self
+                .projects
+                .delete_chapter_takes(project_id, chapter_index)
+            {
+                tracing::warn!(
+                    project_id,
+                    chapter_index,
+                    error = %error,
+                    "cannot drop stale chapter takes"
+                );
+            }
+        } else if let Err(error) =
+            self.persist_chapter_takes(job, project_id, chapter_index, output)
+        {
+            tracing::warn!(
+                project_id,
+                chapter_index,
+                error = %error,
+                "cannot persist chapter takes"
+            );
+        }
 
         self.projects
             .save_chapter_audio(project_id, chapter_index, wav)
