@@ -183,93 +183,14 @@ fn opus_tags(
     chapters: &[crate::ExportedChapter],
     cover: &crate::CoverImage,
 ) -> Result<Vec<u8>, ExportError> {
-    let metadata = &input.metadata;
-    let album = if metadata.album.trim().is_empty() {
-        &metadata.title
-    } else {
-        &metadata.album
-    };
-    let mut comments: Vec<(String, String)> = Vec::new();
-    comments.push(("TITLE".to_string(), metadata.title.clone()));
-    if !metadata.author.trim().is_empty() {
-        comments.push(("ARTIST".to_string(), metadata.author.clone()));
-        comments.push(("ALBUMARTIST".to_string(), metadata.author.clone()));
-    }
-    comments.push(("ALBUM".to_string(), album.clone()));
-    comments.push(("GENRE".to_string(), "Audiobook".to_string()));
-    comments.push((
-        "ENCODER".to_string(),
-        concat!("Promin TTS ", env!("CARGO_PKG_VERSION")).to_string(),
-    ));
-    if !metadata.language.trim().is_empty() {
-        comments.push(("LANGUAGE".to_string(), metadata.language.clone()));
-    }
-    if let Some(narrator) = metadata
-        .narrator
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        comments.push(("NARRATOR".to_string(), narrator.to_string()));
-    }
-    if let Some(year) = metadata
-        .year
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        comments.push(("DATE".to_string(), year.to_string()));
-    }
-    if let Some(description) = metadata
-        .description
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        comments.push(("DESCRIPTION".to_string(), description.to_string()));
-    }
-    for (position, chapter) in chapters.iter().enumerate() {
-        let number = position + 1;
-        comments.push((format!("CHAPTER{number:03}"), timestamp(chapter.start_ms)));
-        comments.push((format!("CHAPTER{number:03}NAME"), chapter.title.clone()));
-    }
+    let mut comments = crate::meta::vorbis_comments(input, chapters);
     comments.push((
         "METADATA_BLOCK_PICTURE".to_string(),
-        base64::engine::general_purpose::STANDARD.encode(flac_picture_block(cover)),
+        base64::engine::general_purpose::STANDARD.encode(crate::cover::picture_block(cover)),
     ));
 
-    let vendor = concat!("Promin TTS ", env!("CARGO_PKG_VERSION")).as_bytes();
     let mut tags = Vec::new();
     tags.extend_from_slice(b"OpusTags");
-    tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
-    tags.extend_from_slice(vendor);
-    tags.extend_from_slice(&(comments.len() as u32).to_le_bytes());
-    for (key, value) in comments {
-        let comment = format!("{key}={value}");
-        tags.extend_from_slice(&(comment.len() as u32).to_le_bytes());
-        tags.extend_from_slice(comment.as_bytes());
-    }
+    tags.extend_from_slice(&crate::meta::vorbis_comment_block(&comments));
     Ok(tags)
-}
-
-fn flac_picture_block(cover: &crate::CoverImage) -> Vec<u8> {
-    let (width, height, depth) = cover.dimensions();
-    let mime = cover.mime.as_bytes();
-    let mut block = Vec::new();
-    block.extend_from_slice(&3u32.to_be_bytes()); // front cover
-    block.extend_from_slice(&(mime.len() as u32).to_be_bytes());
-    block.extend_from_slice(mime);
-    block.extend_from_slice(&0u32.to_be_bytes()); // description
-    block.extend_from_slice(&width.to_be_bytes());
-    block.extend_from_slice(&height.to_be_bytes());
-    block.extend_from_slice(&depth.to_be_bytes());
-    block.extend_from_slice(&0u32.to_be_bytes()); // colors
-    block.extend_from_slice(&(cover.data.len() as u32).to_be_bytes());
-    block.extend_from_slice(&cover.data);
-    block
-}
-
-fn timestamp(ms: u64) -> String {
-    let hours = ms / 3_600_000;
-    let minutes = (ms / 60_000) % 60;
-    let seconds = (ms / 1000) % 60;
-    let millis = ms % 1000;
-    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
 }

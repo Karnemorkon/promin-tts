@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Karnemorkon/promin-tts"
@@ -24,6 +24,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 ebur128 = { version = "0.1.10", features = ["precision-true-peak"] }
 encoding_rs = "0.8"
 fancy-regex = "0.19"
+flacenc = { version = "0.5.1", default-features = false }
 futures-util = "0.3"
 hound = "3.5"
 html-escape = "0.2"

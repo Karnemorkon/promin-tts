@@ -12,5 +12,6 @@ anyhow.workspace = true
 ebur128.workspace = true
 hound.workspace = true
 rubato = "5"
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -1,17 +1,20 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. It builds on v0.9 per-sentence takes, v0.8 dialogue roles, v0.7 PDF import and audiobook export to **M4B**, **MP3** and **OGG/Opus** with chapters, cover art, metadata and combined SRT/VTT subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.10 «HolosTTS»** — повний ланцюжок `текст → вербалізація → наголос → фонеми → ONNX → WAV`
+**v0.11 «Експорт і контроль якості»** — повний ланцюжок
+`текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
-експорт готової аудіокниги в M4B/MP3/OGG, багатоголосий синтез діалогів
+експорт готової аудіокниги в M4B/MP3/OGG/FLAC, багатоголосий синтез діалогів
 із ролями персонажів та кеш аудіо по реченнях із кількома тейками,
-A/B-вибором і перегенерацією окремого речення.
+A/B-вибором і перегенерацією окремого речення. ASS-субтитри містять
+послівну караоке-розмітку, а діагностика глав знаходить кліпінг, довгі
+паузи, постійну складову та проблеми рівня.
 
 Нова багатоетапна архітектура HolosTTS: замість одного графа — бандл
 `holos_onnx.json` + `encoder` / `prosody` / `decoder` (exact) або
@@ -53,6 +56,8 @@ A/B-вибором і перегенерацією окремого реченн
   рівнопотужний кросфейд між чанками.
 - `speech-audio::loudness` — EBU R128 / ACX: вимірювання LUFS + true peak,
   статичний gain, look-ahead лімітер, фінальна TP-корекція (типово −19 LUFS / −3 dBTP).
+- `speech-audio::diagnostics` — пік/RMS/crest factor, DC offset, кліпінг,
+  провідна/хвостова тиша, найдовша пауза та перелік знахідок для UI.
 - `speech-text::verbalize` — rule-вербалізатор: числа, дати, час. Golden 68/68.
 - `speech-inference::gemma` — Gemma-3-270M INT8 з KV-кешем; golden 46/46,
   token IDs звірені 1:1 із системним SentencePiece 0.2.0.
@@ -66,13 +71,14 @@ A/B-вибором і перегенерацією окремого реченн
 - `speech-inference` — ONNX Runtime 1.31.0 (офіційний x64 build; перевірено на
   AVX-only Xeon E5-2650), автоматичний біндінг входів `tokens` / `voice` / `speed`.
 - `speech-export` — експорт книги в **M4B** (AAC, глави, обкладинка, метадані),
-  **MP3** (ID3v2.4 CHAP/CTOC/APIC) та **OGG/Opus** (OpusTags, глави, обкладинка);
-  об'єднані SRT/VTT. Pure-Rust енкодери, без ffmpeg у рантаймі.
+  **MP3** (ID3v2.4 CHAP/CTOC/APIC), **OGG/Opus** (OpusTags, глави, обкладинка)
+  та **FLAC** (lossless, Vorbis comments + нативний Picture-блок); об'єднані
+  SRT/VTT/ASS. Pure-Rust енкодери, без ffmpeg у рантаймі.
 - `speech-server` — Axum: REST, streaming WAV, асинхронні job-и + SSE, webhook-и,
   OpenAI-сумісний API, API-ключі, автозавантаження моделей, Wyoming TCP, MCP,
   API проєктів книг, імпорт, генерація глав, багатоголосий синтез діалогів,
-  SRT/VTT, `.speechproj`, тейки й перегенерація речень, асинхронні
-  export-job-и аудіокниг.
+  SRT/VTT/ASS, `.speechproj`, тейки й перегенерація речень, асинхронні
+  export-job-и аудіокниг, діагностика готових глав.
 
 ## Архітектура
 
@@ -81,8 +87,8 @@ crates/
 ├── speech-core/        # Голоси (.npy), job-и, проєкти книг, `.speechproj`
 ├── speech-text/        # Препроцесинг, вербалізація, наголоси, IPA, чанки, імпорт, вимова
 ├── speech-inference/   # ONNX Runtime: TTS-генератор, Gemma, accentor, voice encoder
-├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP
-├── speech-export/      # M4B (AAC), MP3, OGG/Opus, глави, обкладинка, SRT/VTT
+├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP, діагностика
+├── speech-export/      # M4B (AAC), MP3, OGG/Opus, FLAC, глави, обкладинка, SRT/VTT/ASS
 └── speech-server/      # Axum + Wyoming + MCP (HTTP і stdio-проксі promin-mcp)
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
 ```
@@ -265,7 +271,8 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `POST` | `/v1/projects/{id}/generate` | Поставити глави в чергу (`chapters?`, `force?`) |
 | `GET`/`PUT` | `/v1/projects/{id}/chapters/{i}` | Отримати/змінити назву й текст глави |
 | `GET` | `/v1/projects/{id}/chapters/{i}/audio` | Готовий WAV глави |
-| `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt` | Субтитри глави |
+| `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt\|ass` | Субтитри глави (ASS — з послівним караоке) |
+| `GET` | `/v1/projects/{id}/chapters/{i}/diagnostics` | Аудіо-діагностика глави: кліпінг, паузи, DC offset, рівень |
 | `GET` | `/v1/projects/{id}/chapters/{i}/takes` | Маніфест тейків глави (усі речення й версії) |
 | `POST` | `/v1/projects/{id}/chapters/{i}/takes` | Скинути кеш тейків глави (204) |
 | `POST` | `/v1/projects/{id}/chapters/{i}/takes/units/{u}` | Перегенерувати речення `{voice?, speed?, text?}` як новий тейк |
@@ -279,8 +286,8 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `POST` | `/v1/projects/{id}/exports` | Створити експорт `{format, bitrate_kbps?, cover_base64?, ...}`; 409, якщо не всі глави `completed` |
 | `GET` | `/v1/projects/{id}/exports/{export_id}` | Статус, прогрес, тривалість, розмір, помилка |
 | `DELETE` | `/v1/projects/{id}/exports/{export_id}` | Видалити експорт і його файли: 204/404 |
-| `GET` | `/v1/projects/{id}/exports/{export_id}/audio` | Готовий M4B/MP3/OGG; 409, якщо експорт не завершений |
-| `GET` | `/v1/projects/{id}/exports/{export_id}/subtitles?format=srt\|vtt` | Об'єднані субтитри книги |
+| `GET` | `/v1/projects/{id}/exports/{export_id}/audio` | Готовий M4B/MP3/OGG/FLAC; 409, якщо експорт не завершений |
+| `GET` | `/v1/projects/{id}/exports/{export_id}/subtitles?format=srt\|vtt\|ass` | Об'єднані субтитри книги |
 | `GET` | `/v1/jobs?limit=50` | Останні завдання |
 | `GET` | `/v1/jobs/{id}` | Статус, прогрес, метадані |
 | `DELETE` | `/v1/jobs/{id}` | Скасувати: 204, 404 або 409 (уже завершено) |
@@ -539,6 +546,7 @@ curl -X DELETE \
 | `m4b` | AAC-LC | 96 кбіт/с | 32–256 | глави `chpl`, обкладинка `covr`, `stik=9`, metadata |
 | `mp3` | MPEG-1/2 Layer III | 64 кбіт/с | 32–160 | ID3v2.4 `CHAP`/`CTOC`/`APIC` |
 | `ogg` | Opus | 48 кбіт/с | 16–128 | OpusTags, глави, обкладинка |
+| `flac` | FLAC | — | — | lossless, Vorbis comments, нативний Picture-блок; `bitrate_kbps` ігнорується |
 
 ```bash
 # Створити експорт (metadata опційна; cover_base64 — data URI або base64)
@@ -567,13 +575,30 @@ curl -H 'Authorization: Bearer change-me' \
   'http://localhost:8010/v1/projects/<id>/exports/<export_id>/subtitles?format=srt' -o book.srt
 curl -H 'Authorization: Bearer change-me' \
   'http://localhost:8010/v1/projects/<id>/exports/<export_id>/subtitles?format=vtt' -o book.vtt
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8010/v1/projects/<id>/exports/<export_id>/subtitles?format=ass' -o book.ass
 ```
 
-Файли лежать у `<projects>/<id>/exports/<export_id>.{m4b,mp3,ogg,srt,vtt,json}`;
+ASS містить заголовок, стиль `Default` і `Dialogue`-події з `{\k<cs>}` для
+кожного слова. Оскільки модель поки не повертає точних послівних таймінгів,
+тривалість слова оцінюється пропорційно його довжині та розділовим знакам.
+
+Файли лежать у `<projects>/<id>/exports/<export_id>.{m4b,mp3,ogg,flac,srt,vtt,ass,json}`;
 під час роботи поруч є `.part`. Після рестарту незавершені експорти позначаються
 `failed`, завершені лишаються доступними. `PROMIN_EXPORT_CONCURRENCY` (типово 1)
 обмежує одночасне кодування. Без `cover_base64` вбудовується стандартна
 обкладинка 600×600 PNG.
+
+### Аудіо-діагностика
+
+`GET /v1/projects/{id}/chapters/{i}/diagnostics` повертає JSON для готової
+глави: `peak_dbfs`, `rms_dbfs`, `crest_factor_db`, `dc_offset`,
+`clipped_samples`, `clipping_ratio`, `silence_ratio`, `leading_silence_ms`,
+`trailing_silence_ms`, `longest_silence` і `issues`. Коди знахідок:
+`clipping`, `near_full_scale`, `low_level`, `dc_offset`, `leading_silence`,
+`trailing_silence`, `long_pause`, `silent_audio`, `short_audio`, `empty_audio`.
+Пороги орієнтовані на аудіокниги: тиша — нижче −50 dBFS, довга пауза — понад
+2 с, кліпінг — семпли ≥ 0.999.
 
 ### OpenAI-сумісний API
 

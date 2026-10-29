@@ -40,6 +40,27 @@ impl CoverImage {
     }
 }
 
+/// FLAC `PICTURE` metadata block (type 6) з обкладинкою.
+///
+/// Формат однаковий для нативного FLAC-блоку та для base64-значення
+/// `METADATA_BLOCK_PICTURE` у Vorbis comments (OGG/Opus).
+pub(crate) fn picture_block(cover: &CoverImage) -> Vec<u8> {
+    let (width, height, depth) = cover.dimensions();
+    let mime = cover.mime.as_bytes();
+    let mut block = Vec::new();
+    block.extend_from_slice(&3u32.to_be_bytes()); // front cover
+    block.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    block.extend_from_slice(mime);
+    block.extend_from_slice(&0u32.to_be_bytes()); // description
+    block.extend_from_slice(&width.to_be_bytes());
+    block.extend_from_slice(&height.to_be_bytes());
+    block.extend_from_slice(&depth.to_be_bytes());
+    block.extend_from_slice(&0u32.to_be_bytes()); // colors
+    block.extend_from_slice(&(cover.data.len() as u32).to_be_bytes());
+    block.extend_from_slice(&cover.data);
+    block
+}
+
 /// Визначити MIME за сигнатурою.
 pub fn sniff_image_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {

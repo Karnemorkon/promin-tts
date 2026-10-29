@@ -1,22 +1,27 @@
-//! Експорт готових аудіокниг у M4B, MP3 та OGG Opus.
+//! Експорт готових аудіокниг у M4B, MP3, OGG Opus та FLAC.
 //!
 //! Крейт не знає нічого про сервер чи проєкти: на вході — список глав із
 //! шляхами до WAV (24 кГц mono PCM16), метадані та обкладинка; на виході —
 //! аудіофайл, записаний у будь-який [`std::io::Write`], плюс таймлайн глав і
-//! об’єднані SRT/VTT.
+//! об’єднані SRT/VTT/ASS.
 //!
 //! Ключові особливості:
 //! - M4B кодується по главах окремими AAC-енкодерами (обмеження пам’яті), а
 //!   priming першої глави прибирається єдиним edit-list записом;
 //! - MP3 та OGG кодуються безперервно на всю книгу, тому на межах глав немає
 //!   артефактів і зайвої тиші;
+//! - FLAC lossless читає глави потоково й вбудовує Vorbis comments та нативний
+//!   Picture-блок;
 //! - у кожен файл вбудовуються назва, автор, глави та обкладинка (типово —
 //!   вбудована обкладинка Promin TTS);
 //! - субтитри для M4B зсуваються на priming-фрейм кожної глави, для MP3/OGG —
-//!   на вихідний таймлайн WAV.
+//!   на вихідний таймлайн WAV; ASS містить послівну караоке-розмітку.
 
+mod ass;
 mod cover;
+mod flac;
 mod m4b;
+mod meta;
 mod mp3;
 mod ogg;
 pub mod subtitles;
@@ -27,6 +32,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use ass::render_ass;
 pub use cover::{default_cover, CoverImage};
 pub use subtitles::{render_srt, render_vtt, Cue};
 
@@ -47,6 +53,7 @@ pub enum ExportFormat {
     M4b,
     Mp3,
     Ogg,
+    Flac,
 }
 
 impl ExportFormat {
@@ -55,6 +62,7 @@ impl ExportFormat {
             "m4b" | "m4a" | "aac" => Some(Self::M4b),
             "mp3" => Some(Self::Mp3),
             "ogg" | "opus" | "oga" => Some(Self::Ogg),
+            "flac" => Some(Self::Flac),
             _ => None,
         }
     }
@@ -64,6 +72,7 @@ impl ExportFormat {
             Self::M4b => "m4b",
             Self::Mp3 => "mp3",
             Self::Ogg => "ogg",
+            Self::Flac => "flac",
         }
     }
 
@@ -76,7 +85,13 @@ impl ExportFormat {
             Self::M4b => "audio/mp4",
             Self::Mp3 => "audio/mpeg",
             Self::Ogg => "audio/ogg",
+            Self::Flac => "audio/flac",
         }
+    }
+
+    /// FLAC не має бітрейту: якість визначається лише lossless-кодуванням.
+    pub fn is_lossless(self) -> bool {
+        matches!(self, Self::Flac)
     }
 
     pub fn default_bitrate_kbps(self) -> u32 {
@@ -84,6 +99,7 @@ impl ExportFormat {
             Self::M4b => DEFAULT_M4B_BITRATE_KBPS,
             Self::Mp3 => DEFAULT_MP3_BITRATE_KBPS,
             Self::Ogg => DEFAULT_OGG_BITRATE_KBPS,
+            Self::Flac => 0,
         }
     }
 
@@ -93,12 +109,16 @@ impl ExportFormat {
             Self::M4b => (32, 256),
             Self::Mp3 => (32, 160),
             Self::Ogg => (16, 128),
+            Self::Flac => (0, 0),
         }
     }
 
     /// Перевірити бітрейт; `0` означає типовий для формату.
+    ///
+    /// Для FLAC явний бітрейт ігнорується: це lossless-формат, і клієнти
+    /// можуть надсилати спільне поле `bitrate_kbps` для всіх форматів.
     pub fn resolve_bitrate_kbps(self, requested: u32) -> Result<u32, ExportError> {
-        if requested == 0 {
+        if requested == 0 || self.is_lossless() {
             return Ok(self.default_bitrate_kbps());
         }
         let (min, max) = self.bitrate_range_kbps();
@@ -209,6 +229,8 @@ pub enum ExportError {
     Mp3(String),
     #[error("OGG error: {0}")]
     Ogg(String),
+    #[error("FLAC error: {0}")]
+    Flac(String),
 }
 
 /// Експортувати книгу у `out`.
@@ -257,6 +279,15 @@ pub fn export_book(
             &mut counter,
             observer,
         )?,
+        ExportFormat::Flac => flac::encode(input, &frame_counts, &cover, &mut counter, observer)?,
+    };
+
+    // Для lossless-формату фактичний бітрейт залежить від матеріалу, тому
+    // повертаємо середній, а не нуль із запиту.
+    let bitrate_kbps = if input.format.is_lossless() {
+        effective_bitrate_kbps(counter.count, encoded.duration_ms)
+    } else {
+        bitrate_kbps
     };
 
     Ok(ExportSummary {
@@ -268,6 +299,16 @@ pub fn export_book(
     })
 }
 
+fn effective_bitrate_kbps(bytes: u64, duration_ms: u64) -> u32 {
+    if duration_ms == 0 {
+        return 0;
+    }
+    let bits = bytes.saturating_mul(8);
+    u32::try_from(bits / duration_ms.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
 /// Побудувати об’єднані SRT/VTT за таймлайном експорту.
 ///
 /// Для M4B [`ExportedChapter::start_ms`] уже враховує priming-фрейм глави,
@@ -276,6 +317,19 @@ pub fn combined_subtitles(
     input: &[ExportChapter],
     chapters: &[ExportedChapter],
 ) -> (String, String) {
+    let cues = combined_cues(input, chapters);
+    (render_srt(&cues), render_vtt(&cues))
+}
+
+/// Побудувати об’єднаний ASS із послівною караоке-розміткою.
+///
+/// Точних послівних таймінгів модель поки не повертає, тому тривалість
+/// кожного слова оцінюється пропорційно його довжині в межах речення.
+pub fn combined_ass(input: &[ExportChapter], chapters: &[ExportedChapter], title: &str) -> String {
+    render_ass(&combined_cues(input, chapters), title)
+}
+
+fn combined_cues(input: &[ExportChapter], chapters: &[ExportedChapter]) -> Vec<Cue> {
     let mut cues = Vec::new();
     for chapter in input {
         let Some(exported) = chapters.iter().find(|item| item.index == chapter.index) else {
@@ -293,7 +347,7 @@ pub fn combined_subtitles(
             });
         }
     }
-    (render_srt(&cues), render_vtt(&cues))
+    cues
 }
 
 pub(crate) struct EncodedBook {

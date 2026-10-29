@@ -1188,6 +1188,10 @@ async fn main() -> anyhow::Result<()> {
             get(projects::chapter_subtitles),
         )
         .route(
+            "/v1/projects/{id}/chapters/{index}/diagnostics",
+            get(projects::chapter_diagnostics),
+        )
+        .route(
             "/v1/projects/{id}/chapters/{index}/takes",
             get(projects::chapter_takes).post(projects::invalidate_chapter_takes),
         )

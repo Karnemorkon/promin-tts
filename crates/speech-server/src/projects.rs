@@ -27,7 +27,7 @@ use tokio::task;
 
 use crate::pronunciation::PronunciationPayload;
 use crate::service::{assemble_chapter_pcm, VerbalizerMode, SPEED_RANGE};
-use crate::subtitles::{render_srt, render_vtt};
+use crate::subtitles::{render_ass, render_srt, render_vtt};
 use crate::AppState;
 
 /// Помилка API проєктів.
@@ -802,6 +802,11 @@ pub async fn chapter_subtitles(
             "text/vtt; charset=utf-8",
             "vtt",
         ),
+        "ass" | "ssa" => (
+            render_ass(&chapter.chunk_timings, &chapter.title),
+            "text/x-ssa; charset=utf-8",
+            "ass",
+        ),
         other => {
             return Err(ProjectApiError::bad(format!(
                 "unsupported subtitle format: {other}"
@@ -818,6 +823,36 @@ pub async fn chapter_subtitles(
         .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
     Ok((headers, body).into_response())
+}
+
+/// `GET /v1/projects/{id}/chapters/{index}/diagnostics`: кліпінг, тиша, DC.
+pub async fn chapter_diagnostics(
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+) -> Result<Json<serde_json::Value>, ProjectApiError> {
+    let project = load_project(&state, &id)?;
+    let chapter = load_chapter(&project, index)?;
+    if chapter.status != ChapterStatus::Completed {
+        return Err(ProjectApiError::conflict(format!(
+            "diagnostics are available only for completed chapters (status: {})",
+            chapter.status.as_str()
+        )));
+    }
+    let bytes = state
+        .projects
+        .load_chapter_audio(&id, index)
+        .map_err(|error| ProjectApiError::internal("read chapter audio", error))?
+        .ok_or(ProjectApiError::NotFound("chapter audio is missing"))?;
+    let (samples, sample_rate) = speech_audio::decode_wav_f32(&bytes)
+        .map_err(|error| ProjectApiError::internal("decode chapter audio", error))?;
+    let diagnostics = speech_audio::diagnostics::analyze(&samples, sample_rate)
+        .map_err(|error| ProjectApiError::internal("analyze chapter audio", error))?;
+    Ok(Json(json!({
+        "project_id": id,
+        "chapter_index": index,
+        "chapter_title": chapter.title,
+        "diagnostics": diagnostics,
+    })))
 }
 
 /// Запит перегенерації одного юніта (речення) глави.

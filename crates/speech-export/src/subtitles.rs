@@ -42,7 +42,7 @@ pub fn render_vtt(cues: &[Cue]) -> String {
     out
 }
 
-fn normalized(cues: &[Cue]) -> Vec<Cue> {
+pub(crate) fn normalized(cues: &[Cue]) -> Vec<Cue> {
     let mut cues: Vec<Cue> = cues
         .iter()
         .filter(|cue| !cue.text.trim().is_empty())

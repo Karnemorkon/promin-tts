@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use speech_core::projects::{now_rfc3339, valid_project_id, ChapterStatus, Project, ProjectStore};
 use speech_export::{
-    combined_subtitles, export_book, CoverImage, Cue, ExportChapter, ExportError, ExportFormat,
-    ExportInput, ExportMetadata, ExportObserver, ExportSummary,
+    combined_ass, combined_subtitles, export_book, CoverImage, Cue, ExportChapter, ExportError,
+    ExportFormat, ExportInput, ExportMetadata, ExportObserver, ExportSummary,
 };
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::io::ReaderStream;
@@ -92,6 +92,8 @@ pub struct ExportRecord {
     pub subtitles_srt_file: Option<String>,
     #[serde(default)]
     pub subtitles_vtt_file: Option<String>,
+    #[serde(default)]
+    pub subtitles_ass_file: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -246,7 +248,7 @@ impl ExportManager {
             return Err(ExportApiError::bad("invalid project id"));
         }
         let format = ExportFormat::parse(&request.format)
-            .ok_or_else(|| ExportApiError::bad("format must be m4b, mp3 or ogg"))?;
+            .ok_or_else(|| ExportApiError::bad("format must be m4b, mp3, ogg or flac"))?;
         let bitrate_kbps = format
             .resolve_bitrate_kbps(request.bitrate_kbps.unwrap_or(0))
             .map_err(|error| ExportApiError::bad(error.to_string()))?;
@@ -326,6 +328,7 @@ impl ExportManager {
             audio_file: None,
             subtitles_srt_file: None,
             subtitles_vtt_file: None,
+            subtitles_ass_file: None,
             error: None,
         };
 
@@ -471,6 +474,9 @@ impl ExportManager {
             remove_file_if_exists(&dir.join(name));
         }
         if let Some(name) = record.subtitles_vtt_file.as_deref() {
+            remove_file_if_exists(&dir.join(name));
+        }
+        if let Some(name) = record.subtitles_ass_file.as_deref() {
             remove_file_if_exists(&dir.join(name));
         }
         Ok(())
@@ -637,27 +643,28 @@ impl ExportManager {
 
         let part_for_task = part.clone();
         let result = tokio::task::spawn_blocking(
-            move || -> Result<(ExportSummary, String, String), ExportError> {
+            move || -> Result<(ExportSummary, String, String, String), ExportError> {
                 let file = std::fs::File::create(&part_for_task)?;
                 let mut writer = BufWriter::new(file);
                 let mut observer = observer;
                 let summary = export_book(&input, &mut writer, &mut observer)?;
                 writer.flush()?;
                 let (srt, vtt) = combined_subtitles(&input.chapters, &summary.chapters);
-                Ok((summary, srt, vtt))
+                let ass = combined_ass(&input.chapters, &summary.chapters, &input.metadata.title);
+                Ok((summary, srt, vtt, ass))
             },
         )
         .await;
 
         match result {
-            Ok(Ok((summary, srt, vtt))) => self.complete(id, &summary, srt, vtt),
+            Ok(Ok((summary, srt, vtt, ass))) => self.complete(id, &summary, srt, vtt, ass),
             Ok(Err(ExportError::Cancelled)) => self.mark_cancelled(id),
             Ok(Err(error)) => self.fail_record(id, error.to_string()),
             Err(join_error) => self.fail_record(id, format!("export task failed: {join_error}")),
         }
     }
 
-    fn complete(&self, id: &str, summary: &ExportSummary, srt: String, vtt: String) {
+    fn complete(&self, id: &str, summary: &ExportSummary, srt: String, vtt: String, ass: String) {
         let Some(record) = self.record(id) else {
             remove_file_if_exists(&self.part_path(id));
             self.cleanup_task_state(id);
@@ -695,6 +702,14 @@ impl ExportManager {
             self.fail_record(id, format!("cannot write subtitles: {error}"));
             return;
         }
+        let ass_file = format!("{id}.ass");
+        if let Err(error) = std::fs::write(dir.join(&ass_file), ass.as_bytes()) {
+            remove_file_if_exists(&audio_path);
+            remove_file_if_exists(&dir.join(&srt_file));
+            remove_file_if_exists(&dir.join(&vtt_file));
+            self.fail_record(id, format!("cannot write subtitles: {error}"));
+            return;
+        }
 
         let mut record = record;
         record.status = ExportStatus::Completed;
@@ -702,9 +717,11 @@ impl ExportManager {
         record.chapters_done = record.chapters_total;
         record.duration_ms = Some(summary.duration_ms);
         record.audio_bytes = Some(summary.bytes_written);
+        record.bitrate_kbps = summary.bitrate_kbps;
         record.audio_file = Some(audio_file);
         record.subtitles_srt_file = Some(srt_file);
         record.subtitles_vtt_file = Some(vtt_file);
+        record.subtitles_ass_file = Some(ass_file);
         record.finished_at = Some(now_rfc3339());
         record.error = None;
         self.persist(&record);
@@ -1101,6 +1118,13 @@ fn export_view(record: &ExportRecord, project_updated_at: &str, base: &str) -> s
                 record.project_id, record.id
             )),
         );
+        object.insert(
+            "subtitles_ass_url".to_string(),
+            json!(format!(
+                "{base}/v1/projects/{}/exports/{}/subtitles?format=ass",
+                record.project_id, record.id
+            )),
+        );
     }
     value
 }
@@ -1246,6 +1270,10 @@ pub async fn export_subtitles(
             record.subtitles_vtt_file.as_deref(),
             "text/vtt; charset=utf-8",
         ),
+        "ass" | "ssa" => (
+            record.subtitles_ass_file.as_deref(),
+            "text/x-ssa; charset=utf-8",
+        ),
         other => {
             return Err(ExportApiError::bad(format!(
                 "unsupported subtitle format: {other}"
@@ -1270,7 +1298,11 @@ pub async fn export_subtitles(
         HeaderValue::from_str(&format!(
             "attachment; filename=\"promin-{}.{}\"",
             record.id,
-            if format == "srt" { "srt" } else { "vtt" }
+            match format.as_str() {
+                "srt" => "srt",
+                "vtt" | "webvtt" => "vtt",
+                _ => "ass",
+            }
         ))
         .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
     );
@@ -1344,6 +1376,7 @@ mod tests {
             audio_file: None,
             subtitles_srt_file: None,
             subtitles_vtt_file: None,
+            subtitles_ass_file: None,
             error: None,
         };
         save_record(&exports, &record).unwrap();
@@ -1523,16 +1556,22 @@ mod tests {
         let audio = dir.join(finished.audio_file.clone().unwrap());
         let srt = dir.join(finished.subtitles_srt_file.clone().unwrap());
         let vtt = dir.join(finished.subtitles_vtt_file.clone().unwrap());
+        let ass = dir.join(finished.subtitles_ass_file.clone().unwrap());
         assert!(audio.is_file());
         assert!(srt.is_file());
         assert!(vtt.is_file());
+        assert!(ass.is_file());
         let srt_text = std::fs::read_to_string(&srt).unwrap();
         assert!(srt_text.contains("Перший текст"));
         assert!(srt_text.contains("Другий текст"));
+        let ass_text = std::fs::read_to_string(&ass).unwrap();
+        assert!(ass_text.contains("[Script Info]"));
+        assert!(ass_text.contains("{\\k"));
 
         manager.delete(&id, &record.id).unwrap();
         assert!(!audio.exists());
         assert!(!srt.exists());
         assert!(!vtt.exists());
+        assert!(!ass.exists());
     }
 }

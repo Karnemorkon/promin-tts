@@ -30,6 +30,19 @@ pub fn render_srt(timings: &[ChunkTiming]) -> String {
     out
 }
 
+/// ASS-файл із послівною караоке-розміткою.
+pub fn render_ass(timings: &[ChunkTiming], title: &str) -> String {
+    let cues: Vec<speech_export::Cue> = cues(timings)
+        .into_iter()
+        .map(|cue| speech_export::Cue {
+            start_ms: cue.start_ms,
+            end_ms: cue.end_ms,
+            text: cue.text,
+        })
+        .collect();
+    speech_export::render_ass(&cues, title)
+}
+
 /// WebVTT-файл (крапка в мілісекундах).
 pub fn render_vtt(timings: &[ChunkTiming]) -> String {
     let mut out = String::from("WEBVTT\n\n");
@@ -168,6 +181,16 @@ mod tests {
         let vtt = render_vtt(&timings);
         assert!(vtt.starts_with("WEBVTT\n\n"));
         assert!(vtt.contains("00:01:05.500 --> 00:01:07.000\nТекст."));
+    }
+
+    #[test]
+    fn renders_ass_with_karaoke() {
+        let timings = vec![timing(0, 1_500, "Перше речення. Друге речення.")];
+        let ass = render_ass(&timings, "Розділ 1");
+        assert!(ass.contains("Title: Розділ 1"));
+        assert!(ass.contains("Dialogue: 0,0:00:00.00"));
+        assert!(ass.contains("{\\k"));
+        assert!(ass.contains("Перше"));
     }
 
     #[test]

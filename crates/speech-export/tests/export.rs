@@ -1,8 +1,9 @@
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use speech_export::{
-    combined_subtitles, export_book, Cue, ExportChapter, ExportFormat, ExportInput, ExportMetadata,
-    NoopObserver,
+    combined_ass, combined_subtitles, export_book, Cue, ExportChapter, ExportFormat, ExportInput,
+    ExportMetadata, NoopObserver,
 };
 
 fn tone(seconds: f32, frequency: f32) -> Vec<i16> {
@@ -90,7 +91,12 @@ fn book(dir: &Path, format: ExportFormat) -> ExportInput {
 
 #[test]
 fn exports_every_format_with_chapters_and_subtitles() {
-    for format in [ExportFormat::M4b, ExportFormat::Mp3, ExportFormat::Ogg] {
+    for format in [
+        ExportFormat::M4b,
+        ExportFormat::Mp3,
+        ExportFormat::Ogg,
+        ExportFormat::Flac,
+    ] {
         let dir = temp_dir();
         let input = book(&dir, format);
         let mut output = Vec::new();
@@ -125,6 +131,12 @@ fn exports_every_format_with_chapters_and_subtitles() {
                 assert!(output.windows(8).any(|window| window == b"OpusHead"));
                 assert!(output.windows(8).any(|window| window == b"OpusTags"));
                 assert!(output.windows(10).any(|window| window == b"CHAPTER002"));
+            }
+            ExportFormat::Flac => {
+                assert!(output.starts_with(b"fLaC"));
+                assert!(output.windows(5).any(|window| window == b"TITLE"));
+                assert!(output.windows(10).any(|window| window == b"CHAPTER002"));
+                assert!(output.windows(3).any(|window| window == b"PNG"));
             }
         }
 
@@ -184,6 +196,61 @@ fn rejects_wav_with_wrong_sample_rate() {
         error,
         speech_export::ExportError::WavFormat { .. }
     ));
+}
+
+#[test]
+fn flac_roundtrip_is_lossless_and_keeps_metadata() {
+    let dir = temp_dir();
+    let input = book(&dir, ExportFormat::Flac);
+    let mut output = Vec::new();
+    let summary = export_book(&input, &mut output, &mut NoopObserver).unwrap();
+    assert_eq!(summary.format, ExportFormat::Flac);
+    assert_eq!(summary.duration_ms, 2_500);
+    assert!(summary.bitrate_kbps > 0);
+
+    let mut reader = claxon::FlacReader::new(Cursor::new(&output)).unwrap();
+    let info = reader.streaminfo();
+    assert_eq!(info.sample_rate, 24_000);
+    assert_eq!(info.channels, 1);
+    assert_eq!(info.bits_per_sample, 16);
+    assert_eq!(reader.get_tag("TITLE").next(), Some("Тестова книга"));
+    assert_eq!(reader.get_tag("CHAPTER002NAME").next(), Some("Розділ 2"));
+
+    let decoded: Vec<i32> = reader.samples().map(|sample| sample.unwrap()).collect();
+    let mut expected = Vec::new();
+    for chapter in &input.chapters {
+        let mut wav = hound::WavReader::open(&chapter.wav_path).unwrap();
+        expected.extend(
+            wav.samples::<i16>()
+                .map(|sample| i32::from(sample.unwrap())),
+        );
+    }
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn ass_subtitles_use_word_karaoke_and_book_timeline() {
+    let dir = temp_dir();
+    let input = book(&dir, ExportFormat::Flac);
+    let mut output = Vec::new();
+    let summary = export_book(&input, &mut output, &mut NoopObserver).unwrap();
+    let ass = combined_ass(&input.chapters, &summary.chapters, "Тестова книга");
+    assert!(ass.contains("Title: Тестова книга"));
+    assert!(ass.contains("Dialogue: 0,0:00:00.00,0:00:00.70"));
+    assert!(ass.contains("{\\k"));
+    assert!(ass.contains("Перше"));
+    let third_start = summary.chapters[1].start_ms + 100;
+    let timestamp = format!(
+        "{}:{:02}:{:02}.{:02}",
+        third_start / 3_600_000,
+        (third_start / 60_000) % 60,
+        (third_start / 1_000) % 60,
+        (third_start % 1_000) / 10
+    );
+    assert!(
+        ass.contains(&timestamp),
+        "ASS should contain {timestamp}:\n{ass}"
+    );
 }
 
 #[test]

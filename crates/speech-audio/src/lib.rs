@@ -5,6 +5,7 @@
 
 pub mod crossfade;
 pub mod decode;
+pub mod diagnostics;
 pub mod loudness;
 pub mod resample;
 
