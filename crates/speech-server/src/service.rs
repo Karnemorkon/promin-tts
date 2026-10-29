@@ -541,7 +541,7 @@ impl SynthService {
                     );
                 }
                 let engine =
-                    Engine::Holos(Box::new(HolosPipeline::open(dir, intra_threads, false)?));
+                    Engine::Holos(Box::new(HolosPipeline::open(dir, intra_threads, true)?));
                 let tokenizer = CharTokenizer::from_vocab(bundle.vocab());
                 let voices = bundle.voices.clone();
                 let identity = bundle_model_identity(dir, &bundle)?;

@@ -111,6 +111,16 @@ fn holos_streaming_matches_exact() {
 
     let streaming = HolosPipeline::open(&dir, 4, true).expect("load streaming pipeline");
     assert!(streaming.is_streaming());
+
+    // Повний синтез із віконного рушія все одно йде exact-декодером.
+    let exact_from_streaming = streaming
+        .synthesize(&ids, &voice, 1.0)
+        .expect("exact synthesis from streaming pipeline");
+    assert_eq!(
+        exact_from_streaming, expected,
+        "streaming pipeline must reuse the exact decoder for full synthesis"
+    );
+
     let chunks = streaming
         .synthesize_chunks(&ids, &voice, 1.0, None)
         .unwrap_or_else(|error| panic!("stream {text:?}: {error:#}"));

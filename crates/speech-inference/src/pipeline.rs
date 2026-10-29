@@ -34,14 +34,12 @@ struct Encoded {
     durations: Vec<i64>,
 }
 
-enum DecoderStage {
-    Exact(Session),
-    Streaming {
-        source: Session,
-        decoder: Session,
-        chunk_frames: usize,
-        context_frames: usize,
-    },
+/// Віконний (стрімінговий) декодер: `source` + `decoder_window`.
+struct StreamingDecoder {
+    source: Session,
+    decoder: Session,
+    chunk_frames: usize,
+    context_frames: usize,
 }
 
 /// Готовий до синтезу багатоетапний рушій.
@@ -50,10 +48,14 @@ pub struct HolosPipeline {
     bundle: Bundle,
     encoder: Session,
     prosody: Session,
-    decoder: DecoderStage,
+    /// Exact-декодер на всю репліку (завжди є в маніфесті).
+    exact: Session,
+    /// Віконний декодер, якщо бандл його містить і його просили завантажити.
+    streaming: Option<StreamingDecoder>,
     encoder_outputs: EncoderOutputs,
     prosody_outputs: ProsodyOutputs,
-    decoder_outputs: AudioOutputs,
+    exact_outputs: AudioOutputs,
+    window_outputs: AudioOutputs,
     source_output: usize,
 }
 
@@ -74,7 +76,9 @@ struct AudioOutputs {
 }
 
 impl HolosPipeline {
-    /// Відкрити бандл. `streaming` вантажить віконний декодер замість exact.
+    /// Відкрити бандл. `streaming` додатково вантажить віконний декодер
+    /// (`source` + `decoder_window`), якщо він є в маніфесті; exact-декодер
+    /// потрібен завжди для повного синтезу.
     pub fn open(dir: impl AsRef<Path>, intra_threads: i16, streaming: bool) -> Result<Self> {
         let dir = dir.as_ref();
         let bundle = Bundle::open(dir, VOICE_DIM)
@@ -106,55 +110,61 @@ impl HolosPipeline {
             energy: output_index(&prosody, "energy")?,
         };
 
-        let (decoder, decoder_outputs, source_output) = if streaming {
-            let config =
-                bundle.manifest.streaming.as_ref().context(
-                    "bundle has no streaming section; re-export the model to use streaming",
-                )?;
-            let source = load_stage(&env, &bundle.stage(&config.source), threads)?;
-            require_inputs(&source, &["f0"], "source")?;
-            let source_output = output_index(&source, "source")?;
-
-            let decoder = load_stage(&env, &bundle.stage(&config.decoder), threads)?;
-            require_inputs(
-                &decoder,
-                &[
-                    "acoustic_tokens",
-                    "frame_to_token",
-                    "f0",
-                    "energy",
-                    "source",
-                    "voice",
-                ],
-                "decoder_window",
-            )?;
-            let outputs = AudioOutputs {
-                audio: output_index(&decoder, "audio")?,
-                lengths: optional_output_index(&decoder, "audio_lengths"),
-            };
-            (
-                DecoderStage::Streaming {
-                    source,
-                    decoder,
-                    chunk_frames: config.chunk_frames,
-                    context_frames: config.context_frames,
-                },
-                outputs,
-                source_output,
-            )
-        } else {
-            let decoder = load_stage(&env, &bundle.stage(&bundle.manifest.decoder), threads)?;
-            require_inputs(
-                &decoder,
-                &["acoustic_tokens", "frame_to_token", "f0", "energy", "voice"],
-                "decoder",
-            )?;
-            let outputs = AudioOutputs {
-                audio: output_index(&decoder, "audio")?,
-                lengths: optional_output_index(&decoder, "audio_lengths"),
-            };
-            (DecoderStage::Exact(decoder), outputs, 0)
+        let exact = load_stage(&env, &bundle.stage(&bundle.manifest.decoder), threads)?;
+        require_inputs(
+            &exact,
+            &["acoustic_tokens", "frame_to_token", "f0", "energy", "voice"],
+            "decoder",
+        )?;
+        let exact_outputs = AudioOutputs {
+            audio: output_index(&exact, "audio")?,
+            lengths: optional_output_index(&exact, "audio_lengths"),
         };
+
+        let (streaming, window_outputs, source_output) =
+            match (&bundle.manifest.streaming, streaming) {
+                (Some(config), true) => {
+                    let source = load_stage(&env, &bundle.stage(&config.source), threads)?;
+                    require_inputs(&source, &["f0"], "source")?;
+                    let source_output = output_index(&source, "source")?;
+
+                    let decoder = load_stage(&env, &bundle.stage(&config.decoder), threads)?;
+                    require_inputs(
+                        &decoder,
+                        &[
+                            "acoustic_tokens",
+                            "frame_to_token",
+                            "f0",
+                            "energy",
+                            "source",
+                            "voice",
+                        ],
+                        "decoder_window",
+                    )?;
+                    let outputs = AudioOutputs {
+                        audio: output_index(&decoder, "audio")?,
+                        lengths: optional_output_index(&decoder, "audio_lengths"),
+                    };
+                    (
+                        Some(StreamingDecoder {
+                            source,
+                            decoder,
+                            chunk_frames: config.chunk_frames,
+                            context_frames: config.context_frames,
+                        }),
+                        outputs,
+                        source_output,
+                    )
+                }
+                _ => (
+                    None,
+                    AudioOutputs {
+                        audio: 0,
+                        lengths: None,
+                    },
+                    0,
+                ),
+            };
 
         tracing::info!(
             bundle = %dir.display(),
@@ -163,7 +173,7 @@ impl HolosPipeline {
             samples_per_frame = bundle.samples_per_frame(),
             max_frames = bundle.max_frames(),
             voices = bundle.voices.len(),
-            streaming,
+            streaming = streaming.is_some(),
             threads,
             "Holos bundle loaded"
         );
@@ -173,10 +183,12 @@ impl HolosPipeline {
             bundle,
             encoder,
             prosody,
-            decoder,
+            exact,
+            streaming,
             encoder_outputs,
             prosody_outputs,
-            decoder_outputs,
+            exact_outputs,
+            window_outputs,
             source_output,
         })
     }
@@ -206,25 +218,19 @@ impl HolosPipeline {
     }
 
     pub fn is_streaming(&self) -> bool {
-        matches!(self.decoder, DecoderStage::Streaming { .. })
+        self.streaming.is_some()
     }
 
     /// Синтез фонемних id у float32-аудіо (моно, `sample_rate`).
+    ///
+    /// Для повного синтезу завжди використовується exact-декодер, навіть якщо
+    /// бандл має віконний: так результат не залежить від нарізки на вікна.
     pub fn synthesize(&self, phoneme_ids: &[i64], voice: &[f32], speed: f32) -> Result<Vec<f32>> {
         let encoded = self.encode(phoneme_ids, voice, speed)?;
-        match &self.decoder {
-            DecoderStage::Exact(_) => self.decode_exact(&encoded),
-            DecoderStage::Streaming { .. } => {
-                let mut audio = Vec::new();
-                for chunk in self.decode_windows(&encoded, None)? {
-                    audio.extend_from_slice(&chunk);
-                }
-                Ok(audio)
-            }
-        }
+        self.decode_exact(&encoded)
     }
 
-    /// Стрімінгові чанки; порожньо, якщо бандл без віконного декодера.
+    /// Стрімінгові чанки; один чанк, якщо бандл без віконного декодера.
     ///
     /// Стартова тиша зрізається до 10 мс, після чого перші 5 мс отримують
     /// фейд-ін — так само, як `_trim_leading` у Python-рантаймі.
@@ -236,20 +242,19 @@ impl HolosPipeline {
         chunk_frames: Option<usize>,
     ) -> Result<Vec<Vec<f32>>> {
         let encoded = self.encode(phoneme_ids, voice, speed)?;
-        match &self.decoder {
-            DecoderStage::Streaming { .. } => {
-                let mut chunks = self.decode_windows(&encoded, chunk_frames)?;
-                let skip = stream_silence_skip(
-                    &encoded.durations,
-                    self.bundle.samples_per_frame(),
-                    self.bundle.sample_rate(),
-                );
-                let fade = if skip > 0 { STREAM_FADE_IN_SAMPLES } else { 0 };
-                trim_leading_silence(&mut chunks, skip, fade);
-                chunks.retain(|chunk| !chunk.is_empty());
-                Ok(chunks)
-            }
-            DecoderStage::Exact(_) => Ok(vec![self.decode_exact(&encoded)?]),
+        if self.streaming.is_some() {
+            let mut chunks = self.decode_windows(&encoded, chunk_frames)?;
+            let skip = stream_silence_skip(
+                &encoded.durations,
+                self.bundle.samples_per_frame(),
+                self.bundle.sample_rate(),
+            );
+            let fade = if skip > 0 { STREAM_FADE_IN_SAMPLES } else { 0 };
+            trim_leading_silence(&mut chunks, skip, fade);
+            chunks.retain(|chunk| !chunk.is_empty());
+            Ok(chunks)
+        } else {
+            Ok(vec![self.decode_exact(&encoded)?])
         }
     }
 
@@ -270,26 +275,25 @@ impl HolosPipeline {
         F: FnMut(&[f32]) -> bool,
     {
         let encoded = self.encode(phoneme_ids, voice, speed)?;
-        match &self.decoder {
-            DecoderStage::Exact(_) => {
-                let audio = self.decode_exact(&encoded)?;
-                Ok(on_chunk(&audio))
-            }
-            DecoderStage::Streaming { .. } => {
-                let skip = stream_silence_skip(
-                    &encoded.durations,
-                    self.bundle.samples_per_frame(),
-                    self.bundle.sample_rate(),
-                );
-                let fade = if skip > 0 { STREAM_FADE_IN_SAMPLES } else { 0 };
-                let mut trimmer = LeadingTrimmer::new(skip, fade);
-                self.decode_windows_with(&encoded, chunk_frames, &mut |chunk| match trimmer
-                    .apply(chunk)
-                {
+        if self.streaming.is_some() {
+            let skip = stream_silence_skip(
+                &encoded.durations,
+                self.bundle.samples_per_frame(),
+                self.bundle.sample_rate(),
+            );
+            let fade = if skip > 0 { STREAM_FADE_IN_SAMPLES } else { 0 };
+            let mut trimmer = LeadingTrimmer::new(skip, fade);
+            self.decode_windows_with(
+                &encoded,
+                chunk_frames,
+                &mut |chunk| match trimmer.apply(chunk) {
                     Some(trimmed) => on_chunk(&trimmed),
                     None => true,
-                })
-            }
+                },
+            )
+        } else {
+            let audio = self.decode_exact(&encoded)?;
+            Ok(on_chunk(&audio))
         }
     }
 
@@ -417,9 +421,7 @@ impl HolosPipeline {
     }
 
     fn decode_exact(&self, encoded: &Encoded) -> Result<Vec<f32>> {
-        let DecoderStage::Exact(session) = &self.decoder else {
-            bail!("exact decoder is not loaded");
-        };
+        let session = &self.exact;
         let frames = encoded.frame_to_token.len();
         let expected = frames * self.bundle.samples_per_frame();
 
@@ -447,8 +449,8 @@ impl HolosPipeline {
             values.push(value);
         }
         let outputs = session.run(values).context("decoder run")?;
-        let audio = extract_f32(&outputs, self.decoder_outputs.audio, "audio")?;
-        let audio_length = match self.decoder_outputs.lengths {
+        let audio = extract_f32(&outputs, self.exact_outputs.audio, "audio")?;
+        let audio_length = match self.exact_outputs.lengths {
             Some(index) => extract_i64(&outputs, index, "audio_lengths")?
                 .iter()
                 .next()
@@ -496,15 +498,15 @@ impl HolosPipeline {
     where
         F: FnMut(&[f32]) -> bool,
     {
-        let DecoderStage::Streaming {
+        let Some(streaming) = &self.streaming else {
+            bail!("streaming decoder is not loaded");
+        };
+        let StreamingDecoder {
             source,
             decoder,
             chunk_frames: max_chunk,
             context_frames,
-        } = &self.decoder
-        else {
-            bail!("streaming decoder is not loaded");
-        };
+        } = streaming;
         let chunk = chunk_frames.unwrap_or(*max_chunk);
         if chunk == 0 || chunk > *max_chunk {
             bail!("chunk_frames must be between 1 and {max_chunk}");
@@ -577,7 +579,7 @@ impl HolosPipeline {
                 values.push(value);
             }
             let outputs = decoder.run(values).context("decoder_window run")?;
-            let audio = extract_f32(&outputs, self.decoder_outputs.audio, "audio")?;
+            let audio = extract_f32(&outputs, self.window_outputs.audio, "audio")?;
             let flat: Vec<f32> = audio.iter().copied().collect();
             let offset = (start - window_start) * step;
             let length = (end - start) * step;
