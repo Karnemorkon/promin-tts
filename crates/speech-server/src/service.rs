@@ -40,6 +40,13 @@ pub const MAX_JOB_TEXT_CHARS: usize = 200_000;
 /// Допустимий діапазон темпу.
 pub const SPEED_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.0;
 
+/// Дефолт для синхронних кінцівок (`/api/synthesize`, стрімінг, Wyoming):
+/// скільки символів вміщує один ONNX-виклик моделі.
+pub const DEFAULT_STREAM_MAX_CHARS: usize = 1_200;
+
+/// Дефолт тривалості кросфейду між чанками (мс), як у асинхронних завданнях.
+pub const DEFAULT_CROSSFADE_MS: u32 = 40;
+
 /// Референс для клонування: мінімальна та максимальна тривалість (секунди).
 pub const REFERENCE_SECONDS: std::ops::RangeInclusive<f32> = 0.25..=120.0;
 
@@ -891,8 +898,8 @@ impl SynthService {
         })
     }
 
-    /// Фонеми -> ONNX -> float32-семпли (один або кілька викликів моделі).
-    fn synthesize_verbalized_f32(
+    /// Фонеми одного речення -> ONNX -> float32-семпли (без стикування).
+    fn synthesize_chunk_f32(
         &self,
         text: &str,
         voice_vector: &[f32],
@@ -924,12 +931,42 @@ impl SynthService {
             samples.extend_from_slice(&chunk);
         }
 
-        if samples.is_empty() {
+        Ok(samples)
+    }
+
+    /// Фонеми -> ONNX -> float32-семпли (один або кілька викликів моделі).
+    fn synthesize_verbalized_f32(
+        &self,
+        text: &str,
+        voice_vector: &[f32],
+        speed: f32,
+        raw_stress: bool,
+    ) -> Result<Vec<f32>, SynthError> {
+        let parts = self.phonemizer.phonemize(text, raw_stress);
+        if parts.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+
+        // Кросфейд на стиках речень — як у довгому/главному синтезі.
+        let mut sentences: Vec<Vec<f32>> = Vec::with_capacity(parts.len());
+        for part in &parts {
+            let samples = self.synthesize_chunk_f32(part, voice_vector, speed, raw_stress)?;
+            sentences.push(samples);
+        }
+
+        let sentences: Vec<Vec<f32>> = sentences.into_iter().filter(|c| !c.is_empty()).collect();
+        if sentences.is_empty() {
             return Err(SynthError::Internal(anyhow::anyhow!(
                 "model produced no audio samples"
             )));
         }
-        Ok(samples)
+        if sentences.len() == 1 {
+            return Ok(sentences.pop().expect("one non-empty chunk"));
+        }
+        let overlap = crossfade_samples(DEFAULT_CROSSFADE_MS, SAMPLE_RATE);
+        Ok(crossfade_concat(&sentences, overlap))
     }
 
     /// Як `synthesize_verbalized_f32`, але віддає аудіо шматками.
@@ -1027,13 +1064,38 @@ impl SynthService {
 
         let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
         tracing::debug!(verbalizer, vb_ms, "text verbalized");
-        let samples =
-            self.synthesize_verbalized_f32(&verbalized, &voice_vector, speed, raw_stress)?;
+        let chunks = sentence_chunks(&verbalized, DEFAULT_STREAM_MAX_CHARS);
+        if chunks.is_empty() {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+        // Кожне речення — окремий ONNX-виклик; стики склеюємо кросфейдом
+        // (раніше весь текст ішов одним викликом без стикування).
+        let total = chunks.len();
+        let mut audio_chunks = Vec::with_capacity(total);
+        for chunk in &chunks {
+            let samples = self.synthesize_chunk_f32(chunk, &voice_vector, speed, raw_stress)?;
+            if !samples.is_empty() {
+                audio_chunks.push(samples);
+            }
+        }
+        if audio_chunks.is_empty() {
+            return Err(SynthError::Internal(anyhow::anyhow!(
+                "model produced no audio samples"
+            )));
+        }
+        let samples = if audio_chunks.len() == 1 {
+            audio_chunks.pop().expect("one non-empty chunk")
+        } else {
+            let overlap = crossfade_samples(DEFAULT_CROSSFADE_MS, SAMPLE_RATE);
+            crossfade_concat(&audio_chunks, overlap)
+        };
         Ok(SynthPcmOutput {
             pcm: float_to_pcm16(&samples),
             verbalizer,
             vb_ms,
-            chunks: 1,
+            chunks: total,
         })
     }
 
