@@ -161,6 +161,12 @@ struct Args {
     /// True-peak ceiling (dBTP) for new projects
     #[arg(long, env = "PROMIN_TRUE_PEAK", default_value_t = -3.0)]
     true_peak: f64,
+
+    /// Таймаут (секунди) синхронних inference-запитів (/api/synthesize,
+    /// /api/verbalize, /api/voices); 0 вимикає таймаут. Довгі тексти мають
+    /// використовувати async jobs або стрімінг.
+    #[arg(long, env = "PROMIN_SYNTH_TIMEOUT_SECS", default_value_t = 600)]
+    synth_timeout_secs: u64,
 }
 
 #[derive(Clone)]
@@ -177,6 +183,8 @@ struct AppState {
     default_loudness: LoudnessSettings,
     public_url: String,
     api_keys: Arc<Vec<String>>,
+    /// Таймаут синхронних inference-запитів (Duration::ZERO = вимкнено).
+    synth_timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,13 +318,64 @@ fn synth_error_response(error: SynthError, context: &'static str) -> Response {
     }
 }
 
+/// Таймаут blocking-інференсу: `504` із ввічливим заголовком `Retry-After`,
+/// якщо завдання не завершилось за `state.synth_timeout` (0 = вимкнено).
+/// Робочий потік не скасовується — ONNX-виклик дописується у фоні, а клієнт
+/// отримує швидку відповідь замісь безкінечного висяння з'єднання.
+async fn with_synth_timeout<T>(
+    timeout: Duration,
+    context: &'static str,
+    handle: tokio::task::JoinHandle<T>,
+) -> Result<T, Response> {
+    if timeout.is_zero() {
+        return handle
+            .await
+            .map_err(|join_error| blocking_task_response(join_error, context));
+    }
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(result) => result.map_err(|join_error| blocking_task_response(join_error, context)),
+        Err(_) => {
+            tracing::warn!(
+                context,
+                timeout_secs = timeout.as_secs(),
+                "request timed out"
+            );
+            let seconds = timeout.as_secs().max(1).to_string();
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds).unwrap(),
+            );
+            let response = (
+                StatusCode::GATEWAY_TIMEOUT,
+                headers,
+                Json(json!({
+                    "error": format!("{context} timed out after {}s; use async jobs (/v1/projects/generate-async) or /api/synthesize/stream for long texts", timeout.as_secs())
+                })),
+            )
+                .into_response();
+            Err(response)
+        }
+    }
+}
+
+/// Join-error (паніка/скасування blocking-задачі) -> HTTP 500.
+fn blocking_task_response(join_error: tokio::task::JoinError, context: &'static str) -> Response {
+    tracing::error!(error = %join_error, "{context} task panicked");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal task error" })),
+    )
+        .into_response()
+}
+
 async fn synthesize(
     State(state): State<AppState>,
     Json(request): Json<SynthesizeRequest>,
 ) -> Response {
     let mode = VerbalizerMode::parse(request.auto_verbalize.as_ref());
     let service = Arc::clone(&state.service);
-    let result = tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         service.synthesize_wav(
             &request.text,
             request.voice.as_deref(),
@@ -325,11 +384,14 @@ async fn synthesize(
             mode,
             request.raw_stress,
         )
-    })
-    .await;
+    });
+    let result = match with_synth_timeout(state.synth_timeout, "synthesis", handle).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
 
     match result {
-        Ok(Ok(output)) => {
+        Ok(output) => {
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
             headers.insert(
@@ -353,15 +415,7 @@ async fn synthesize(
             );
             (headers, output.wav).into_response()
         }
-        Ok(Err(error)) => synth_error_response(error, "synthesis"),
-        Err(join_error) => {
-            tracing::error!(error = %join_error, "synthesis task panicked");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal task error" })),
-            )
-                .into_response()
-        }
+        Err(error) => synth_error_response(error, "synthesis"),
     }
 }
 
@@ -371,20 +425,15 @@ async fn verbalize(
 ) -> Response {
     let mode = VerbalizerMode::parse_mode(request.mode.as_deref());
     let service = Arc::clone(&state.service);
-    let result =
-        tokio::task::spawn_blocking(move || service.verbalize_text(&request.text, mode)).await;
+    let handle = tokio::task::spawn_blocking(move || service.verbalize_text(&request.text, mode));
+    let result = match with_synth_timeout(state.synth_timeout, "verbalization", handle).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
 
     match result {
-        Ok(Ok(text)) => Json(VerbalizeResponse { text }).into_response(),
-        Ok(Err(error)) => synth_error_response(error, "verbalization"),
-        Err(join_error) => {
-            tracing::error!(error = %join_error, "verbalization task panicked");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal task error" })),
-            )
-                .into_response()
-        }
+        Ok(text) => Json(VerbalizeResponse { text }).into_response(),
+        Err(error) => synth_error_response(error, "verbalization"),
     }
 }
 
@@ -396,24 +445,20 @@ async fn enroll_voice(
     let EnrollVoiceRequest { name, audio_base64 } = request;
     let task_name = name.clone();
     let service = Arc::clone(&state.service);
-    let result =
-        tokio::task::spawn_blocking(move || service.enroll_voice(&task_name, &audio_base64)).await;
+    let handle =
+        tokio::task::spawn_blocking(move || service.enroll_voice(&task_name, &audio_base64));
+    let result = match with_synth_timeout(state.synth_timeout, "voice enrollment", handle).await {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
 
     match result {
-        Ok(Ok(())) => Json(EnrollVoiceResponse {
+        Ok(()) => Json(EnrollVoiceResponse {
             name,
             dim: speech_core::custom_voices::VOICE_DIM,
         })
         .into_response(),
-        Ok(Err(error)) => synth_error_response(error, "voice enrollment"),
-        Err(join_error) => {
-            tracing::error!(error = %join_error, "voice enrollment task panicked");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal task error" })),
-            )
-                .into_response()
-        }
+        Err(error) => synth_error_response(error, "voice enrollment"),
     }
 }
 
@@ -1291,6 +1336,7 @@ async fn main() -> anyhow::Result<()> {
         default_loudness,
         public_url,
         api_keys,
+        synth_timeout: Duration::from_secs(args.synth_timeout_secs),
     };
 
     // Wyoming для Home Assistant: окремий TCP-порт, не блокує HTTP.
@@ -1591,5 +1637,41 @@ mod tests {
         // `/healthz` має лишатися відкритим навіть із новим middleware-chain.
         assert!(is_public_ui_request(&Method::GET, "/healthz"));
         assert!(is_public_ui_request(&Method::HEAD, "/healthz"));
+    }
+
+    #[tokio::test]
+    async fn synth_timeout_returns_504_when_task_overruns() {
+        let timeout = Duration::from_millis(30);
+        let handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_secs(5));
+            42u32
+        });
+        let result = with_synth_timeout(timeout, "synthesis", handle).await;
+        let response = match result {
+            Err(response) => response,
+            Ok(_) => panic!("task should not finish within timeout"),
+        };
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn synth_timeout_passes_through_fast_tasks() {
+        let handle = tokio::task::spawn_blocking(|| 7u32);
+        let value = with_synth_timeout(Duration::from_secs(30), "synthesis", handle)
+            .await
+            .expect("fast task should succeed");
+        assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn synth_timeout_zero_disables_timeout() {
+        let handle = tokio::task::spawn_blocking(|| 1u32);
+        assert_eq!(
+            with_synth_timeout(Duration::ZERO, "synthesis", handle)
+                .await
+                .unwrap(),
+            1
+        );
     }
 }
