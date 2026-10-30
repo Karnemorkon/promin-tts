@@ -1,12 +1,12 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.12 «Back-ASR контроль якості»** — повний ланцюжок
+**v0.13 «Експорт окремими файлами по главах»** — повний ланцюжок
 `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
@@ -15,6 +15,13 @@
 A/B-вибором і перегенерацією окремого речення. ASS-субтитри містять
 послівну караоке-розмітку, а діагностика глав знаходить кліпінг, довгі
 паузи, постійну складову та проблеми рівня.
+
+v0.13 додає експорт окремих глав: можна вибрати будь-які завершені глави
+(або всі) і отримати для кожної власний аудіофайл M4B/MP3/OGG/FLAC разом
+із SRT/VTT/ASS. Job-и асинхронні, зберігаються в
+`<project>/exports/per-chapter/`, переживають рестарт і скасовуються
+кооперативно. Імена файлів містять id job-а, тому кілька експортів не
+перезаписують файли один одного, а невдала глава не блокує решту.
 
 v0.12 додає зворотне розпізнавання готових глав: компактна українська
 W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує аудіо вікнами ~25 с,
@@ -92,7 +99,7 @@ W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує ауді
   API проєктів книг, імпорт, генерація глав, багатоголосий синтез діалогів,
   SRT/VTT/ASS, `.speechproj`, тейки й перегенерація речень, асинхронні
   export-job-и аудіокниг, діагностика готових глав, Back-ASR перевірки
-  з WER/CER і збереженням історії.
+  з WER/CER і збереженням історії, експорт окремих глав із субтитрами.
 
 ## Архітектура
 
@@ -142,7 +149,8 @@ models/
 ├── speakers/                 # клоновані голоси: <name>.npy (float32[256])
 ├── jobs/                     # асинхронні завдання: <id>.json + <id>.wav
 └── projects/                 # книги: <id>/project.json + chapters/<n>.wav
-                              #        + chapters/<n>/takes/ (тейки) + exports/
+                              #        + chapters/<n>/takes/ (тейки)
+                              #        + exports/ (книга, per-chapter/)
 ```
 
 Бандл шукається в корені `models/`, а також у `tts/`, `onnx/` і `holos-onnx/`.
@@ -321,6 +329,12 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 | `DELETE` | `/v1/projects/{id}/exports/{export_id}` | Видалити експорт і його файли: 204/404 |
 | `GET` | `/v1/projects/{id}/exports/{export_id}/audio` | Готовий M4B/MP3/OGG/FLAC; 409, якщо експорт не завершений |
 | `GET` | `/v1/projects/{id}/exports/{export_id}/subtitles?format=srt\|vtt\|ass` | Об'єднані субтитри книги |
+| `GET` | `/v1/projects/{id}/exports/per-chapter` | Історія job-ів експорту окремих глав |
+| `POST` | `/v1/projects/{id}/exports/per-chapter` | Експорт вибраних/усіх завершених глав `{format, chapters?, include_subtitles?, bitrate_kbps?}` → 202; 409 для незавершених |
+| `GET` | `/v1/projects/{id}/exports/per-chapter/{job_id}` | Статус, прогрес і результат по кожній главі |
+| `DELETE` | `/v1/projects/{id}/exports/per-chapter/{job_id}` | Скасувати/видалити job і його файли: 204/404 |
+| `GET` | `/v1/projects/{id}/exports/per-chapter/{job_id}/chapter/{i}/audio` | Аудіо окремої глави; 409, якщо глава ще не готова |
+| `GET` | `/v1/projects/{id}/exports/per-chapter/{job_id}/chapter/{i}/subtitles?format=srt\|vtt\|ass` | Субтитри окремої глави |
 | `GET` | `/v1/jobs?limit=50` | Останні завдання |
 | `GET` | `/v1/jobs/{id}` | Статус, прогрес, метадані |
 | `DELETE` | `/v1/jobs/{id}` | Скасувати: 204, 404 або 409 (уже завершено) |
@@ -622,6 +636,46 @@ ASS містить заголовок, стиль `Default` і `Dialogue`-под
 обмежує одночасне кодування. Без `cover_base64` вбудовується стандартна
 обкладинка 600×600 PNG.
 
+### Експорт окремими файлами по главах (v0.13)
+
+`POST /v1/projects/{id}/exports/per-chapter` створює асинхронний job, який
+кодує кожну вибрану главу в **окремий** файл. `chapters` — індекси глав;
+якщо поле пропущене або порожнє, беруться всі глави зі статусом `completed`.
+Дублікати індексів відкидаються, а незавершена або відсутня глава дає `409`
+(без часткового запуску). `include_subtitles=true` додає SRT/VTT/ASS для
+кожної глави.
+
+```bash
+# Глави 0 і 1 окремими MP3 + субтитри
+curl -X POST http://localhost:8010/v1/projects/<id>/exports/per-chapter \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer change-me' \
+  -d '{"format":"mp3","chapters":[0,1],"include_subtitles":true}'
+# -> 202 {"id":"<job_id>","status":"queued","chapters":[0,1],...}
+
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/exports/per-chapter/<job_id>
+# statuses: queued, running, completed, failed, cancelled
+# results[]: chapter_index, status, audio_file, subtitles_*_file,
+#            duration_ms, bytes, error
+
+curl -H 'Authorization: Bearer change-me' \
+  http://localhost:8010/v1/projects/<id>/exports/per-chapter/<job_id>/chapter/0/audio \
+  -o chapter-0.mp3
+curl -H 'Authorization: Bearer change-me' \
+  'http://localhost:8010/v1/projects/<id>/exports/per-chapter/<job_id>/chapter/0/subtitles?format=ass' \
+  -o chapter-0.ass
+```
+
+Файли лежать у
+`<projects>/<id>/exports/per-chapter/<job_id>-chapter-<n>.{m4b,mp3,ogg,flac,srt,vtt,ass}`;
+записи job-ів — `<job_id>.json`, під час кодування поруч є `.part`. Загальний
+статус job-а — `completed`, лише якщо всі глави успішні; інакше `failed` зі
+списком глав у `error`, але аудіо успішних глав лишається доступним. Після
+рестарту незавершені job-и позначаються `failed`. `DELETE` скасовує активний
+job і видаляє всі його файли; `PROMIN_EXPORT_CONCURRENCY` спільний із повним
+експортом книги.
+
 ### Аудіо-діагностика
 
 `GET /v1/projects/{id}/chapters/{i}/diagnostics` повертає JSON для готової
@@ -747,7 +801,7 @@ MCP audio content (`audio/wav` base64) і текст із метаданими.
 | `PROMIN_JOBS_DIR` | `<models>/jobs` | Job-и та аудіо |
 | `PROMIN_JOBS_CONCURRENCY` | `1` | Одночасних job-ів |
 | `PROMIN_PROJECTS_DIR` | `<models>/projects` | Проєкти книг (`project.json` + WAV + тейки + exports) |
-| `PROMIN_EXPORT_CONCURRENCY` | `1` | Одночасних експортів аудіокниг |
+| `PROMIN_EXPORT_CONCURRENCY` | `1` | Одночасних експортів аудіокниг (повних і по главах) |
 | `PROMIN_ASR_MODEL_DIR` | `<models>/asr/w2v-bert-v3` | Каталог Back-ASR моделі |
 | `PROMIN_ASR_MODEL_ID` | `speech-uk/w2v-bert-v3-onnx` | Id моделі у звітах |
 | `PROMIN_ASR_REPO` | `speech-uk/w2v-bert-v3-onnx` | HF-репозиторій ASR |
@@ -785,6 +839,8 @@ Golden-тести accentor/Gemma/voice encoder потребують моделе
 окремо (див. `crates/*/tests`). Імпорт книг перевіряється синтетичними
 EPUB2/EPUB3/FB2/DOCX/PDF/ZIP-фікстурами, LUFS — еталонним синусом і сплесками,
 експорт — синтетичними WAV-главами з перевіркою контейнерів і субтитрів.
+Експорт по главах додатково перевіряє round-trip job-а на диск, валідацію
+id/імен файлів і статуси.
 
 Back-ASR E2E-тест (реальна модель + WAV) запускається окремо:
 

@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "speech-asr"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "asr-features",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "speech-audio"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "ebur128",
@@ -2168,7 +2168,7 @@ dependencies = [
 
 [[package]]
 name = "speech-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "speech-export"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "speech-inference"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "ndarray",
@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "speech-server"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "speech-text"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "encoding_rs",

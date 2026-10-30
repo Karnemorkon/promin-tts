@@ -30,6 +30,7 @@ mod downloader;
 mod exports;
 mod jobs;
 mod mcp;
+mod per_chapter_export;
 mod projects;
 mod pronunciation;
 mod qc;
@@ -168,6 +169,7 @@ struct AppState {
     exports: Arc<exports::ExportManager>,
     asr: Arc<asr::AsrService>,
     qc: Arc<qc::QcManager>,
+    per_chapter_exports: Arc<per_chapter_export::PerChapterExportManager>,
     project_lock: Arc<tokio::sync::Mutex<()>>,
     pronunciation: Arc<PronunciationStore>,
     default_loudness: LoudnessSettings,
@@ -246,6 +248,7 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "pronunciation_rules": state.pronunciation.rule_count(),
         "asr": state.asr.status(),
         "qc_active": state.qc.active_count(),
+        "per_chapter_exports_active": state.per_chapter_exports.active_count(),
     }))
 }
 
@@ -1181,6 +1184,14 @@ async fn main() -> anyhow::Result<()> {
         qc_concurrency = args.qc_concurrency.max(1),
         "Back-ASR quality control ready"
     );
+    let per_chapter_exports = per_chapter_export::PerChapterExportManager::new(
+        Arc::clone(&projects),
+        args.export_concurrency,
+    )?;
+    tracing::info!(
+        per_chapter_concurrency = args.export_concurrency.max(1),
+        "per-chapter export ready"
+    );
 
     let api_keys: Arc<Vec<String>> = Arc::new(
         args.api_keys
@@ -1201,6 +1212,7 @@ async fn main() -> anyhow::Result<()> {
         exports,
         asr,
         qc,
+        per_chapter_exports,
         project_lock,
         pronunciation,
         default_loudness,
@@ -1334,6 +1346,24 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/projects/{id}/exports/{export_id}/subtitles",
             get(exports::export_subtitles),
+        )
+        .route(
+            "/v1/projects/{id}/exports/per-chapter",
+            get(per_chapter_export::list_per_chapter_exports)
+                .post(per_chapter_export::create_per_chapter_export),
+        )
+        .route(
+            "/v1/projects/{id}/exports/per-chapter/{job_id}",
+            get(per_chapter_export::get_per_chapter_export)
+                .delete(per_chapter_export::delete_per_chapter_export),
+        )
+        .route(
+            "/v1/projects/{id}/exports/per-chapter/{job_id}/chapter/{index}/audio",
+            get(per_chapter_export::get_per_chapter_audio),
+        )
+        .route(
+            "/v1/projects/{id}/exports/per-chapter/{job_id}/chapter/{index}/subtitles",
+            get(per_chapter_export::get_per_chapter_subtitles),
         )
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
