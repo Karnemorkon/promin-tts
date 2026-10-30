@@ -235,9 +235,15 @@ struct EnrollVoiceResponse {
     dim: usize,
 }
 
-async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({
-        "status": "ok",
+async fn healthz(State(state): State<AppState>) -> Response {
+    let (queued, running) = state.jobs.queue_counts();
+    // Порогове перевантаження: довга черга = engine не встигає (детекція без
+    // зовнішнього моніторингу). 503 лише для цього випадку; помилки движка
+    // надалі повертаються окремо у самих запитах.
+    const QUEUE_BACKLOG_LIMIT: usize = 20;
+    let overloaded = queued > QUEUE_BACKLOG_LIMIT;
+    let body = json!({
+        "status": if overloaded { "overloaded" } else { "ok" },
         "engine": "promin-tts",
         "version": env!("CARGO_PKG_VERSION"),
         "model": state.service.model_identity(),
@@ -251,7 +257,13 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "asr": state.asr.status(),
         "qc_active": state.qc.active_count(),
         "per_chapter_exports_active": state.per_chapter_exports.active_count(),
-    }))
+        "jobs_queued": queued,
+        "jobs_running": running,
+    });
+    if overloaded {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    Json(body).into_response()
 }
 
 /// `GET /v1/model`: ідентичність завантаженої моделі.
@@ -957,6 +969,49 @@ fn is_public_ui_request(method: &axum::http::Method, path: &str) -> bool {
     is_read && !path.starts_with("/v1") && !path.starts_with("/api") && !path.starts_with("/mcp")
 }
 
+/// Серійний інференс під одним engine-mutex робить довгі запити невидимими
+/// для логу, тому кожний HTTP-запис містить тривалість і (для синтезу)
+/// розмір результату. Це мінімальний набір метрик для локального застосунку:
+/// без зовнішнього Prometheus можна оцінити латентність і перевантаження.
+async fn log_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let query_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let start = std::time::Instant::now();
+
+    let mut response = next.run(request).await;
+
+    let elapsed_ms = start.elapsed().as_millis();
+    // Клієнтський request-id повертаємо в заголовку — зручно корелювати логи
+    // браузера/SPA з серверними записами.
+    if let Ok(value) = HeaderValue::from_str(&query_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    let status = response.status();
+    let fields = format_args!(
+        "request_id={} {} {} status={} elapsed_ms={}",
+        query_id,
+        method,
+        path,
+        status.as_u16(),
+        elapsed_ms
+    );
+    // Помилкові та повільні (>1 c) запити — завжди в WARN+; успішні швидкі — DEBUG.
+    if status.is_server_error() {
+        tracing::error!("{}", fields);
+    } else if status.is_client_error() || elapsed_ms >= 1_000 {
+        tracing::warn!("{}", fields);
+    } else {
+        tracing::debug!("{}", fields);
+    }
+    response
+}
+
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if is_public_ui_request(request.method(), request.uri().path())
         || is_authorized(request.headers(), &state.api_keys)
@@ -1410,6 +1465,8 @@ async fn main() -> anyhow::Result<()> {
         // `audio_base64` може містити WAV до 120 с (base64 ~30–60 МБ);
         // для multipart-імпорту 64 МБ файлу потрібен запас на межі частин.
         .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
+        // Логування зовнішнє до auth: 401 також корисно бачити з latency.
+        .layer(middleware::from_fn(log_request))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -1526,5 +1583,13 @@ mod tests {
         }
         assert!(!is_openai_voice("Speaker_0"));
         assert!(!is_openai_voice("Тест Клон"));
+    }
+
+    #[test]
+    fn healthz_stays_public_after_logging_middleware() {
+        use axum::http::Method;
+        // `/healthz` має лишатися відкритим навіть із новим middleware-chain.
+        assert!(is_public_ui_request(&Method::GET, "/healthz"));
+        assert!(is_public_ui_request(&Method::HEAD, "/healthz"));
     }
 }

@@ -329,6 +329,28 @@ impl JobManager {
         }
     }
 
+    /// Лічильник активних job-ів за статусами (для `/healthz`).
+    ///
+    /// `queued` — чекають у черзі; `running` — виконуються воркерами.
+    /// Використовується як cheap-проксі завантаженості єдиного engine-м'ютекса:
+    /// коли `queued` росте, послідовний інференс не встигає за запитами.
+    pub fn queue_counts(&self) -> (usize, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut queued = 0usize;
+        let mut running = 0usize;
+        for job in state.values() {
+            match job.status {
+                JobStatus::Queued => queued += 1,
+                JobStatus::Running => running += 1,
+                _ => {}
+            }
+        }
+        (queued, running)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
         self.events.subscribe()
     }
