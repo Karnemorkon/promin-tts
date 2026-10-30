@@ -956,7 +956,8 @@ impl SynthService {
             sentences.push(samples);
         }
 
-        let sentences: Vec<Vec<f32>> = sentences.into_iter().filter(|c| !c.is_empty()).collect();
+        let mut sentences: Vec<Vec<f32>> =
+            sentences.into_iter().filter(|c| !c.is_empty()).collect();
         if sentences.is_empty() {
             return Err(SynthError::Internal(anyhow::anyhow!(
                 "model produced no audio samples"
