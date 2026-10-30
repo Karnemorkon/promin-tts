@@ -322,6 +322,7 @@ fn synth_error_response(error: SynthError, context: &'static str) -> Response {
 /// якщо завдання не завершилось за `state.synth_timeout` (0 = вимкнено).
 /// Робочий потік не скасовується — ONNX-виклик дописується у фоні, а клієнт
 /// отримує швидку відповідь замісь безкінечного висяння з'єднання.
+#[allow(clippy::result_large_err)] // Response у axum за замовчуванням >128 байт
 async fn with_synth_timeout<T>(
     timeout: Duration,
     context: &'static str,
