@@ -39,6 +39,8 @@ uuid.workspace = true
 url.workspace = true
 axum = { version = "0.8", features = ["multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
+rust-embed = "8"
+tower-http = { version = "0.5", features = ["cors"] }
 
 [dev-dependencies]
 hound.workspace = true

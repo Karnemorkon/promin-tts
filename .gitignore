@@ -7,6 +7,8 @@
 /models
 /desktop/node_modules
 /desktop/dist
+/crates/speech-server/web/node_modules
+/crates/speech-server/web/dist
 /.idea
 /.vscode
 .env

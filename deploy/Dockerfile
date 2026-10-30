@@ -2,6 +2,17 @@
 
 # CPU-legacy image: ONNX Runtime 1.31.0 (official x64 build).
 # Verified on AVX-only Xeon E5-2650: no AVX2/FMA required for our models.
+
+# --- Web UI (React + TypeScript + Vite) -----------------------------------
+FROM node:22-bookworm-slim AS web
+
+WORKDIR /web
+COPY crates/speech-server/web/package.json crates/speech-server/web/package-lock.json ./
+RUN npm ci
+COPY crates/speech-server/web/ ./
+RUN npm run build
+
+# --- Rust server ----------------------------------------------------------
 FROM rust:1-bookworm AS builder
 
 ARG ORT_VERSION=1.31.0
@@ -24,6 +35,7 @@ ENV ORT_STRATEGY=system \
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+COPY --from=web /web/dist ./crates/speech-server/web/dist
 RUN cargo build --release -p speech-server --bins
 
 FROM debian:bookworm-slim

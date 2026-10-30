@@ -24,6 +24,7 @@ use speech_audio::{default_streaming_wav_header, pcm16_bytes, wav_bytes, SAMPLE_
 use speech_core::jobs::{JobRequest, JobStatus};
 use speech_core::projects::{LoudnessSettings, ProjectStore};
 use tokio::sync::{broadcast, mpsc};
+use tower_http::cors::{Any, CorsLayer};
 
 mod asr;
 mod downloader;
@@ -36,6 +37,7 @@ mod pronunciation;
 mod qc;
 mod service;
 mod subtitles;
+mod web;
 mod wyoming;
 
 use downloader::{ensure_models, legacy_model_present, DownloadOptions, ModelLayout};
@@ -941,8 +943,24 @@ fn is_authorized(headers: &HeaderMap, keys: &[String]) -> bool {
             .unwrap_or(false)
 }
 
+/// Статичний веб-UI доступний без ключа: інакше користувач не зможе
+/// відкрити сторінку, щоб увести API-ключ. Усі API-шляхи захищені.
+fn is_public_ui_request(method: &axum::http::Method, path: &str) -> bool {
+    if path == "/healthz" {
+        return true;
+    }
+    // CORS-preflight не містить API-ключа і не має побічних ефектів.
+    if method == axum::http::Method::OPTIONS {
+        return true;
+    }
+    let is_read = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    is_read && !path.starts_with("/v1") && !path.starts_with("/api") && !path.starts_with("/mcp")
+}
+
 async fn require_api_key(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if request.uri().path() == "/healthz" || is_authorized(request.headers(), &state.api_keys) {
+    if is_public_ui_request(request.method(), request.uri().path())
+        || is_authorized(request.headers(), &state.api_keys)
+    {
         return next.run(request).await;
     }
     let mut response = (
@@ -1377,6 +1395,18 @@ async fn main() -> anyhow::Result<()> {
             get(get_pronunciation).put(put_pronunciation),
         )
         .route("/mcp", post(mcp::handle))
+        // Веб-інтерфейс (SPA): віддається вбудованим статичним файлом.
+        // Статичні файли — перші, щоб не перекривати API-маршрути;
+        // `/{*path}` обробляє SPA fallback (React Router).
+        .route("/", get(web::serve))
+        .route("/{*path}", get(web::serve))
+        // CORS: дозволяє кросс-доменні запити з браузера (веб-UI).
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         // `audio_base64` може містити WAV до 120 с (base64 ~30–60 МБ);
         // для multipart-імпорту 64 МБ файлу потрібен запас на межі частин.
         .layer(DefaultBodyLimit::max(80 * 1024 * 1024))
@@ -1436,6 +1466,20 @@ mod tests {
 
     fn keys() -> Vec<String> {
         vec!["secret".to_string(), "second".to_string()]
+    }
+
+    #[test]
+    fn web_ui_is_public_but_api_is_not() {
+        use axum::http::Method;
+        assert!(is_public_ui_request(&Method::GET, "/"));
+        assert!(is_public_ui_request(&Method::GET, "/projects/123"));
+        assert!(is_public_ui_request(&Method::GET, "/assets/app.js"));
+        assert!(!is_public_ui_request(&Method::GET, "/v1/projects"));
+        assert!(!is_public_ui_request(&Method::GET, "/api/voices"));
+        assert!(!is_public_ui_request(&Method::POST, "/mcp"));
+        assert!(!is_public_ui_request(&Method::POST, "/projects/123"));
+        // Preflight має проходити без ключа, інакше CORS ламається.
+        assert!(is_public_ui_request(&Method::OPTIONS, "/v1/projects"));
     }
 
     #[test]

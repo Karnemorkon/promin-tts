@@ -1,12 +1,12 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, takes, voices, export and Back-ASR QC. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.13 «Експорт окремими файлами по главах»** — повний ланцюжок
+**v0.14 «Веб-інтерфейс»** — повний ланцюжок
 `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
@@ -22,6 +22,14 @@ v0.13 додає експорт окремих глав: можна вибрат
 `<project>/exports/per-chapter/`, переживають рестарт і скасовуються
 кооперативно. Імена файлів містять id job-а, тому кілька експортів не
 перезаписують файли один одного, а невдала глава не блокує решту.
+
+v0.14 додає вбудований **веб-інтерфейс**: React + TypeScript SPA
+збирається у `crates/speech-server/web`, вбудовується в бінарник і
+відкривається за `http://<host>:8010/`. UI працює з локальним або
+віддаленим сервером, дозволяє керувати проєктами, редагувати глави,
+запускати синтез, слухати WAV, призначати голоси ролям, експортувати
+книгу та переглядати Back-ASR QC. Статичний UI доступний без API-ключа,
+а всі маршрути `/v1/*`, `/api/*` і `/mcp` лишаються захищеними.
 
 v0.12 додає зворотне розпізнавання готових глав: компактна українська
 W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує аудіо вікнами ~25 с,
@@ -112,6 +120,7 @@ crates/
 ├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP, діагностика
 ├── speech-export/      # M4B (AAC), MP3, OGG/Opus, FLAC, глави, обкладинка, SRT/VTT/ASS
 └── speech-server/      # Axum + Wyoming + MCP (HTTP і stdio-проксі promin-mcp)
+    └── web/            # React + TypeScript + Vite, вбудовується у бінарник
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
 ```
 
@@ -229,7 +238,11 @@ curl http://localhost:8010/healthz
 curl -H 'Authorization: Bearer change-me' http://localhost:8010/api/voices
 ```
 
-Порти: `8010` — HTTP/REST/OpenAI/MCP, `10200` — Wyoming (Home Assistant).
+Веб-інтерфейс: **http://localhost:8010/** — відкривається в браузері й працює
+з тим самим API. Статичні файли вбудовані в бінарник, окремий Node.js у
+рантаймі не потрібен.
+
+Порти: `8010` — HTTP/REST/OpenAI/MCP + веб-UI, `10200` — Wyoming (Home Assistant).
 Для immutable-моделей додайте `:ro` до mount-у `/data/models`, якщо всі файли вже є.
 
 ```bash
@@ -284,10 +297,53 @@ export PROMIN_WYOMING_ADDR=127.0.0.1:10200
 cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 ```
 
+## Веб-інтерфейс (v0.14)
+
+Веб-UI — основний інтерфейс для роботи з проєктами. Він збирається з
+`crates/speech-server/web` (React 18 + TypeScript + Vite + Tailwind) і
+вбудовується у `speech-server` через `rust-embed`.
+
+Можливості MVP:
+
+- підключення до локального або віддаленого сервера (URL + API-ключ);
+- список, створення та видалення проєктів; імпорт `EPUB`, `FB2`, `PDF`,
+  `DOCX`, `TXT`, `Markdown` і `.speechproj`;
+- редактор глав (назва, текст) зі статусами `empty`/`queued`/`running`/
+  `completed`/`failed`/`stale`;
+- синтез глави або всієї книги, прогрес job-ів і скасування;
+- прослуховування готового WAV глави;
+- ролі діалогу, голос нарації та швидкість;
+- експорт книги й окремих глав у `M4B`/`MP3`/`OGG`/`FLAC` із субтитрами;
+- запуск і перегляд Back-ASR QC (WER/CER, проблемні сегменти).
+
+Статуси job-ів оновлюються опитуванням кожні 3 секунди: SSE-ендпоінт
+`/v1/jobs/{id}/events` існує, але браузерний `EventSource` не передає
+заголовок `Authorization`, тому UI поки не використовує його.
+
+Збірка фронтенду (потрібен Node.js 20+):
+
+```bash
+cd crates/speech-server/web
+npm ci
+npm run build
+```
+
+`cargo build` без зібраного фронтенду створює placeholder-сторінку через
+`build.rs`, тому збірка не падає. Docker і CI збирають справжній UI.
+
+Для розробки з гарячим перезавантаженням:
+
+```bash
+cd crates/speech-server/web
+npm run dev   # http://localhost:5173, проксі на 127.0.0.1:8010
+```
+
 ## API
 
-Усі маршрути, крім `GET /healthz`, захищені, якщо задано `PROMIN_API_KEYS`
-(`Authorization: Bearer <key>` або `X-API-Key: <key>`).
+Усі маршрути API (`/v1/*`, `/api/*`, `/mcp`) захищені, якщо задано
+`PROMIN_API_KEYS` (`Authorization: Bearer <key>` або `X-API-Key: <key>`).
+Статичний веб-UI (`/`, `/assets/*`) і `GET /healthz` доступні без ключа,
+інакше неможливо було б відкрити сторінку для введення ключа.
 
 | Метод | Шлях | Опис |
 |---|---|---|
