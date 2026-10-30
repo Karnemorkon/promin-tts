@@ -1,0 +1,20 @@
+[package]
+name = "speech-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Ukrainian W2V-BERT ASR inference and transcript diff for Back-ASR quality control"
+
+[dependencies]
+asr-features.workspace = true
+anyhow.workspace = true
+ndarray.workspace = true
+ort.workspace = true
+sentencepiece.workspace = true
+serde.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
