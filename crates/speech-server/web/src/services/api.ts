@@ -4,6 +4,7 @@ import type {
   CreateProjectRequest,
   UpdateProjectRequest,
   UpdateChapterRequest,
+  AddChapterRequest,
   Chapter,
   JobStatus,
   ModelInfo,
@@ -68,9 +69,12 @@ function authHeaders(): Record<string, string> {
 
 async function request<T>(path: string, opts?: RequestInit): Promise<T> {
   const url = `${getBaseUrl()}${path}`;
+  // FormData потребує Content-Type із boundary, який виставляє браузер.
+  const isFormData = opts?.body instanceof FormData;
+  const baseHeaders = isFormData ? authHeaders() : headers();
   const res = await fetch(url, {
     ...opts,
-    headers: { ...headers(), ...(opts?.headers as Record<string, string> | undefined) },
+    headers: { ...baseHeaders, ...(opts?.headers as Record<string, string> | undefined) },
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -127,6 +131,13 @@ export function importProject(formData: FormData) {
 }
 
 /* ---------- Chapters ---------- */
+export function addChapter(id: string, body: AddChapterRequest) {
+  return request<Chapter>(`/v1/projects/${id}/chapters`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
 export function updateChapter(id: string, index: number, body: UpdateChapterRequest) {
   return request<Chapter>(`/v1/projects/${id}/chapters/${index}`, {
     method: 'PUT',
