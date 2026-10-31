@@ -65,6 +65,7 @@ import type {
 } from '../types';
 import type { ExportRecord } from '../services/api';
 import { useAudioUrl } from '../hooks/useAudioUrl';
+import VoicePreviewButton from '../components/VoicePreviewButton';
 
 type Tab = 'editor' | 'roles' | 'takes' | 'export' | 'qc';
 
@@ -101,6 +102,8 @@ export default function ProjectEditor() {
   const [editingChapter, setEditingChapter] = useState<number | null>(null);
   const [chapterText, setChapterText] = useState('');
   const [chapterTitle, setChapterTitle] = useState('');
+  const [showAddChapter, setShowAddChapter] = useState(false);
+  const [newChapterTitle, setNewChapterTitle] = useState('');
 
   const [jobs, setJobs] = useState<JobStatus[]>([]);
   const [voices, setVoices] = useState<VoicesResponse | null>(null);
@@ -277,6 +280,32 @@ export default function ProjectEditor() {
     [jobs, id]
   );
 
+  const allVoices = useMemo(() => {
+    const list = [...(voices?.voices ?? []), ...(voices?.custom ?? [])];
+    return Array.from(new Set(list));
+  }, [voices]);
+
+  /** Підпис голосу для селектів: локальна назва + технічна назва. */
+  function voiceLabel(name: string, custom = false): string {
+    const alias = project?.settings.voice_aliases?.[name]?.trim();
+    const base = alias ? `${alias} (${name})` : name;
+    return custom ? `${base} · клон` : base;
+  }
+
+  function updateVoiceAlias(name: string, alias: string) {
+    if (!project) return;
+    const aliases = { ...(project.settings.voice_aliases ?? {}) };
+    if (alias.trim()) {
+      aliases[name] = alias;
+    } else {
+      delete aliases[name];
+    }
+    setProject({
+      ...project,
+      settings: { ...project.settings, voice_aliases: aliases },
+    });
+  }
+
   async function handleSaveProject() {
     if (!project || !id) return;
     if (project.roles.some((role) => !role.name.trim())) {
@@ -293,7 +322,7 @@ export default function ProjectEditor() {
         settings: project.settings,
         roles: project.roles,
       });
-      setProject(updated);
+      setProject({ ...updated, roles: updated.roles ?? [] });
       setNotice('Проєкт збережено');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Не вдалося зберегти проєкт');
@@ -328,25 +357,34 @@ export default function ProjectEditor() {
 
   async function handleAddChapter() {
     if (!id) return;
-    const suggested = `Розділ ${(project?.chapters.length ?? 0) + 1}`;
-    const title = window.prompt('Назва нової глави:', suggested);
-    if (title === null) return;
+    const title =
+      newChapterTitle.trim() ||
+      `Розділ ${(project?.chapters.length ?? 0) + 1}`;
     setLoading(true);
     setError(null);
     setNotice(null);
     try {
       const chapter = await addChapter(id, {
-        title: title.trim() || undefined,
+        title,
         text: '',
       });
       await loadProject();
       startEdit(chapter);
+      setShowAddChapter(false);
+      setNewChapterTitle('');
       setNotice('Главу додано');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Не вдалося додати главу');
     } finally {
       setLoading(false);
     }
+  }
+
+  function openAddChapter() {
+    setNewChapterTitle(`Розділ ${(project?.chapters.length ?? 0) + 1}`);
+    setShowAddChapter(true);
+    setError(null);
+    setNotice(null);
   }
 
   async function handleActivateTake(unit: number, take: number) {
@@ -789,13 +827,15 @@ export default function ProjectEditor() {
               </h2>
               <div className="flex items-center gap-1">
                 <button
-                  onClick={() => handleAddChapter()}
+                  onClick={() =>
+                    showAddChapter ? setShowAddChapter(false) : openAddChapter()
+                  }
                   disabled={loading}
                   className="flex items-center gap-1 text-xs bg-white border border-gray-300 text-gray-700 px-2 py-1 rounded hover:bg-gray-50 disabled:opacity-50"
-                  title="Додати главу"
+                  title={showAddChapter ? 'Скасувати додавання' : 'Додати главу'}
                 >
                   <Plus className="w-3 h-3" />
-                  Додати
+                  {showAddChapter ? 'Скасувати' : 'Додати'}
                 </button>
                 <button
                   onClick={() => handleGenerate()}
@@ -806,12 +846,51 @@ export default function ProjectEditor() {
                 </button>
               </div>
             </div>
+            {showAddChapter && (
+              <div className="p-3 border-b border-gray-200 bg-blue-50">
+                <label className="block text-xs font-medium text-gray-600 mb-1">
+                  Назва нової глави
+                </label>
+                <input
+                  autoFocus
+                  value={newChapterTitle}
+                  onChange={(e) => setNewChapterTitle(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      void handleAddChapter();
+                    } else if (e.key === 'Escape') {
+                      setShowAddChapter(false);
+                    }
+                  }}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                  placeholder="Наприклад, Розділ 2"
+                />
+                <div className="flex items-center gap-2 mt-2">
+                  <button
+                    onClick={() => void handleAddChapter()}
+                    disabled={loading}
+                    className="flex items-center gap-1 px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    Створити
+                  </button>
+                  <button
+                    onClick={() => setShowAddChapter(false)}
+                    disabled={loading}
+                    className="px-3 py-1.5 text-sm text-gray-600 hover:bg-white rounded-lg disabled:opacity-50"
+                  >
+                    Скасувати
+                  </button>
+                </div>
+              </div>
+            )}
             <div className="flex-1 overflow-y-auto">
               {project.chapters.length === 0 && (
                 <div className="p-4 text-center text-sm text-gray-500">
                   <p className="mb-3">У проєкті ще немає глав.</p>
                   <button
-                    onClick={() => handleAddChapter()}
+                    onClick={openAddChapter}
                     disabled={loading}
                     className="inline-flex items-center gap-1 px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
                   >
@@ -986,33 +1065,41 @@ export default function ProjectEditor() {
                 <label className="block text-xs font-medium text-gray-500 mb-1">
                   Голос нарації
                 </label>
-                <select
-                  value={project.settings.voice ?? ''}
-                  onChange={(e) =>
-                    setProject({
-                      ...project,
-                      settings: {
-                        ...project.settings,
-                        voice: e.target.value || undefined,
-                      },
-                    })
-                  }
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
-                >
-                  <option value="">
-                    За замовчуванням{voices?.default ? ` (${voices.default})` : ''}
-                  </option>
-                  {voices?.voices.map((v) => (
-                    <option key={v} value={v}>
-                      {v}
+                <div className="flex items-center gap-2">
+                  <select
+                    value={project.settings.voice ?? ''}
+                    onChange={(e) =>
+                      setProject({
+                        ...project,
+                        settings: {
+                          ...project.settings,
+                          voice: e.target.value || undefined,
+                        },
+                      })
+                    }
+                    className="flex-1 min-w-0 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                  >
+                    <option value="">
+                      За замовчуванням
+                      {voices?.default ? ` (${voiceLabel(voices.default)})` : ''}
                     </option>
-                  ))}
-                  {voices?.custom.map((v) => (
-                    <option key={v} value={v}>
-                      {v} (клон)
-                    </option>
-                  ))}
-                </select>
+                    {voices?.voices.map((v) => (
+                      <option key={v} value={v}>
+                        {voiceLabel(v)}
+                      </option>
+                    ))}
+                    {voices?.custom.map((v) => (
+                      <option key={v} value={v}>
+                        {voiceLabel(v, true)}
+                      </option>
+                    ))}
+                  </select>
+                  <VoicePreviewButton
+                    voice={project.settings.voice}
+                    speed={project.settings.speed}
+                    title="Прослухати голос нарації"
+                  />
+                </div>
               </div>
               <div>
                 <label className="block text-xs font-medium text-gray-500 mb-1">
@@ -1070,23 +1157,30 @@ export default function ProjectEditor() {
                 </div>
                 <div className="flex-1 min-w-40">
                   <label className="block text-xs text-gray-500 mb-1">Голос</label>
-                  <select
-                    value={newRoleVoice}
-                    onChange={(e) => setNewRoleVoice(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
-                  >
-                    <option value="">Голос проєкту</option>
-                    {voices?.voices.map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                    {voices?.custom.map((v) => (
-                      <option key={v} value={v}>
-                        {v} (клон)
-                      </option>
-                    ))}
-                  </select>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={newRoleVoice}
+                      onChange={(e) => setNewRoleVoice(e.target.value)}
+                      className="flex-1 min-w-0 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                    >
+                      <option value="">Голос проєкту</option>
+                      {voices?.voices.map((v) => (
+                        <option key={v} value={v}>
+                          {voiceLabel(v)}
+                        </option>
+                      ))}
+                      {voices?.custom.map((v) => (
+                        <option key={v} value={v}>
+                          {voiceLabel(v, true)}
+                        </option>
+                      ))}
+                    </select>
+                    <VoicePreviewButton
+                      voice={newRoleVoice || project.settings.voice}
+                      speed={project.settings.speed}
+                      title="Прослухати голос нової ролі"
+                    />
+                  </div>
                 </div>
                 <button
                   onClick={handleAddRole}
@@ -1123,15 +1217,20 @@ export default function ProjectEditor() {
                       <option value="">Голос проєкту</option>
                       {voices?.voices.map((v) => (
                         <option key={v} value={v}>
-                          {v}
+                          {voiceLabel(v)}
                         </option>
                       ))}
                       {voices?.custom.map((v) => (
                         <option key={v} value={v}>
-                          {v} (клон)
+                          {voiceLabel(v, true)}
                         </option>
                       ))}
                     </select>
+                    <VoicePreviewButton
+                      voice={role.voice ?? project.settings.voice}
+                      speed={project.settings.speed}
+                      title={`Прослухати голос ролі «${role.name}»`}
+                    />
                     <button
                       onClick={() => handleDeleteRole(i)}
                       title="Видалити роль"
@@ -1143,6 +1242,47 @@ export default function ProjectEditor() {
                 ))}
               </div>
             )}
+
+            <details className="mt-5 border border-gray-200 rounded-lg">
+              <summary className="cursor-pointer select-none px-4 py-3 text-sm font-medium text-gray-700">
+                Назви голосів
+              </summary>
+              <div className="px-4 pb-4 space-y-2">
+                <p className="text-xs text-gray-500">
+                  Задайте зрозумілі назви для голосів — вони з'являться в усіх
+                  селектах. Порожнє поле повертає технічну назву.
+                </p>
+                {allVoices.length === 0 ? (
+                  <p className="text-xs text-gray-400">Список голосів недоступний.</p>
+                ) : (
+                  allVoices.map((v) => (
+                    <div key={v} className="flex items-center gap-2">
+                      <span
+                        className="w-32 shrink-0 truncate font-mono text-xs text-gray-500"
+                        title={v}
+                      >
+                        {v}
+                      </span>
+                      <input
+                        value={project.settings.voice_aliases?.[v] ?? ''}
+                        onChange={(e) => updateVoiceAlias(v, e.target.value)}
+                        placeholder="Назва для відображення"
+                        className="flex-1 min-w-0 px-3 py-1.5 border border-gray-300 rounded-lg text-sm bg-white"
+                      />
+                      <VoicePreviewButton
+                        voice={v}
+                        speed={project.settings.speed}
+                        title={`Прослухати ${v}`}
+                      />
+                    </div>
+                  ))
+                )}
+                <p className="text-xs text-gray-400">
+                  Зміни зберігаються кнопкою «Зберегти ролі».
+                </p>
+              </div>
+            </details>
+
             <div className="mt-4 flex justify-end">
               <button
                 onClick={handleSaveProject}
@@ -1568,23 +1708,30 @@ export default function ProjectEditor() {
                             <label className="block text-xs font-medium text-gray-500 mb-1">
                               Голос
                             </label>
-                            <select
-                              value={regenVoice}
-                              onChange={(e) => setRegenVoice(e.target.value)}
-                              className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white"
-                            >
-                              <option value="">
-                                Як у проєкті / активному тейку
-                              </option>
-                              {[
-                                ...(voices?.voices ?? []),
-                                ...(voices?.custom ?? []),
-                              ].map((voice) => (
-                                <option key={voice} value={voice}>
-                                  {voice}
+                            <div className="flex items-center gap-2">
+                              <select
+                                value={regenVoice}
+                                onChange={(e) => setRegenVoice(e.target.value)}
+                                className="flex-1 min-w-0 px-3 py-2 border border-gray-300 rounded-lg bg-white"
+                              >
+                                <option value="">
+                                  Як у проєкті / активному тейку
                                 </option>
-                              ))}
-                            </select>
+                                {allVoices.map((voice) => (
+                                  <option key={voice} value={voice}>
+                                    {voiceLabel(
+                                      voice,
+                                      voices?.custom.includes(voice) ?? false
+                                    )}
+                                  </option>
+                                ))}
+                              </select>
+                              <VoicePreviewButton
+                                voice={regenVoice || project.settings.voice}
+                                speed={Number(regenSpeed) || project.settings.speed}
+                                title="Прослухати голос для нового тейку"
+                              />
+                            </div>
                           </div>
                           <div>
                             <label className="block text-xs font-medium text-gray-500 mb-1">

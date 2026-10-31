@@ -1,12 +1,12 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, roles, export and Back-ASR QC. v0.15 adds a **takes editor** to that UI: per-sentence A/B playback, regeneration with another voice/speed/text, activation and deletion of versions. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, roles, export and Back-ASR QC. v0.15 adds a **takes editor** to that UI: per-sentence A/B playback, regeneration with another voice/speed/text, activation and deletion of versions. v0.16 adds **role management** with inline dialogue markup. v0.17 adds **voice previews** before applying a voice, **local voice aliases** for friendlier names, a **collapsible sidebar**, and an inline chapter-creation form that does not depend on browser prompts. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
 ## Статус
 
-**v0.16 «Керування ролями»** — повний ланцюжок
+**v0.17 «Прослуховування голосів»** — повний ланцюжок
 `текст → вербалізація → наголос → фонеми → ONNX → WAV`
 плюс клонування голосу, асинхронна черга, потоковий синтез, інтеграції,
 озвучення книг по главах з LUFS-нормалізацією і субтитрами, імпорт PDF,
@@ -43,6 +43,12 @@ v0.16 додає керування ролями у веб-інтерфейсі:
 виділити фрагмент тексту й позначити його реплікою обраної ролі. Заодно
 виправлено білий екран на вкладці «Ролі» для старих проєктів, де поле
 `roles` було відсутнє в JSON.
+
+v0.17 додає прослуховування короткого зразка голосу перед застосуванням
+(кнопка біля кожного селекта голосу та в списку назв), локальні назви
+голосів (`voice_aliases` у налаштуваннях проєкту), згортуваний лівий
+сайдбар зі збереженням стану та вбудовану форму створення глави замість
+`window.prompt`, який блокується в деяких браузерах.
 
 v0.12 додає зворотне розпізнавання готових глав: компактна українська
 W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує аудіо вікнами ~25 с,

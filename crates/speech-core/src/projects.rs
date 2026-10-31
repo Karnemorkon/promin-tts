@@ -5,7 +5,7 @@
 //! (унікальний `.tmp` + rename), тому перерваний процес не залишає
 //! напівфайлів.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -276,6 +276,9 @@ pub struct ProjectSettings {
     pub raw_stress: bool,
     #[serde(default)]
     pub loudness: LoudnessSettings,
+    /// Локальні назви голосів: технічна назва (`Speaker_1`) -> підпис у UI.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub voice_aliases: BTreeMap<String, String>,
 }
 
 impl Default for ProjectSettings {
@@ -288,6 +291,7 @@ impl Default for ProjectSettings {
             auto_verbalize: None,
             raw_stress: false,
             loudness: LoudnessSettings::default(),
+            voice_aliases: BTreeMap::new(),
         }
     }
 }
@@ -306,6 +310,17 @@ impl ProjectSettings {
         if let Some(voice) = &self.voice {
             if voice.chars().count() > 100 {
                 bail!("voice name is too long");
+            }
+        }
+        if self.voice_aliases.len() > 200 {
+            bail!("too many voice aliases");
+        }
+        for (name, alias) in &self.voice_aliases {
+            if name.trim().is_empty() || alias.trim().is_empty() {
+                bail!("voice alias must not be empty");
+            }
+            if name.chars().count() > 100 || alias.chars().count() > 100 {
+                bail!("voice alias is too long");
             }
         }
         self.loudness.validate()
@@ -543,6 +558,15 @@ impl Project {
     /// та оновити версію.
     pub fn normalize(&mut self) {
         self.version = PROJECT_SCHEMA_VERSION;
+        let aliases = std::mem::take(&mut self.settings.voice_aliases);
+        self.settings.voice_aliases = aliases
+            .into_iter()
+            .filter_map(|(name, alias)| {
+                let name = name.trim().to_string();
+                let alias = alias.trim().to_string();
+                (!name.is_empty() && !alias.is_empty()).then_some((name, alias))
+            })
+            .collect();
         for role in &mut self.roles {
             role.normalize();
         }
@@ -1385,6 +1409,32 @@ mod tests {
         }"#;
         let project: Project = serde_json::from_str(json).unwrap();
         assert!(project.roles.is_empty());
+        assert!(project.settings.voice_aliases.is_empty());
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn voice_aliases_are_normalized_and_validated() {
+        let mut project = sample_project();
+        project
+            .settings
+            .voice_aliases
+            .insert(" Speaker_1 ".to_string(), " Анна ".to_string());
+        project
+            .settings
+            .voice_aliases
+            .insert("Speaker_2".to_string(), "  ".to_string());
+        project.normalize();
+
+        assert_eq!(
+            project
+                .settings
+                .voice_aliases
+                .get("Speaker_1")
+                .map(String::as_str),
+            Some("Анна")
+        );
+        assert!(!project.settings.voice_aliases.contains_key("Speaker_2"));
         assert!(project.validate().is_ok());
     }
 }

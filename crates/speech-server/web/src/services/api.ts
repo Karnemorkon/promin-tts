@@ -113,6 +113,40 @@ export function getProject(id: string) {
   return request<Project>(`/v1/projects/${id}`);
 }
 
+/**
+ * Короткий зразок голосу для прослуховування перед застосуванням.
+ *
+ * Використовує той самий `/api/synthesize`, що й основний синтез, але
+ * повертає WAV як Blob, щоб UI міг відтворити його без збереження файлу.
+ */
+export async function synthesizeVoiceSample(
+  text: string,
+  voice?: string,
+  speed = 1
+): Promise<Blob> {
+  const res = await fetch(`${getBaseUrl()}/api/synthesize`, {
+    method: 'POST',
+    headers: headers(),
+    body: JSON.stringify({
+      text,
+      voice: voice || undefined,
+      speed,
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    let message = errText;
+    try {
+      const parsed = JSON.parse(errText) as { error?: string };
+      if (parsed.error) message = parsed.error;
+    } catch {
+      /* тіло не JSON — лишаємо як є */
+    }
+    throw new Error(message || `${res.status} ${res.statusText}`);
+  }
+  return res.blob();
+}
+
 export function updateProject(id: string, body: UpdateProjectRequest) {
   return request<Project>(`/v1/projects/${id}`, {
     method: 'PUT',

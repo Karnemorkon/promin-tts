@@ -26,6 +26,8 @@ export interface ProjectSettings {
   auto_verbalize?: unknown;
   raw_stress: boolean;
   loudness: LoudnessSettings;
+  /** Локальні назви голосів: технічна назва -> підпис у UI. */
+  voice_aliases?: Record<string, string>;
 }
 
 export interface ChunkTiming {
