@@ -279,6 +279,10 @@ export default function ProjectEditor() {
 
   async function handleSaveProject() {
     if (!project || !id) return;
+    if (project.roles.some((role) => !role.name.trim())) {
+      setError('Ім\'я ролі не може бути порожнім');
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
