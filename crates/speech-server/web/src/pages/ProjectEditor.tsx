@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -125,6 +125,11 @@ export default function ProjectEditor() {
   const [regenVoice, setRegenVoice] = useState('');
   const [regenSpeed, setRegenSpeed] = useState('1');
 
+  const [newRoleName, setNewRoleName] = useState('');
+  const [newRoleVoice, setNewRoleVoice] = useState('');
+  const [assignRole, setAssignRole] = useState('');
+  const chapterTextRef = useRef<HTMLTextAreaElement>(null);
+
   useEffect(() => {
     setTakesChapter('');
     setTakes(null);
@@ -187,7 +192,8 @@ export default function ProjectEditor() {
     if (!id) return;
     try {
       const p = await getProject(id);
-      setProject(p);
+      // Старі проєкти (до v0.8) не містять поля roles у JSON.
+      setProject({ ...p, roles: p.roles ?? [] });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Не вдалося завантажити проєкт');
     }
@@ -571,6 +577,93 @@ export default function ProjectEditor() {
     setProject({ ...project, roles });
   }
 
+  function updateRoleName(index: number, name: string) {
+    if (!project) return;
+    const roles = project.roles.map((role, i) =>
+      i === index ? { ...role, name } : role
+    );
+    setProject({ ...project, roles });
+  }
+
+  function handleAddRole() {
+    if (!project) return;
+    const name = newRoleName.trim();
+    if (!name) {
+      setError('Введіть ім\'я ролі');
+      return;
+    }
+    if (name.includes(':') || name.includes('[') || name.includes(']')) {
+      setError('Ім\'я ролі не може містити двокрапку або дужки');
+      return;
+    }
+    if (
+      project.roles.some(
+        (role) => role.name.trim().toLowerCase() === name.toLowerCase()
+      )
+    ) {
+      setError('Роль з таким ім\'ям уже існує');
+      return;
+    }
+    setProject({
+      ...project,
+      roles: [
+        ...project.roles,
+        { name, voice: newRoleVoice || undefined },
+      ],
+    });
+    setNewRoleName('');
+    setNewRoleVoice('');
+    setError(null);
+    setNotice(`Роль «${name}» додано. Натисніть «Зберегти ролі».`);
+  }
+
+  function handleDeleteRole(index: number) {
+    if (!project) return;
+    const role = project.roles[index];
+    if (!window.confirm(`Видалити роль «${role.name}»?`)) return;
+    setProject({
+      ...project,
+      roles: project.roles.filter((_, i) => i !== index),
+    });
+    setNotice(`Роль «${role.name}» видалено. Натисніть «Зберегти ролі».`);
+  }
+
+  /**
+   * Позначити виділений у редакторі глави текст як репліку ролі.
+   *
+   * Парсер діалогів розпізнає роль лише на початку рядка, тому перед
+   * виділенням додаємо `Ім'я: `; якщо виділення починається всередині
+   * рядка — спершу переносимо його на новий рядок.
+   */
+  function handleAssignRoleToSelection() {
+    const textarea = chapterTextRef.current;
+    if (!textarea) return;
+    if (!assignRole) {
+      setError('Оберіть роль для виділеного тексту');
+      return;
+    }
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    if (start === end) {
+      setError('Спочатку виділіть текст у редакторі глави');
+      return;
+    }
+    const selected = chapterText.slice(start, end);
+    const atLineStart = start === 0 || chapterText[start - 1] === '\n';
+    const prefix = atLineStart ? `${assignRole}: ` : `\n${assignRole}: `;
+    const next = chapterText.slice(0, start) + prefix + chapterText.slice(start);
+    setChapterText(next);
+    setError(null);
+    setNotice(
+      `Текст позначено як репліка ролі «${assignRole}». Не забудьте зберегти главу.`
+    );
+    window.requestAnimationFrame(() => {
+      const caret = start + prefix.length + selected.length;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    });
+  }
+
   if (!project) {
     return (
       <div className="flex-1 flex items-center justify-center">
@@ -813,11 +906,49 @@ export default function ProjectEditor() {
                       Текст
                     </label>
                     <textarea
+                      ref={chapterTextRef}
                       value={chapterText}
                       onChange={(e) => setChapterText(e.target.value)}
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-gray-900 font-mono text-sm leading-relaxed"
                       rows={24}
                     />
+                  </div>
+                  <div className="p-3 bg-blue-50 border border-blue-100 rounded-lg">
+                    <p className="text-xs font-medium text-blue-900 mb-2">
+                      Призначити виділений текст ролі
+                    </p>
+                    {project.roles.length === 0 ? (
+                      <p className="text-xs text-blue-800">
+                        Спершу додайте роль на вкладці «Ролі».
+                      </p>
+                    ) : (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          value={assignRole}
+                          onChange={(e) => setAssignRole(e.target.value)}
+                          className="px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white min-w-48"
+                        >
+                          <option value="">Оберіть роль</option>
+                          {project.roles.map((role) => (
+                            <option key={role.name} value={role.name}>
+                              {role.name}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={handleAssignRoleToSelection}
+                          className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                        >
+                          <Users className="w-4 h-4" />
+                          Позначити репліку
+                        </button>
+                        <p className="text-xs text-blue-800">
+                          Виділіть фрагмент у полі «Текст» вище, оберіть роль і
+                          натисніть кнопку. Перед текстом з'явиться{' '}
+                          <code className="font-mono">Ім'я:</code>.
+                        </p>
+                      </div>
+                    )}
                   </div>
                 </div>
               </>
@@ -903,18 +1034,83 @@ export default function ProjectEditor() {
               </div>
             </div>
 
+            <div className="mb-5 p-3 bg-blue-50 border border-blue-100 rounded-lg">
+              <p className="text-xs font-medium text-blue-900 mb-1">
+                Як позначити репліку ролі в тексті
+              </p>
+              <p className="text-xs text-blue-800">
+                На початку рядка напишіть <code className="font-mono">Ім'я: текст</code>{' '}
+                або <code className="font-mono">[Ім'я] текст</code>. Усе інше —
+                нарація голосом проєкту. У редакторі глави можна виділити
+                фрагмент і призначити його ролі кнопкою.
+              </p>
+            </div>
+
+            <div className="mb-5 p-3 bg-gray-50 rounded-lg">
+              <p className="text-xs font-medium text-gray-500 mb-2">Додати роль</p>
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="flex-1 min-w-40">
+                  <label className="block text-xs text-gray-500 mb-1">Ім'я</label>
+                  <input
+                    value={newRoleName}
+                    onChange={(e) => setNewRoleName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleAddRole();
+                      }
+                    }}
+                    placeholder="Наприклад, Анна"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                  />
+                </div>
+                <div className="flex-1 min-w-40">
+                  <label className="block text-xs text-gray-500 mb-1">Голос</label>
+                  <select
+                    value={newRoleVoice}
+                    onChange={(e) => setNewRoleVoice(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                  >
+                    <option value="">Голос проєкту</option>
+                    {voices?.voices.map((v) => (
+                      <option key={v} value={v}>
+                        {v}
+                      </option>
+                    ))}
+                    {voices?.custom.map((v) => (
+                      <option key={v} value={v}>
+                        {v} (клон)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  onClick={handleAddRole}
+                  className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                >
+                  <Plus className="w-4 h-4" />
+                  Додати роль
+                </button>
+              </div>
+            </div>
+
             {project.roles.length === 0 ? (
               <p className="text-sm text-gray-500">
-                Ролей ще немає. Вони з'являться після імпорту книги з діалогами.
+                Ролей ще немає. Додайте роль вище або імпортуйте книгу з
+                діалогами.
               </p>
             ) : (
               <div className="space-y-2">
                 {project.roles.map((role, i) => (
                   <div
-                    key={`${role.name}-${i}`}
-                    className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg"
+                    key={i}
+                    className="flex flex-wrap items-center gap-2 p-3 bg-gray-50 rounded-lg"
                   >
-                    <span className="flex-1 font-medium text-gray-900">{role.name}</span>
+                    <input
+                      value={role.name}
+                      onChange={(e) => updateRoleName(i, e.target.value)}
+                      className="flex-1 min-w-40 px-3 py-1.5 border border-gray-300 rounded-lg text-sm bg-white font-medium text-gray-900"
+                    />
                     <select
                       value={role.voice ?? ''}
                       onChange={(e) => updateRoleVoice(i, e.target.value)}
@@ -932,6 +1128,13 @@ export default function ProjectEditor() {
                         </option>
                       ))}
                     </select>
+                    <button
+                      onClick={() => handleDeleteRole(i)}
+                      title="Видалити роль"
+                      className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
                 ))}
               </div>
