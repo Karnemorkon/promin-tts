@@ -311,7 +311,7 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 - список, створення та видалення проєктів; імпорт `EPUB`, `FB2`, `PDF`,
   `DOCX`, `TXT`, `Markdown` і `.speechproj`;
 - редактор глав (назва, текст) зі статусами `empty`/`queued`/`running`/
-  `completed`/`failed`/`stale`;
+  `completed`/`failed`/`stale`; додавання глав до наявного проєкту;
 - синтез глави або всієї книги, прогрес job-ів і скасування;
 - прослуховування готового WAV глави;
 - ролі діалогу, голос нарації та швидкість;
@@ -368,6 +368,7 @@ npm run dev   # http://localhost:5173, проксі на 127.0.0.1:8010
 | `DELETE` | `/v1/projects/{id}` | Скасувати job-и глави та видалити проєкт |
 | `PUT` | `/v1/projects/{id}/pronunciation` | Замінити проєктний словник вимови |
 | `POST` | `/v1/projects/{id}/generate` | Поставити глави в чергу (`chapters?`, `force?`) |
+| `POST` | `/v1/projects/{id}/chapters` | Додати главу в кінець проєкту (`title?`, `text?`) |
 | `GET`/`PUT` | `/v1/projects/{id}/chapters/{i}` | Отримати/змінити назву й текст глави |
 | `GET` | `/v1/projects/{id}/chapters/{i}/audio` | Готовий WAV глави |
 | `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt\|ass` | Субтитри глави (ASS — з послівним караоке) |

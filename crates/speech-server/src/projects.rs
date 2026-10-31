@@ -19,7 +19,7 @@ use speech_audio::{decode_wav_f32, LoudnessTarget, SAMPLE_RATE};
 use speech_core::jobs::JobRequest;
 use speech_core::projects::{
     now_rfc3339, valid_project_id, validate_roles, Chapter, ChapterStatus, LoudnessSettings,
-    Project, ProjectSettings, ProjectStore, PronunciationRule, Role, MAX_TITLE_CHARS,
+    Project, ProjectSettings, ProjectStore, PronunciationRule, Role, MAX_CHAPTERS, MAX_TITLE_CHARS,
 };
 use speech_core::takes::{chapter_fingerprint, sha256_hex, Take, TakeManifest, MAX_TAKES_PER_UNIT};
 use speech_text::import::{import_book, ImportError, ImportedBook};
@@ -183,6 +183,14 @@ pub struct UpdateChapterRequest {
     title: Option<String>,
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddChapterRequest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -744,6 +752,41 @@ pub async fn update_chapter(
             .expect("chapter index validated above")
             .clone(),
     ))
+}
+
+/// `POST /v1/projects/{id}/chapters`: додати главу в кінець проєкту.
+pub async fn add_chapter(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AddChapterRequest>,
+) -> Result<Response, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let mut project = load_project(&state, &id)?;
+    if project.chapters.len() >= MAX_CHAPTERS {
+        return Err(ProjectApiError::bad(format!(
+            "project has too many chapters: {}",
+            project.chapters.len()
+        )));
+    }
+    let index = project.chapters.len();
+    let title = request
+        .title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("Розділ {}", index + 1));
+    project
+        .chapters
+        .push(Chapter::new(index, title, request.text));
+    save_project(&state.projects, &mut project)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            project
+                .chapter(index)
+                .expect("chapter appended above")
+                .clone(),
+        ),
+    )
+        .into_response())
 }
 
 /// `GET /v1/projects/{id}/chapters/{index}/audio`: готовий WAV глави.

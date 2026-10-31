@@ -100,6 +100,11 @@ export interface UpdateChapterRequest {
   text?: string;
 }
 
+export interface AddChapterRequest {
+  title?: string;
+  text?: string;
+}
+
 export interface JobStatus {
   id: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';

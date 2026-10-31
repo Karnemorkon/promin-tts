@@ -16,11 +16,13 @@ import {
   AlertTriangle,
   CheckCircle2,
   Clock,
+  Plus,
 } from 'lucide-react';
 import {
   getProject,
   updateProject,
   deleteProject,
+  addChapter,
   updateChapter,
   listJobs,
   cancelJob,
@@ -258,6 +260,29 @@ export default function ProjectEditor() {
     }
   }
 
+  async function handleAddChapter() {
+    if (!id) return;
+    const suggested = `Розділ ${(project?.chapters.length ?? 0) + 1}`;
+    const title = window.prompt('Назва нової глави:', suggested);
+    if (title === null) return;
+    setLoading(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const chapter = await addChapter(id, {
+        title: title.trim() || undefined,
+        text: '',
+      });
+      await loadProject();
+      startEdit(chapter);
+      setNotice('Главу додано');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Не вдалося додати главу');
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleGenerate(chapterIndex?: number) {
     if (!id) return;
     setError(null);
@@ -485,15 +510,39 @@ export default function ProjectEditor() {
               <h2 className="font-semibold text-gray-900">
                 Глави <span className="text-gray-400 font-normal">({project.chapters.length})</span>
               </h2>
-              <button
-                onClick={() => handleGenerate()}
-                className="flex items-center gap-1 text-xs bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-700"
-              >
-                <Play className="w-3 h-3" />
-                Синтез усіх
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => handleAddChapter()}
+                  disabled={loading}
+                  className="flex items-center gap-1 text-xs bg-white border border-gray-300 text-gray-700 px-2 py-1 rounded hover:bg-gray-50 disabled:opacity-50"
+                  title="Додати главу"
+                >
+                  <Plus className="w-3 h-3" />
+                  Додати
+                </button>
+                <button
+                  onClick={() => handleGenerate()}
+                  className="flex items-center gap-1 text-xs bg-blue-600 text-white px-2 py-1 rounded hover:bg-blue-700"
+                >
+                  <Play className="w-3 h-3" />
+                  Синтез усіх
+                </button>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto">
+              {project.chapters.length === 0 && (
+                <div className="p-4 text-center text-sm text-gray-500">
+                  <p className="mb-3">У проєкті ще немає глав.</p>
+                  <button
+                    onClick={() => handleAddChapter()}
+                    disabled={loading}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    <Plus className="w-4 h-4" />
+                    Додати першу главу
+                  </button>
+                </div>
+              )}
               {project.chapters.map((ch) => (
                 <button
                   key={ch.index}

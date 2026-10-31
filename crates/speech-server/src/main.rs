@@ -1292,6 +1292,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/projects/{id}/generate",
             post(projects::generate_project),
         )
+        .route("/v1/projects/{id}/chapters", post(projects::add_chapter))
         .route(
             "/v1/projects/{id}/chapters/{index}",
             get(projects::get_chapter).put(projects::update_chapter),
