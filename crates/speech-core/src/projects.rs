@@ -898,6 +898,51 @@ impl ProjectStore {
         Ok(true)
     }
 
+    /// Видалити файли глави та зсунути аудіо/тейки наступних глав.
+    ///
+    /// `chapter_count` — кількість глав до видалення. Після видалення глави
+    /// `index` усі наступні глави отримують індекс на одиницю менший, тому
+    /// їхні WAV-файли (`<index>.wav`) і каталоги тейків (`<index>/`) треба
+    /// перейменувати, інакше UI покаже готову главу без аудіо.
+    pub fn delete_chapter_files(&self, id: &str, index: usize, chapter_count: usize) -> Result<()> {
+        if chapter_count > MAX_CHAPTERS || index >= chapter_count {
+            bail!("invalid chapter index");
+        }
+        let dir = self.chapters_dir(id)?;
+        if !dir.is_dir() {
+            return Ok(());
+        }
+
+        let audio = dir.join(format!("{index}.wav"));
+        if audio.is_file() {
+            std::fs::remove_file(&audio).with_context(|| format!("remove {}", audio.display()))?;
+        }
+        let takes = dir.join(index.to_string());
+        if takes.is_dir() {
+            std::fs::remove_dir_all(&takes)
+                .with_context(|| format!("remove takes dir {}", takes.display()))?;
+        }
+
+        for current in index..chapter_count - 1 {
+            let next = current + 1;
+            let from_audio = dir.join(format!("{next}.wav"));
+            if from_audio.is_file() {
+                let to_audio = dir.join(format!("{current}.wav"));
+                std::fs::rename(&from_audio, &to_audio).with_context(|| {
+                    format!("rename {} -> {}", from_audio.display(), to_audio.display())
+                })?;
+            }
+            let from_takes = dir.join(next.to_string());
+            if from_takes.is_dir() {
+                let to_takes = dir.join(current.to_string());
+                std::fs::rename(&from_takes, &to_takes).with_context(|| {
+                    format!("rename {} -> {}", from_takes.display(), to_takes.display())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Каталог Back-ASR перевірок: `<projects>/<id>/qc/`.
     pub fn qc_dir(&self, id: &str) -> Result<PathBuf> {
         Ok(self.project_dir(id)?.join("qc"))
@@ -1313,6 +1358,49 @@ mod tests {
         );
         assert!(store.delete_chapter_audio(&project.id, 0).unwrap());
         assert!(!store.chapter_audio_exists(&project.id, 0));
+        std::fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn deleting_chapter_files_shifts_following_chapters() {
+        let store = temp_store();
+        let mut project = sample_project();
+        project
+            .chapters
+            .push(Chapter::new(2, "Розділ 3", "Третій розділ."));
+        store.create(&project).unwrap();
+
+        for index in 0..3 {
+            store
+                .save_chapter_audio(&project.id, index, format!("audio-{index}").as_bytes())
+                .unwrap();
+            let takes = store.takes_dir(&project.id, index).unwrap();
+            std::fs::create_dir_all(&takes).unwrap();
+            std::fs::write(takes.join("marker"), format!("takes-{index}")).unwrap();
+        }
+
+        store.delete_chapter_files(&project.id, 1, 3).unwrap();
+
+        assert_eq!(
+            store.load_chapter_audio(&project.id, 0).unwrap().unwrap(),
+            b"audio-0"
+        );
+        assert_eq!(
+            store.load_chapter_audio(&project.id, 1).unwrap().unwrap(),
+            b"audio-2"
+        );
+        assert!(!store.chapter_audio_exists(&project.id, 2));
+        assert_eq!(
+            std::fs::read_to_string(store.takes_dir(&project.id, 0).unwrap().join("marker"))
+                .unwrap(),
+            "takes-0"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.takes_dir(&project.id, 1).unwrap().join("marker"))
+                .unwrap(),
+            "takes-2"
+        );
+        assert!(!store.takes_dir(&project.id, 2).unwrap().exists());
         std::fs::remove_dir_all(store.dir()).unwrap();
     }
 

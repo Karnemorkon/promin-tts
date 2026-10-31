@@ -182,6 +182,12 @@ export function updateChapter(id: string, index: number, body: UpdateChapterRequ
   });
 }
 
+export function deleteChapter(id: string, index: number) {
+  return request<void>(`/v1/projects/${id}/chapters/${index}`, {
+    method: 'DELETE',
+  });
+}
+
 export function chapterAudioUrl(id: string, index: number) {
   return `${getBaseUrl()}/v1/projects/${id}/chapters/${index}/audio`;
 }

@@ -789,6 +789,44 @@ pub async fn add_chapter(
         .into_response())
 }
 
+/// `DELETE /v1/projects/{id}/chapters/{index}`: видалити главу.
+///
+/// Наступні глави зсуваються на нові індекси, тому їхні WAV-файли та
+/// каталоги тейків перейменовуються. Активні job-и, експорти й QC проєкту
+/// скасовуються, щоб фонові задачі не писали у старі індекси.
+pub async fn delete_chapter(
+    State(state): State<AppState>,
+    Path((id, index)): Path<(String, usize)>,
+) -> Result<StatusCode, ProjectApiError> {
+    let _guard = state.project_lock.lock().await;
+    let mut project = load_project(&state, &id)?;
+    let chapter_count = project.chapters.len();
+    if index >= chapter_count {
+        return Err(ProjectApiError::NotFound("unknown chapter"));
+    }
+    let cancelled = state.jobs.cancel_project_jobs(&id);
+    state.exports.cancel_project(&id);
+    state.qc.cancel_project(&id);
+    state.per_chapter_exports.cancel_project(&id);
+
+    project.chapters.remove(index);
+    project.normalize();
+    save_project(&state.projects, &mut project)?;
+    state
+        .projects
+        .delete_chapter_files(&id, index, chapter_count)
+        .map_err(|error| ProjectApiError::internal("delete chapter files", error))?;
+
+    tracing::info!(
+        project_id = id,
+        chapter_index = index,
+        chapters = project.chapters.len(),
+        cancelled,
+        "chapter deleted"
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /v1/projects/{id}/chapters/{index}/audio`: готовий WAV глави.
 pub async fn chapter_audio(
     State(state): State<AppState>,

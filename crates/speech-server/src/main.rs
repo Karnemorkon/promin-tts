@@ -1295,7 +1295,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/projects/{id}/chapters", post(projects::add_chapter))
         .route(
             "/v1/projects/{id}/chapters/{index}",
-            get(projects::get_chapter).put(projects::update_chapter),
+            get(projects::get_chapter)
+                .put(projects::update_chapter)
+                .delete(projects::delete_chapter),
         )
         .route(
             "/v1/projects/{id}/chapters/{index}/audio",

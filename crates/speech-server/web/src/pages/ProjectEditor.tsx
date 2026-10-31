@@ -25,6 +25,7 @@ import {
   deleteProject,
   addChapter,
   updateChapter,
+  deleteChapter,
   listJobs,
   cancelJob,
   generateChapters,
@@ -104,6 +105,7 @@ export default function ProjectEditor() {
   const [chapterTitle, setChapterTitle] = useState('');
   const [showAddChapter, setShowAddChapter] = useState(false);
   const [newChapterTitle, setNewChapterTitle] = useState('');
+  const [deleteChapterConfirm, setDeleteChapterConfirm] = useState(false);
 
   const [jobs, setJobs] = useState<JobStatus[]>([]);
   const [voices, setVoices] = useState<VoicesResponse | null>(null);
@@ -335,6 +337,7 @@ export default function ProjectEditor() {
     setEditingChapter(chapter.index);
     setChapterTitle(chapter.title);
     setChapterText(chapter.text);
+    setDeleteChapterConfirm(false);
     setNotice(null);
   }
 
@@ -385,6 +388,26 @@ export default function ProjectEditor() {
     setShowAddChapter(true);
     setError(null);
     setNotice(null);
+  }
+
+  async function handleDeleteChapter(index: number) {
+    if (!id) return;
+    setLoading(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await deleteChapter(id, index);
+      setDeleteChapterConfirm(false);
+      setEditingChapter(null);
+      await loadProject();
+      setNotice('Главу видалено');
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error ? err.message : 'Не вдалося видалити главу'
+      );
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function handleActivateTake(unit: number, take: number) {
@@ -964,8 +987,39 @@ export default function ProjectEditor() {
                     >
                       <X className="w-4 h-4" />
                     </button>
+                    <button
+                      onClick={() => setDeleteChapterConfirm(true)}
+                      disabled={loading}
+                      title="Видалити главу"
+                      className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded disabled:opacity-50"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
+
+                {deleteChapterConfirm && (
+                  <div className="p-3 border-b border-red-100 bg-red-50 flex flex-wrap items-center gap-3">
+                    <p className="flex-1 min-w-48 text-sm text-red-800">
+                      Видалити главу «{currentChapter.title}»? Аудіо та тейки
+                      глави буде видалено, наступні глави зсунуться.
+                    </p>
+                    <button
+                      onClick={() => void handleDeleteChapter(currentChapter.index)}
+                      disabled={loading}
+                      className="px-3 py-1.5 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50"
+                    >
+                      Видалити
+                    </button>
+                    <button
+                      onClick={() => setDeleteChapterConfirm(false)}
+                      disabled={loading}
+                      className="px-3 py-1.5 text-sm text-gray-600 hover:bg-white rounded-lg disabled:opacity-50"
+                    >
+                      Скасувати
+                    </button>
+                  </div>
+                )}
 
                 {currentChapter.status === 'completed' && (
                   <div className="p-3 bg-white border-b border-gray-200">

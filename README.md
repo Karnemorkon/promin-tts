@@ -1,6 +1,6 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, roles, export and Back-ASR QC. v0.15 adds a **takes editor** to that UI: per-sentence A/B playback, regeneration with another voice/speed/text, activation and deletion of versions. v0.16 adds **role management** with inline dialogue markup. v0.17 adds **voice previews** before applying a voice, **local voice aliases** for friendlier names, a **collapsible sidebar**, and an inline chapter-creation form that does not depend on browser prompts. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, roles, export and Back-ASR QC. v0.15 adds a **takes editor** to that UI: per-sentence A/B playback, regeneration with another voice/speed/text, activation and deletion of versions. v0.16 adds **role management** with inline dialogue markup. v0.17 adds **voice previews** before applying a voice, **local voice aliases** for friendlier names, a **collapsible sidebar**, an inline chapter-creation form that does not depend on browser prompts, and **chapter deletion** with automatic reindexing of audio and takes. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
@@ -47,8 +47,9 @@ v0.16 додає керування ролями у веб-інтерфейсі:
 v0.17 додає прослуховування короткого зразка голосу перед застосуванням
 (кнопка біля кожного селекта голосу та в списку назв), локальні назви
 голосів (`voice_aliases` у налаштуваннях проєкту), згортуваний лівий
-сайдбар зі збереженням стану та вбудовану форму створення глави замість
-`window.prompt`, який блокується в деяких браузерах.
+сайдбар зі збереженням стану, вбудовану форму створення глави замість
+`window.prompt`, який блокується в деяких браузерах, і видалення глави
+з автоматичним зсувом аудіо та тейків наступних глав.
 
 v0.12 додає зворотне розпізнавання готових глав: компактна українська
 W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує аудіо вікнами ~25 с,
@@ -388,7 +389,7 @@ npm run dev   # http://localhost:5173, проксі на 127.0.0.1:8010
 | `PUT` | `/v1/projects/{id}/pronunciation` | Замінити проєктний словник вимови |
 | `POST` | `/v1/projects/{id}/generate` | Поставити глави в чергу (`chapters?`, `force?`) |
 | `POST` | `/v1/projects/{id}/chapters` | Додати главу в кінець проєкту (`title?`, `text?`) |
-| `GET`/`PUT` | `/v1/projects/{id}/chapters/{i}` | Отримати/змінити назву й текст глави |
+| `GET`/`PUT`/`DELETE` | `/v1/projects/{id}/chapters/{i}` | Отримати/змінити/видалити главу (DELETE зсуває аудіо й тейки наступних глав) |
 | `GET` | `/v1/projects/{id}/chapters/{i}/audio` | Готовий WAV глави |
 | `GET` | `/v1/projects/{id}/chapters/{i}/subtitles?format=srt\|vtt\|ass` | Субтитри глави (ASS — з послівним караоке) |
 | `GET` | `/v1/projects/{id}/chapters/{i}/diagnostics` | Аудіо-діагностика глави: кліпінг, паузи, DC offset, рівень |
