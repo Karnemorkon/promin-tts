@@ -105,6 +105,36 @@ export interface AddChapterRequest {
   text?: string;
 }
 
+export interface Take {
+  id: number;
+  voice?: string | null;
+  speed: number;
+  spoken: string;
+  duration_ms: number;
+  bytes: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface UnitTakes {
+  index: number;
+  text: string;
+  role?: string | null;
+  active_take: number;
+  takes: Take[];
+}
+
+export interface ChapterTakes {
+  chapter_index: number;
+  units: UnitTakes[];
+}
+
+export interface RegenerateTakeRequest {
+  voice?: string;
+  speed?: number;
+  text?: string;
+}
+
 export interface JobStatus {
   id: string;
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';

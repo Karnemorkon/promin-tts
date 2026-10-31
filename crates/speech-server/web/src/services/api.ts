@@ -6,6 +6,9 @@ import type {
   UpdateChapterRequest,
   AddChapterRequest,
   Chapter,
+  ChapterTakes,
+  Take,
+  RegenerateTakeRequest,
   JobStatus,
   ModelInfo,
   QCJob,
@@ -183,7 +186,7 @@ export function generateChapters(
 
 /* ---------- Takes ---------- */
 export function chapterTakes(id: string, index: number) {
-  return request<any>(`/v1/projects/${id}/chapters/${index}/takes`);
+  return request<ChapterTakes>(`/v1/projects/${id}/chapters/${index}/takes`);
 }
 
 export function activateTake(
@@ -192,24 +195,47 @@ export function activateTake(
   unit: number,
   take: number
 ) {
-  return request<void>(
+  return request<ChapterTakes>(
     `/v1/projects/${id}/chapters/${index}/takes/units/${unit}/takes/${take}/activate`,
     { method: 'POST' }
   );
 }
 
-export function regenerateChapterUnit(id: string, index: number, unit: number) {
-  return request<unknown>(
+export function deleteTake(
+  id: string,
+  index: number,
+  unit: number,
+  take: number
+) {
+  return request<void>(
+    `/v1/projects/${id}/chapters/${index}/takes/units/${unit}/takes/${take}`,
+    { method: 'DELETE' }
+  );
+}
+
+export function regenerateChapterUnit(
+  id: string,
+  index: number,
+  unit: number,
+  body: RegenerateTakeRequest
+) {
+  return request<Take>(
     `/v1/projects/${id}/chapters/${index}/takes/units/${unit}`,
-    { method: 'POST' }
+    { method: 'POST', body: JSON.stringify(body) }
   );
 }
 
 export function rebuildChapter(id: string, index: number) {
-  return request<unknown>(
+  return request<ChapterTakes>(
     `/v1/projects/${id}/chapters/${index}/takes/rebuild`,
     { method: 'POST' }
   );
+}
+
+export function invalidateTakes(id: string, index: number) {
+  return request<void>(`/v1/projects/${id}/chapters/${index}/takes`, {
+    method: 'POST',
+  });
 }
 
 /* ---------- Jobs ---------- */

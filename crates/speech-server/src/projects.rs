@@ -1332,7 +1332,7 @@ pub async fn rebuild_chapter_from_takes(
     Ok(Json(ChapterTakesResponse::new(index, &manifest)))
 }
 
-/// `POST /v1/projects/{id}/chapters/{index}/takes/invalidate`:
+/// `POST /v1/projects/{id}/chapters/{index}/takes`:
 /// видалити кеш тейків глави (наприклад, після зміни тексту або ролей).
 pub async fn invalidate_chapter_takes(
     State(state): State<AppState>,

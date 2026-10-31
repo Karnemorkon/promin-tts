@@ -17,6 +17,7 @@ import {
   CheckCircle2,
   Clock,
   Plus,
+  Layers,
 } from 'lucide-react';
 import {
   getProject,
@@ -41,12 +42,23 @@ import {
   perChapterAudioUrl,
   perChapterSubtitlesUrl,
   downloadFile,
+  chapterTakes,
+  activateTake,
+  deleteTake,
+  regenerateChapterUnit,
+  rebuildChapter,
+  invalidateTakes,
+  unitTakeAudioUrl,
 } from '../services/api';
 import type { PerChapterExportJob } from '../services/api';
 import type {
   Chapter,
+  ChapterTakes,
   Project,
   QCJob,
+  RegenerateTakeRequest,
+  Take,
+  UnitTakes,
   UpdateChapterRequest,
   VoicesResponse,
   JobStatus,
@@ -54,7 +66,7 @@ import type {
 import type { ExportRecord } from '../services/api';
 import { useAudioUrl } from '../hooks/useAudioUrl';
 
-type Tab = 'editor' | 'roles' | 'export' | 'qc';
+type Tab = 'editor' | 'roles' | 'takes' | 'export' | 'qc';
 
 const STATUS_LABELS: Record<string, string> = {
   empty: 'Порожня',
@@ -103,7 +115,21 @@ export default function ProjectEditor() {
   const [perChapterSubtitles, setPerChapterSubtitles] = useState(true);
   const [qcChapter, setQcChapter] = useState<number | ''>('');
 
+  const [takesChapter, setTakesChapter] = useState<number | ''>('');
+  const [takes, setTakes] = useState<ChapterTakes | null>(null);
+  const [takesLoading, setTakesLoading] = useState(false);
+  const [takesBusy, setTakesBusy] = useState(false);
+  const [takesError, setTakesError] = useState<string | null>(null);
+  const [regenUnit, setRegenUnit] = useState<number | null>(null);
+  const [regenText, setRegenText] = useState('');
+  const [regenVoice, setRegenVoice] = useState('');
+  const [regenSpeed, setRegenSpeed] = useState('1');
+
   useEffect(() => {
+    setTakesChapter('');
+    setTakes(null);
+    setTakesError(null);
+    setRegenUnit(null);
     void loadProject();
     void loadJobs();
     void loadVoices();
@@ -142,6 +168,20 @@ export default function ProjectEditor() {
     }, 3000);
     return () => window.clearInterval(timer);
   }, [exports, perChapterJobs, qcJobs]);
+
+  // Автоматично обираємо першу готову главу для вкладки тейків.
+  useEffect(() => {
+    if (tab !== 'takes' || takesChapter !== '' || !project || project.id !== id)
+      return;
+    const first = project.chapters.find((ch) => ch.status === 'completed');
+    if (first) setTakesChapter(first.index);
+  }, [tab, takesChapter, project, id]);
+
+  // Завантажуємо маніфест тейків для вибраної глави.
+  useEffect(() => {
+    if (tab !== 'takes' || takesChapter === '') return;
+    void loadTakes(takesChapter);
+  }, [tab, takesChapter, id]);
 
   async function loadProject() {
     if (!id) return;
@@ -207,6 +247,22 @@ export default function ProjectEditor() {
       setQcJobs(detailed);
     } catch {
       /* ignore */
+    }
+  }
+
+  async function loadTakes(index: number) {
+    if (!id) return;
+    setTakesLoading(true);
+    setTakesError(null);
+    try {
+      setTakes(await chapterTakes(id, index));
+    } catch (err: unknown) {
+      setTakes(null);
+      setTakesError(
+        err instanceof Error ? err.message : 'Не вдалося завантажити тейки'
+      );
+    } finally {
+      setTakesLoading(false);
     }
   }
 
@@ -280,6 +336,129 @@ export default function ProjectEditor() {
       setError(err instanceof Error ? err.message : 'Не вдалося додати главу');
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleActivateTake(unit: number, take: number) {
+    if (!id || takesChapter === '') return;
+    setTakesBusy(true);
+    setTakesError(null);
+    try {
+      setTakes(await activateTake(id, takesChapter, unit, take));
+      await loadProject();
+      setNotice(`Активовано версію ${take}`);
+    } catch (err: unknown) {
+      setTakesError(
+        err instanceof Error ? humanizeError(err.message) : 'Не вдалося активувати тейк'
+      );
+    } finally {
+      setTakesBusy(false);
+    }
+  }
+
+  async function handleDeleteTake(unit: number, take: number) {
+    if (!id || takesChapter === '') return;
+    if (!window.confirm(`Видалити версію ${take}?`)) return;
+    setTakesBusy(true);
+    setTakesError(null);
+    try {
+      await deleteTake(id, takesChapter, unit, take);
+      await loadTakes(takesChapter);
+      await loadProject();
+      setNotice(`Версію ${take} видалено`);
+    } catch (err: unknown) {
+      setTakesError(
+        err instanceof Error ? humanizeError(err.message) : 'Не вдалося видалити тейк'
+      );
+    } finally {
+      setTakesBusy(false);
+    }
+  }
+
+  function openRegenerate(unit: UnitTakes) {
+    const active = unit.takes.find((take) => take.id === unit.active_take);
+    setRegenUnit(unit.index);
+    setRegenText(unit.text);
+    setRegenVoice(active?.voice ?? '');
+    setRegenSpeed(String(active?.speed ?? project?.settings.speed ?? 1));
+    setTakesError(null);
+  }
+
+  async function handleRegenerateSubmit(unit: UnitTakes) {
+    if (!id || takesChapter === '' || !project) return;
+    if (!regenText.trim()) {
+      setTakesError('Текст не може бути порожнім');
+      return;
+    }
+    const speed = Number(regenSpeed);
+    if (!Number.isFinite(speed) || speed < 0.5 || speed > 2) {
+      setTakesError('Темп має бути в межах 0.5–2.0');
+      return;
+    }
+    const body: RegenerateTakeRequest = {
+      text: regenText.trim() === unit.text.trim() ? undefined : regenText,
+      voice: regenVoice || undefined,
+      speed,
+    };
+    setTakesBusy(true);
+    setTakesError(null);
+    try {
+      const take = await regenerateChapterUnit(
+        id,
+        takesChapter,
+        unit.index,
+        body
+      );
+      setRegenUnit(null);
+      await loadTakes(takesChapter);
+      setNotice(`Створено версію ${take.id}`);
+    } catch (err: unknown) {
+      setTakesError(
+        err instanceof Error ? humanizeError(err.message) : 'Не вдалося створити новий тейк'
+      );
+    } finally {
+      setTakesBusy(false);
+    }
+  }
+
+  async function handleRebuildChapter() {
+    if (!id || takesChapter === '') return;
+    setTakesBusy(true);
+    setTakesError(null);
+    try {
+      setTakes(await rebuildChapter(id, takesChapter));
+      await loadProject();
+      setNotice('Главу перезібрано з активних тейків');
+    } catch (err: unknown) {
+      setTakesError(
+        err instanceof Error ? humanizeError(err.message) : 'Не вдалося перезібрати главу'
+      );
+    } finally {
+      setTakesBusy(false);
+    }
+  }
+
+  async function handleInvalidateTakes() {
+    if (!id || takesChapter === '') return;
+    if (
+      !window.confirm(
+        'Скинути кеш тейків глави? Поточні версії речень буде видалено; для нових тейків главу доведеться синтезувати повторно.'
+      )
+    ) {
+      return;
+    }
+    setTakesBusy(true);
+    setTakesError(null);
+    try {
+      await invalidateTakes(id, takesChapter);
+      setTakes(null);
+      setNotice('Кеш тейків скинуто');
+    } catch (err: unknown) {
+      setTakesError(
+        err instanceof Error ? humanizeError(err.message) : 'Не вдалося скинути кеш тейків'
+      );
+    } finally {
+      setTakesBusy(false);
     }
   }
 
@@ -466,6 +645,7 @@ export default function ProjectEditor() {
           [
             ['editor', 'Редактор', BookOpen],
             ['roles', 'Ролі', Users],
+            ['takes', 'Тейки', Layers],
             ['export', 'Експорт', Download],
             ['qc', 'QC', BarChart3],
           ] as [Tab, string, typeof BookOpen][]
@@ -1035,6 +1215,235 @@ export default function ProjectEditor() {
         </div>
       )}
 
+      {tab === 'takes' && (
+        <div className="flex-1 overflow-y-auto p-6">
+          <div className="max-w-4xl mx-auto bg-white rounded-xl border border-gray-200 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">
+                  Версії речень
+                </h2>
+                <p className="text-sm text-gray-500">
+                  Прослухайте альтернативні тейки, активуйте найкращий або
+                  перегенеруйте окреме речення.
+                </p>
+              </div>
+              <button
+                onClick={() =>
+                  takesChapter !== '' && void loadTakes(takesChapter)
+                }
+                disabled={takesChapter === '' || takesLoading}
+                className="p-2 text-gray-600 hover:bg-gray-100 rounded-lg disabled:opacity-50"
+                title="Оновити"
+              >
+                <RefreshCw
+                  className={`w-4 h-4 ${takesLoading ? 'animate-spin' : ''}`}
+                />
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-end gap-3 mb-5 p-3 bg-gray-50 rounded-lg">
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1">
+                  Глава
+                </label>
+                <select
+                  value={takesChapter}
+                  onChange={(e) =>
+                    setTakesChapter(
+                      e.target.value === '' ? '' : Number(e.target.value)
+                    )
+                  }
+                  disabled={takesBusy}
+                  className="px-3 py-2 border border-gray-300 rounded-lg bg-white min-w-48 disabled:opacity-50"
+                >
+                  <option value="">Оберіть главу</option>
+                  {project.chapters
+                    .filter((ch) => ch.status === 'completed')
+                    .map((ch) => (
+                      <option key={ch.index} value={ch.index}>
+                        {ch.title}
+                      </option>
+                    ))}
+                </select>
+              </div>
+              <button
+                onClick={handleRebuildChapter}
+                disabled={
+                  takesChapter === '' ||
+                  takesBusy ||
+                  !takes ||
+                  takes.units.length === 0
+                }
+                className="flex items-center gap-2 px-3 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+              >
+                <RefreshCw className="w-4 h-4" />
+                Перезібрати главу
+              </button>
+              <button
+                onClick={handleInvalidateTakes}
+                disabled={
+                  takesChapter === '' ||
+                  takesBusy ||
+                  !takes ||
+                  takes.units.length === 0
+                }
+                className="flex items-center gap-2 px-3 py-2 bg-white border border-red-200 text-red-600 rounded-lg hover:bg-red-50 disabled:opacity-50"
+              >
+                <Trash2 className="w-4 h-4" />
+                Скинути кеш
+              </button>
+              {project.chapters.every((ch) => ch.status !== 'completed') ? (
+                <p className="text-xs text-gray-500">
+                  Спочатку синтезуйте хоча б одну главу.
+                </p>
+              ) : null}
+            </div>
+
+            {takesError && (
+              <div className="mb-4 p-3 rounded-lg bg-red-50 border border-red-100 text-sm text-red-700">
+                {takesError}
+              </div>
+            )}
+
+            {takesLoading ? (
+              <p className="text-sm text-gray-500">Завантаження тейків...</p>
+            ) : takesChapter === '' ? (
+              <p className="text-sm text-gray-500">Оберіть готову главу.</p>
+            ) : !takes || takes.units.length === 0 ? (
+              <p className="text-sm text-gray-500">
+                Маніфест тейків порожній. Синтезуйте главу повторно, щоб
+                створити версії речень.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                {takes.units.map((unit) => (
+                  <div
+                    key={unit.index}
+                    className="border border-gray-200 rounded-lg p-3"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 text-xs text-gray-400">
+                          <span>Речення {unit.index + 1}</span>
+                          {unit.role ? <span>• {unit.role}</span> : null}
+                          <span>• {unit.takes.length} верс.</span>
+                        </div>
+                        <p className="text-sm text-gray-800 mt-1">
+                          {unit.text}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => openRegenerate(unit)}
+                        disabled={takesBusy || regenUnit === unit.index}
+                        className="flex items-center gap-1 text-xs bg-white border border-gray-300 text-gray-700 px-2 py-1 rounded hover:bg-gray-50 disabled:opacity-50 shrink-0"
+                      >
+                        <Mic className="w-3 h-3" />
+                        Перегенерувати
+                      </button>
+                    </div>
+
+                    {regenUnit === unit.index && (
+                      <div className="mt-3 p-3 bg-blue-50 border border-blue-100 rounded-lg space-y-2">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-500 mb-1">
+                            Текст для синтезу
+                          </label>
+                          <textarea
+                            value={regenText}
+                            onChange={(e) => setRegenText(e.target.value)}
+                            rows={2}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-gray-900 text-sm"
+                          />
+                        </div>
+                        <div className="flex flex-wrap items-end gap-2">
+                          <div className="flex-1 min-w-48">
+                            <label className="block text-xs font-medium text-gray-500 mb-1">
+                              Голос
+                            </label>
+                            <select
+                              value={regenVoice}
+                              onChange={(e) => setRegenVoice(e.target.value)}
+                              className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white"
+                            >
+                              <option value="">
+                                Як у проєкті / активному тейку
+                              </option>
+                              {[
+                                ...(voices?.voices ?? []),
+                                ...(voices?.custom ?? []),
+                              ].map((voice) => (
+                                <option key={voice} value={voice}>
+                                  {voice}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-xs font-medium text-gray-500 mb-1">
+                              Темп
+                            </label>
+                            <input
+                              type="number"
+                              min={0.5}
+                              max={2}
+                              step={0.05}
+                              value={regenSpeed}
+                              onChange={(e) => setRegenSpeed(e.target.value)}
+                              className="w-24 px-3 py-2 border border-gray-300 rounded-lg"
+                            />
+                          </div>
+                          <button
+                            onClick={() => void handleRegenerateSubmit(unit)}
+                            disabled={takesBusy}
+                            className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                          >
+                            <Mic className="w-4 h-4" />
+                            Створити тейк
+                          </button>
+                          <button
+                            onClick={() => setRegenUnit(null)}
+                            disabled={takesBusy}
+                            className="px-3 py-2 text-gray-600 hover:bg-gray-100 rounded-lg disabled:opacity-50"
+                          >
+                            Скасувати
+                          </button>
+                        </div>
+                        <p className="text-xs text-gray-500">
+                          Щоб отримати інший тейк, змініть текст, голос або
+                          темп.
+                        </p>
+                      </div>
+                    )}
+
+                    <div className="mt-2 space-y-1">
+                      {unit.takes.map((take) => (
+                        <TakeRow
+                          key={take.id}
+                          id={id!}
+                          chapter={takesChapter as number}
+                          unit={unit.index}
+                          take={take}
+                          active={take.id === unit.active_take}
+                          canDelete={unit.takes.length > 1}
+                          busy={takesBusy}
+                          onActivate={() =>
+                            void handleActivateTake(unit.index, take.id)
+                          }
+                          onDelete={() =>
+                            void handleDeleteTake(unit.index, take.id)
+                          }
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {tab === 'qc' && (
         <div className="flex-1 overflow-y-auto p-6">
           <div className="max-w-3xl mx-auto bg-white rounded-xl border border-gray-200 p-6">
@@ -1176,6 +1585,108 @@ export default function ProjectEditor() {
   );
 }
 
+function TakeRow({
+  id,
+  chapter,
+  unit,
+  take,
+  active,
+  canDelete,
+  busy,
+  onActivate,
+  onDelete,
+}: {
+  id: string;
+  chapter: number;
+  unit: number;
+  take: Take;
+  active: boolean;
+  canDelete: boolean;
+  busy: boolean;
+  onActivate: () => void;
+  onDelete: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const { src, loading, error } = useAudioUrl(
+    expanded ? unitTakeAudioUrl(id, chapter, unit, take.id) : null
+  );
+
+  return (
+    <div
+      className={`rounded-lg border px-3 py-2 ${
+        active ? 'border-green-200 bg-green-50' : 'border-gray-200 bg-gray-50'
+      }`}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          {active ? (
+            <CheckCircle2 className="w-4 h-4 text-green-600 shrink-0" />
+          ) : (
+            <span className="w-4 h-4 shrink-0" />
+          )}
+          <span className="text-xs font-medium text-gray-800">
+            Версія {take.id}
+          </span>
+          <span className="text-xs text-gray-500 truncate">
+            {take.voice ?? 'голос проєкту'} • {take.speed.toFixed(2)}× •{' '}
+            {formatDuration(take.duration_ms)}
+          </span>
+          {active && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">
+              активна
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="text-xs text-blue-600 hover:text-blue-700"
+          >
+            {expanded ? 'Закрити' : 'Прослухати'}
+          </button>
+          {!active && (
+            <button
+              onClick={onActivate}
+              disabled={busy}
+              className="text-xs text-gray-700 hover:text-gray-900 disabled:opacity-50"
+            >
+              Активувати
+            </button>
+          )}
+          <button
+            onClick={onDelete}
+            disabled={busy || !canDelete}
+            title={
+              canDelete
+                ? 'Видалити версію'
+                : 'Не можна видалити єдину версію'
+            }
+            className="text-red-500 hover:text-red-700 disabled:opacity-30"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+      {expanded && (
+        <div className="mt-2">
+          {loading ? (
+            <p className="text-xs text-gray-500">Завантаження аудіо...</p>
+          ) : null}
+          {error ? (
+            <p className="text-xs text-red-600">Аудіо: {error}</p>
+          ) : null}
+          {src ? (
+            <audio src={src} controls autoPlay className="w-full h-9" />
+          ) : null}
+          <p className="text-[10px] text-gray-400 mt-1">
+            Синтезовано: {take.spoken}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ChapterAudio({ id, index }: { id: string; index: number }) {
   const url = chapterAudioUrl(id, index);
   const { src, loading, error } = useAudioUrl(url);
@@ -1207,6 +1718,18 @@ function humanizeError(message: string): string {
   }
   if (message.includes('no completed chapters')) {
     return 'Немає готових глав для експорту. Синтезуйте хоча б одну главу.';
+  }
+  if (message.includes('identical take already exists')) {
+    return 'Такий самий тейк уже існує. Змініть текст, голос або темп.';
+  }
+  if (message.includes('takes cache is invalid or missing')) {
+    return 'Кеш тейків застарілий або відсутній. Синтезуйте главу повторно.';
+  }
+  if (message.includes('cannot delete the last take')) {
+    return 'Не можна видалити єдину версію речення.';
+  }
+  if (message.includes('already has') && message.includes('takes')) {
+    return 'Досягнуто ліміт версій для речення. Видаліть старішу версію.';
   }
   return message;
 }
