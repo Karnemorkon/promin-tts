@@ -73,7 +73,7 @@ export interface Project {
   settings: ProjectSettings;
   roles: Role[];
   chapters: Chapter[];
-  pronunciation: unknown[];
+  pronunciation: PronunciationRule[];
   created_at: string;
   updated_at: string;
 }
@@ -83,7 +83,7 @@ export interface CreateProjectRequest {
   author?: string;
   language?: string;
   settings?: ProjectSettings;
-  pronunciation?: unknown[];
+  pronunciation?: PronunciationRule[];
   roles?: Role[];
   chapters?: { title?: string; text: string }[];
 }
@@ -93,7 +93,7 @@ export interface UpdateProjectRequest {
   author?: string;
   language?: string;
   settings?: ProjectSettings;
-  pronunciation?: unknown[];
+  pronunciation?: PronunciationRule[];
   roles?: Role[];
 }
 
@@ -162,6 +162,14 @@ export interface VoicesResponse {
   custom: string[];
   default: string;
   sample_rate: number;
+}
+
+/** Правило вимови: заміна підрядка або regex до вербалізації. */
+export interface PronunciationRule {
+  pattern: string;
+  replacement: string;
+  regex?: boolean;
+  case_sensitive?: boolean;
 }
 
 export interface ModelInfo {

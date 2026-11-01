@@ -18,6 +18,7 @@ import {
   Clock,
   Plus,
   Layers,
+  SpellCheck,
 } from 'lucide-react';
 import {
   getProject,
@@ -49,9 +50,13 @@ import {
   regenerateChapterUnit,
   rebuildChapter,
   invalidateTakes,
+  jobEvents,
   unitTakeAudioUrl,
   cloneVoice,
   deleteVoice,
+  getGlobalPronunciation,
+  putGlobalPronunciation,
+  putProjectPronunciation,
 } from '../services/api';
 import type { PerChapterExportJob } from '../services/api';
 import type {
@@ -65,12 +70,14 @@ import type {
   UpdateChapterRequest,
   VoicesResponse,
   JobStatus,
+  PronunciationRule,
 } from '../types';
-import type { ExportRecord } from '../services/api';
+import type { ExportRecord, CreateExportRequest } from '../services/api';
 import { useAudioUrl } from '../hooks/useAudioUrl';
 import VoicePreviewButton from '../components/VoicePreviewButton';
+import PronunciationRulesEditor from '../components/PronunciationRulesEditor';
 
-type Tab = 'editor' | 'roles' | 'takes' | 'export' | 'qc';
+type Tab = 'editor' | 'roles' | 'dictionary' | 'takes' | 'export' | 'qc';
 
 const STATUS_LABELS: Record<string, string> = {
   empty: 'Порожня',
@@ -117,6 +124,17 @@ export default function ProjectEditor() {
 
   const [exportFormat, setExportFormat] = useState('mp3');
   const [exportBitrate, setExportBitrate] = useState(128);
+  const [exportTitle, setExportTitle] = useState('');
+  const [exportAuthor, setExportAuthor] = useState('');
+  const [exportAlbum, setExportAlbum] = useState('');
+  const [exportNarrator, setExportNarrator] = useState('');
+  const [exportYear, setExportYear] = useState('');
+  const [exportDescription, setExportDescription] = useState('');
+  const [exportCover, setExportCover] = useState<File | null>(null);
+  const [exportCoverPreview, setExportCoverPreview] = useState<string | null>(
+    null
+  );
+  const [exportCoverError, setExportCoverError] = useState<string | null>(null);
   const [perChapterFormat, setPerChapterFormat] = useState('mp3');
   const [perChapterBitrate, setPerChapterBitrate] = useState(128);
   const [perChapterSubtitles, setPerChapterSubtitles] = useState(true);
@@ -143,6 +161,19 @@ export default function ProjectEditor() {
     null
   );
 
+  const [projectRules, setProjectRules] = useState<PronunciationRule[]>([]);
+  const [projectDictDirty, setProjectDictDirty] = useState(false);
+  const [projectDictSaving, setProjectDictSaving] = useState(false);
+  const [projectDictConfirm, setProjectDictConfirm] = useState(false);
+
+  const [globalRules, setGlobalRules] = useState<PronunciationRule[] | null>(
+    null
+  );
+  const [globalDictLoaded, setGlobalDictLoaded] = useState(false);
+  const [globalDictLoading, setGlobalDictLoading] = useState(false);
+  const [globalDictSaving, setGlobalDictSaving] = useState(false);
+  const [globalDictError, setGlobalDictError] = useState<string | null>(null);
+
   const chapterTextRef = useRef<HTMLTextAreaElement>(null);
   const cloneFileInputRef = useRef<HTMLInputElement>(null);
 
@@ -159,36 +190,68 @@ export default function ProjectEditor() {
     void loadQC();
   }, [id]);
 
-  // Періодичне оновлення job-ів, поки є активні.
+  // Job-и та експорти оновлюються через SSE замість пулінгу.
+  // Відкриваємо одне SSE-з’єднання на кожен активний job і оновлюємо його в стані.
+  const jobSourcesRef = useRef<Map<string, EventSource>>(new Map());
+
+  function closeJobSource(jobId: string) {
+    const es = jobSourcesRef.current.get(jobId);
+    if (es) {
+      es.close();
+      jobSourcesRef.current.delete(jobId);
+    }
+  }
+
+  function openJobSource(jobId: string) {
+    if (jobSourcesRef.current.has(jobId)) return;
+    const es = jobEvents(jobId, (event) => {
+      try {
+        const data = JSON.parse(event.data) as JobStatus;
+        setJobs((jobs) =>
+          jobs.map((j) => (j.id === jobId ? data : j))
+        );
+        // Коли job завершився — оновлюємо проєкт (глави могли оновити статус).
+        if (
+          data.status === 'completed' ||
+          data.status === 'failed' ||
+          data.status === 'cancelled'
+        ) {
+          void loadProject();
+        }
+      } catch {
+        /* некоректне поділю події — ігноруємо */
+      }
+    });
+    jobSourcesRef.current.set(jobId, es);
+  }
+
   useEffect(() => {
-    const active = jobs.some((j) => j.status === 'queued' || j.status === 'running');
-    if (!active) return;
-    const timer = window.setInterval(() => {
-      void loadJobs();
-      void loadProject();
-    }, 3000);
-    return () => window.clearInterval(timer);
+    // Закриваємо з’єднання для job-ів, що перестали бути активними.
+    const activeIds = new Set(
+      jobs
+        .filter((j) => j.status === 'queued' || j.status === 'running')
+        .map((j) => j.id)
+    );
+    for (const [jobId] of jobSourcesRef.current) {
+      if (!activeIds.has(jobId)) closeJobSource(jobId);
+    }
+    for (const jobId of activeIds) {
+      openJobSource(jobId);
+    }
+    return () => {
+      for (const es of jobSourcesRef.current.values()) es.close();
+      jobSourcesRef.current.clear();
+    };
   }, [jobs]);
 
-  // Періодичне оновлення експортів і QC, поки є активні.
+  // Початкове завантаження (із повторним оновленням, якщо щось активне).
   useEffect(() => {
-    const exportsActive = exports.some(
-      (e) => e.status === 'queued' || e.status === 'running'
-    );
-    const perChapterActive = perChapterJobs.some(
-      (j) => j.status === 'queued' || j.status === 'running'
-    );
-    const qcActive = qcJobs.some(
-      (j) => j.status === 'queued' || j.status === 'running'
-    );
-    if (!exportsActive && !perChapterActive && !qcActive) return;
-    const timer = window.setInterval(() => {
-      if (exportsActive) void loadExports();
-      if (perChapterActive) void loadPerChapterExports();
-      if (qcActive) void loadQC();
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [exports, perChapterJobs, qcJobs]);
+    void loadJobs();
+    void loadVoices();
+    void loadExports();
+    void loadPerChapterExports();
+    void loadQC();
+  }, [id]);
 
   // Автоматично обираємо першу готову главу для вкладки тейків.
   useEffect(() => {
@@ -203,6 +266,30 @@ export default function ProjectEditor() {
     if (tab !== 'takes' || takesChapter === '') return;
     void loadTakes(takesChapter);
   }, [tab, takesChapter, id]);
+
+  // Синхронізуємо чернетку словника при зміні проєкту.
+  useEffect(() => {
+    setProjectRules(project?.pronunciation ?? []);
+    setProjectDictDirty(false);
+    setProjectDictConfirm(false);
+  }, [project?.id]);
+
+  // Глобальний словник підвантажуємо при першому відкритті вкладки.
+  useEffect(() => {
+    if (tab !== 'dictionary' || globalDictLoaded) return;
+    void loadGlobalPronunciation();
+  }, [tab, globalDictLoaded]);
+
+  // Прев'ю обкладинки: створюємо blob URL і звільняємо його при зміні.
+  useEffect(() => {
+    if (!exportCover) {
+      setExportCoverPreview(null);
+      return;
+    }
+    const url = URL.createObjectURL(exportCover);
+    setExportCoverPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [exportCover]);
 
   async function loadProject() {
     if (!id) return;
@@ -228,6 +315,69 @@ export default function ProjectEditor() {
       setVoices(await listVoices());
     } catch {
       /* ignore */
+    }
+  }
+
+  async function loadGlobalPronunciation() {
+    setGlobalDictLoading(true);
+    setGlobalDictError(null);
+    try {
+      const data = await getGlobalPronunciation();
+      setGlobalRules(data.rules ?? []);
+    } catch (err: unknown) {
+      setGlobalDictError(
+        err instanceof Error ? err.message : 'Не вдалося завантажити словник'
+      );
+      setGlobalRules([]);
+    } finally {
+      setGlobalDictLoading(false);
+      setGlobalDictLoaded(true);
+    }
+  }
+
+  async function handleSaveProjectPronunciation() {
+    if (!id) return;
+    const hasGenerated = project?.chapters.some(
+      (ch) => ch.status !== 'empty'
+    );
+    if (hasGenerated && !projectDictConfirm) {
+      setProjectDictConfirm(true);
+      return;
+    }
+    setProjectDictSaving(true);
+    setError(null);
+    try {
+      const updated = await putProjectPronunciation(id, projectRules);
+      setProject({ ...updated, roles: updated.roles ?? [] });
+      setProjectRules(updated.pronunciation ?? []);
+      setProjectDictDirty(false);
+      setProjectDictConfirm(false);
+      setNotice('Словник проєкту збережено');
+      void loadJobs();
+      void loadProject();
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error ? err.message : 'Не вдалося зберегти словник'
+      );
+    } finally {
+      setProjectDictSaving(false);
+    }
+  }
+
+  async function handleSaveGlobalPronunciation() {
+    if (!globalRules) return;
+    setGlobalDictSaving(true);
+    setGlobalDictError(null);
+    try {
+      const data = await putGlobalPronunciation(globalRules);
+      setGlobalRules(data.rules ?? []);
+      setNotice('Глобальний словник збережено');
+    } catch (err: unknown) {
+      setGlobalDictError(
+        err instanceof Error ? err.message : 'Не вдалося зберегти словник'
+      );
+    } finally {
+      setGlobalDictSaving(false);
     }
   }
 
@@ -631,15 +781,44 @@ export default function ProjectEditor() {
     }
   }
 
+  function handleCoverChange(file: File | null) {
+    setExportCoverError(null);
+    if (!file) {
+      setExportCover(null);
+      return;
+    }
+    if (file.size > 4 * 1024 * 1024) {
+      setExportCoverError('Обкладинка завелика: максимум 4 МБ');
+      setExportCover(null);
+      return;
+    }
+    if (!/^image\/(png|jpeg|jpg|webp)$/i.test(file.type)) {
+      setExportCoverError('Підтримуються PNG, JPEG або WebP');
+      setExportCover(null);
+      return;
+    }
+    setExportCover(file);
+  }
+
   async function handleExport() {
     if (!id) return;
     setError(null);
     setNotice(null);
     try {
-      const record = await createExport(id, {
+      const body: CreateExportRequest = {
         format: exportFormat,
         bitrate_kbps: exportBitrate,
-      });
+      };
+      if (exportTitle.trim()) body.title = exportTitle.trim();
+      if (exportAuthor.trim()) body.author = exportAuthor.trim();
+      if (exportAlbum.trim()) body.album = exportAlbum.trim();
+      if (exportNarrator.trim()) body.narrator = exportNarrator.trim();
+      if (exportYear.trim()) body.year = exportYear.trim();
+      if (exportDescription.trim()) {
+        body.description = exportDescription.trim();
+      }
+      if (exportCover) body.cover_base64 = await fileToBase64(exportCover);
+      const record = await createExport(id, body);
       setNotice(`Експорт запущено: ${record.id}`);
       await loadExports();
     } catch (err: unknown) {
@@ -865,6 +1044,7 @@ export default function ProjectEditor() {
           [
             ['editor', 'Редактор', BookOpen],
             ['roles', 'Ролі', Users],
+            ['dictionary', 'Словник', SpellCheck],
             ['takes', 'Тейки', Layers],
             ['export', 'Експорт', Download],
             ['qc', 'QC', BarChart3],
@@ -1513,6 +1693,141 @@ export default function ProjectEditor() {
         </div>
       )}
 
+      {tab === 'dictionary' && (
+        <div className="flex-1 overflow-y-auto p-6">
+          <div className="max-w-2xl mx-auto space-y-6">
+            <div className="bg-white rounded-xl border border-gray-200 p-6">
+              <div className="flex items-start justify-between gap-3 mb-1">
+                <h2 className="text-lg font-semibold text-gray-900">
+                  Словник проєкту
+                </h2>
+                <span className="text-xs text-gray-400 shrink-0">
+                  {projectRules.length} правил
+                </span>
+              </div>
+              <p className="text-sm text-gray-500 mb-4">
+                Заміни застосовуються до тексту цього проєкту перед
+                вербалізацією. Правила проєкту мають пріоритет над глобальними.
+              </p>
+              <PronunciationRulesEditor
+                rules={projectRules}
+                onChange={(rules) => {
+                  setProjectRules(rules);
+                  setProjectDictDirty(true);
+                  setProjectDictConfirm(false);
+                }}
+                disabled={projectDictSaving}
+                emptyHint="Додайте правило, наприклад «ІТ → ай-ті»."
+              />
+              {project.chapters.some((ch) => ch.status !== 'empty') && (
+                <p className="mt-3 text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded p-2">
+                  Зміна словника позначить усі глави застарілими та видалить
+                  збережені тейки.
+                </p>
+              )}
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                {projectDictConfirm ? (
+                  <>
+                    <button
+                      onClick={() => void handleSaveProjectPronunciation()}
+                      disabled={projectDictSaving}
+                      className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 text-sm"
+                    >
+                      {projectDictSaving ? (
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <AlertTriangle className="w-4 h-4" />
+                      )}
+                      Підтвердити й зберегти
+                    </button>
+                    <button
+                      onClick={() => setProjectDictConfirm(false)}
+                      disabled={projectDictSaving}
+                      className="px-3 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      Скасувати
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => void handleSaveProjectPronunciation()}
+                    disabled={!projectDictDirty || projectDictSaving}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm"
+                  >
+                    {projectDictSaving ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Save className="w-4 h-4" />
+                    )}
+                    Зберегти словник
+                  </button>
+                )}
+                {projectDictDirty && !projectDictConfirm && (
+                  <span className="text-xs text-amber-600">
+                    Є незбережені зміни
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl border border-gray-200 p-6">
+              <div className="flex items-start justify-between gap-3 mb-1">
+                <h2 className="text-lg font-semibold text-gray-900">
+                  Глобальний словник
+                </h2>
+                <button
+                  onClick={() => void loadGlobalPronunciation()}
+                  disabled={globalDictLoading}
+                  title="Оновити"
+                  className="p-1.5 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 disabled:opacity-50 shrink-0"
+                >
+                  <RefreshCw
+                    className={`w-4 h-4 ${
+                      globalDictLoading ? 'animate-spin' : ''
+                    }`}
+                  />
+                </button>
+              </div>
+              <p className="text-sm text-gray-500 mb-4">
+                Спільний для всіх проєктів словник на сервері
+                (<code className="font-mono text-xs">pronunciation.json</code>).
+                Застосовується під час синтезу; зміни не перегенеровують уже
+                готові глави автоматично.
+              </p>
+              {globalDictLoading && globalRules === null ? (
+                <p className="text-xs text-gray-500">Завантаження…</p>
+              ) : (
+                globalRules && (
+                  <PronunciationRulesEditor
+                    rules={globalRules}
+                    onChange={setGlobalRules}
+                    disabled={globalDictSaving}
+                    emptyHint="Глобальних правил ще немає."
+                  />
+                )
+              )}
+              {globalDictError && (
+                <p className="mt-2 text-xs text-red-600">{globalDictError}</p>
+              )}
+              <div className="mt-4">
+                <button
+                  onClick={() => void handleSaveGlobalPronunciation()}
+                  disabled={!globalRules || globalDictSaving}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm"
+                >
+                  {globalDictSaving ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Save className="w-4 h-4" />
+                  )}
+                  Зберегти глобальний словник
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {tab === 'export' && (
         <div className="flex-1 overflow-y-auto p-6">
           <div className="max-w-3xl mx-auto space-y-4">
@@ -1563,6 +1878,107 @@ export default function ProjectEditor() {
                 >
                   <RefreshCw className="w-4 h-4" />
                 </button>
+              </div>
+
+              <div className="mt-5 pt-5 border-t border-gray-200">
+                <h3 className="text-sm font-medium text-gray-700 mb-3">
+                  Метадані книги
+                </h3>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Назва
+                    </label>
+                    <input
+                      value={exportTitle}
+                      onChange={(e) => setExportTitle(e.target.value)}
+                      placeholder={project.title}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Автор
+                    </label>
+                    <input
+                      value={exportAuthor}
+                      onChange={(e) => setExportAuthor(e.target.value)}
+                      placeholder={project.author || 'Невідомий'}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Альбом
+                    </label>
+                    <input
+                      value={exportAlbum}
+                      onChange={(e) => setExportAlbum(e.target.value)}
+                      placeholder="За замовчуванням — назва книги"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Диктор
+                    </label>
+                    <input
+                      value={exportNarrator}
+                      onChange={(e) => setExportNarrator(e.target.value)}
+                      placeholder="Наприклад, Іван Петренко"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Рік
+                    </label>
+                    <input
+                      value={exportYear}
+                      onChange={(e) => setExportYear(e.target.value)}
+                      placeholder="2026"
+                      maxLength={4}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Обкладинка (PNG/JPEG, до 4 МБ)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        onChange={(e) =>
+                          handleCoverChange(e.target.files?.[0] ?? null)
+                        }
+                        className="flex-1 min-w-0 text-xs text-gray-600 file:mr-2 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                      />
+                      {exportCoverPreview && (
+                        <img
+                          src={exportCoverPreview}
+                          alt="Обкладинка"
+                          className="w-10 h-10 rounded object-cover border border-gray-200 shrink-0"
+                        />
+                      )}
+                    </div>
+                  </div>
+                  <div className="col-span-2">
+                    <label className="block text-xs font-medium text-gray-500 mb-1">
+                      Опис
+                    </label>
+                    <textarea
+                      value={exportDescription}
+                      onChange={(e) => setExportDescription(e.target.value)}
+                      rows={2}
+                      placeholder="Короткий опис книги для метаданих"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm resize-y"
+                    />
+                  </div>
+                </div>
+                {exportCoverError && (
+                  <p className="mt-2 text-xs text-red-600">{exportCoverError}</p>
+                )}
               </div>
             </div>
 

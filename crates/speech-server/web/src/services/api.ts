@@ -12,6 +12,7 @@ import type {
   JobStatus,
   ModelInfo,
   QCJob,
+  PronunciationRule,
 } from '../types';
 
 let baseUrl: string = '';
@@ -311,6 +312,7 @@ export interface CreateExportRequest {
   album?: string;
   narrator?: string;
   year?: string;
+  description?: string;
 }
 
 export interface ExportRecord {
@@ -470,6 +472,25 @@ export function cloneVoice(name: string, audioBase64: string) {
 export function deleteVoice(name: string) {
   return request<void>(`/api/voices/${encodeURIComponent(name)}`, {
     method: 'DELETE',
+  });
+}
+
+/* ---------- Pronunciation ---------- */
+export function getGlobalPronunciation() {
+  return request<{ rules: PronunciationRule[] }>('/v1/pronunciation');
+}
+
+export function putGlobalPronunciation(rules: PronunciationRule[]) {
+  return request<{ rules: PronunciationRule[] }>('/v1/pronunciation', {
+    method: 'PUT',
+    body: JSON.stringify({ rules }),
+  });
+}
+
+export function putProjectPronunciation(id: string, rules: PronunciationRule[]) {
+  return request<Project>(`/v1/projects/${id}/pronunciation`, {
+    method: 'PUT',
+    body: JSON.stringify({ rules }),
   });
 }
 
