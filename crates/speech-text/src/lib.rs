@@ -3,6 +3,7 @@ pub mod gemma_prep;
 #[cfg(feature = "import")]
 pub mod import;
 pub mod ipa;
+pub mod markup;
 pub mod neural;
 pub mod phonemize;
 pub mod pronunciation;

@@ -19,6 +19,7 @@ use speech_inference::{
     BUNDLE_MANIFEST,
 };
 use speech_text::dialogue::DialogueSegment;
+use speech_text::markup::{parse_markup, MarkupUnit};
 use speech_text::neural::{NeuralStress, NeuralVerbalizer};
 use speech_text::phonemize::Phonemizer;
 use speech_text::pronunciation::Pronouncer;
@@ -173,6 +174,12 @@ struct PlannedChunk {
     spoken: String,
     timing: String,
     role: Option<String>,
+    /// Пауза мовчання перед чанком (мс).
+    pause_before_ms: u64,
+    /// Пауза мовчання після чанку (мс).
+    pause_after_ms: u64,
+    /// Індивідуальна швидкість чанка (інакше — швидкість глави).
+    rate: Option<f32>,
 }
 
 /// Готове аудіо глави до формування [`SynthChapterOutput`].
@@ -1209,6 +1216,9 @@ impl SynthService {
                 spoken,
                 timing,
                 role: None,
+                pause_before_ms: 0,
+                pause_after_ms: 0,
+                rate: None,
             })
             .collect();
 
@@ -1276,21 +1286,11 @@ impl SynthService {
         let mut plan = Vec::new();
         let mut verbalizer = None;
         let mut vb_ms = 0u64;
+        let mut pending_pause_ms: u64 = 0;
         for segment in segments {
-            let (verbalized, label, segment_vb_ms) =
-                self.apply_verbalizer(&segment.text, mode, pronunciation);
-            vb_ms = vb_ms.saturating_add(segment_vb_ms);
-            verbalizer = Some(match verbalizer {
-                None => label,
-                Some(previous) if previous == label => previous,
-                Some(_) => "mixed",
-            });
-
-            let chunks = sentence_chunks(&verbalized, max_chars);
-            if chunks.is_empty() {
-                continue;
-            }
-            let timing_texts = timing_texts(&segment.text, &chunks, max_chars);
+            let units = parse_markup(&segment.text).map_err(|error| {
+                SynthError::BadRequest(format!("invalid markup: {error}"))
+            })?;
             let voice = segment
                 .role
                 .as_ref()
@@ -1298,13 +1298,55 @@ impl SynthService {
                 .cloned()
                 .flatten()
                 .or_else(|| default_voice.map(str::to_string));
-            for (spoken, timing) in chunks.into_iter().zip(timing_texts) {
-                plan.push(PlannedChunk {
-                    voice: voice.clone(),
-                    spoken,
-                    timing,
-                    role: segment.role.clone(),
-                });
+            let mut current_rate: Option<f32> = None;
+            for unit in units {
+                match unit {
+                    MarkupUnit::Pause(ms) => {
+                        pending_pause_ms = pending_pause_ms.saturating_add(ms);
+                    }
+                    MarkupUnit::Rate(rate) => {
+                        current_rate = Some(rate);
+                    }
+                    MarkupUnit::Text(text) => {
+                        let (verbalized, label, segment_vb_ms) =
+                            self.apply_verbalizer(&text, mode, pronunciation);
+                        vb_ms = vb_ms.saturating_add(segment_vb_ms);
+                        verbalizer = Some(match verbalizer {
+                            None => label,
+                            Some(previous) if previous == label => previous,
+                            Some(_) => "mixed",
+                        });
+
+                        let chunks = sentence_chunks(&verbalized, max_chars);
+                        if chunks.is_empty() {
+                            continue;
+                        }
+                        let timing_texts = timing_texts(&text, &chunks, max_chars);
+                        for (index, (spoken, timing)) in
+                            chunks.into_iter().zip(timing_texts).enumerate()
+                        {
+                            plan.push(PlannedChunk {
+                                voice: voice.clone(),
+                                spoken,
+                                timing,
+                                role: segment.role.clone(),
+                                pause_before_ms: if index == 0 {
+                                    std::mem::take(&mut pending_pause_ms)
+                                } else {
+                                    0
+                                },
+                                pause_after_ms: 0,
+                                rate: current_rate,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // Пауза в кінці останнього сегмента не губиться.
+        if pending_pause_ms > 0 {
+            if let Some(last) = plan.last_mut() {
+                last.pause_after_ms = last.pause_after_ms.saturating_add(pending_pause_ms);
             }
         }
         if plan.is_empty() {
@@ -1386,8 +1428,22 @@ impl SynthService {
                     .get(&chunk.voice)
                     .expect("voice was resolved before synthesis"),
             };
-            let samples =
-                self.synthesize_verbalized_f32(&chunk.spoken, voice, speed, raw_stress)?;
+            let mut samples = self.synthesize_verbalized_f32(
+                &chunk.spoken,
+                voice,
+                chunk.rate.unwrap_or(speed),
+                raw_stress,
+            )?;
+            if chunk.pause_before_ms > 0 {
+                let count = samples_for_ms(chunk.pause_before_ms);
+                let mut with_pause = vec![0.0f32; count];
+                with_pause.extend(samples);
+                samples = with_pause;
+            }
+            if chunk.pause_after_ms > 0 {
+                let count = samples_for_ms(chunk.pause_after_ms);
+                samples.extend(std::iter::repeat(0.0f32).take(count));
+            }
             audio_chunks.push(samples);
             if let Some(cb) = progress.as_deref_mut() {
                 if !cb(index + 1, total) {
@@ -1487,6 +1543,11 @@ impl SynthService {
 
 fn samples_to_ms(samples: usize) -> u64 {
     samples as u64 * 1000 / SAMPLE_RATE as u64
+}
+
+/// Кількість семплів для паузи заданої тривалості.
+fn samples_for_ms(ms: u64) -> usize {
+    (ms as f64 / 1000.0 * SAMPLE_RATE as f64).round() as usize
 }
 
 /// Склеїти сирі чанки у PCM глави: кросфейд, таймінги та LUFS.
