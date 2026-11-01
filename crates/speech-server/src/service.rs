@@ -583,7 +583,7 @@ fn split_phoneme_segment(
             current_tokens = 0;
         }
         current.push(ch);
-        if tokenizer.encode(&ch.to_string()).len() > 0 {
+        if !tokenizer.encode(&ch.to_string()).is_empty() {
             current_tokens += 1;
         }
     }
