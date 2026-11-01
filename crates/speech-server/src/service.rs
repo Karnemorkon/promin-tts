@@ -182,6 +182,13 @@ struct PlannedChunk {
     rate: Option<f32>,
 }
 
+/// Чанк потокового синтезу з урахуванням інлайн-розмітки.
+struct StreamPlannedChunk {
+    spoken: String,
+    rate: f32,
+    pause_before_ms: u64,
+}
+
 /// Готове аудіо глави до формування [`SynthChapterOutput`].
 struct ChapterAudio {
     pcm: Vec<i16>,
@@ -1032,15 +1039,66 @@ impl SynthService {
             None => self.resolve_voice(voice)?,
         };
 
-        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
-        tracing::debug!(verbalizer, vb_ms, "text verbalized");
-        let samples =
-            self.synthesize_verbalized_f32(&verbalized, &voice_vector, speed, raw_stress)?;
+        let units = parse_markup(text)
+            .map_err(|error| SynthError::BadRequest(format!("invalid markup: {error}")))?;
+        let mut samples: Vec<f32> = Vec::new();
+        let mut verbalizer: Option<&'static str> = None;
+        let mut vb_ms = 0u64;
+        let mut chunks = 0usize;
+        let mut pending_pause_ms = 0u64;
+        let mut current_rate = speed;
+        for unit in units {
+            match unit {
+                MarkupUnit::Pause(ms) => {
+                    pending_pause_ms = pending_pause_ms.saturating_add(ms);
+                }
+                MarkupUnit::Rate(rate) => {
+                    self.validate_speed(rate)?;
+                    current_rate = rate;
+                }
+                MarkupUnit::Text(segment_text) => {
+                    let (verbalized, label, unit_vb_ms) =
+                        self.apply_verbalizer(&segment_text, mode, pronunciation);
+                    vb_ms = vb_ms.saturating_add(unit_vb_ms);
+                    verbalizer = Some(match verbalizer {
+                        None => label,
+                        Some(previous) if previous == label => previous,
+                        Some(_) => "mixed",
+                    });
+                    if verbalized.trim().is_empty() {
+                        continue;
+                    }
+                    if pending_pause_ms > 0 {
+                        let count = samples_for_ms(pending_pause_ms);
+                        samples.extend(std::iter::repeat_n(0.0f32, count));
+                        pending_pause_ms = 0;
+                    }
+                    samples.extend(self.synthesize_verbalized_f32(
+                        &verbalized,
+                        &voice_vector,
+                        current_rate,
+                        raw_stress,
+                    )?);
+                    chunks += 1;
+                }
+            }
+        }
+        if pending_pause_ms > 0 && chunks > 0 {
+            let count = samples_for_ms(pending_pause_ms);
+            samples.extend(std::iter::repeat_n(0.0f32, count));
+        }
+        if chunks == 0 {
+            return Err(SynthError::BadRequest(
+                "text contains no speakable content".into(),
+            ));
+        }
+        let verbalizer = verbalizer.unwrap_or("off");
+        tracing::debug!(verbalizer, vb_ms, chunks, "text verbalized");
         Ok(SynthPcmOutput {
             pcm: float_to_pcm16(&samples),
             verbalizer,
             vb_ms,
-            chunks: 1,
+            chunks,
         })
     }
 
@@ -1529,40 +1587,101 @@ impl SynthService {
             Some(reference) => self.encode_reference(reference)?,
             None => self.resolve_voice(voice)?,
         };
-        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, None);
-        let chunks = sentence_chunks(&verbalized, max_chars);
-        if chunks.is_empty() {
+        let units = parse_markup(text)
+            .map_err(|error| SynthError::BadRequest(format!("invalid markup: {error}")))?;
+        let mut plan: Vec<StreamPlannedChunk> = Vec::new();
+        let mut verbalizer: Option<&'static str> = None;
+        let mut vb_ms = 0u64;
+        let mut pending_pause_ms = 0u64;
+        let mut current_rate = speed;
+        for unit in units {
+            match unit {
+                MarkupUnit::Pause(ms) => {
+                    pending_pause_ms = pending_pause_ms.saturating_add(ms);
+                }
+                MarkupUnit::Rate(rate) => {
+                    self.validate_speed(rate)?;
+                    current_rate = rate;
+                }
+                MarkupUnit::Text(segment_text) => {
+                    let (verbalized, label, unit_vb_ms) =
+                        self.apply_verbalizer(&segment_text, mode, None);
+                    vb_ms = vb_ms.saturating_add(unit_vb_ms);
+                    verbalizer = Some(match verbalizer {
+                        None => label,
+                        Some(previous) if previous == label => previous,
+                        Some(_) => "mixed",
+                    });
+                    for (index, spoken) in sentence_chunks(&verbalized, max_chars)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        plan.push(StreamPlannedChunk {
+                            spoken,
+                            rate: current_rate,
+                            pause_before_ms: if index == 0 {
+                                std::mem::take(&mut pending_pause_ms)
+                            } else {
+                                0
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        if plan.is_empty() {
             return Err(SynthError::BadRequest(
                 "text contains no speakable content".into(),
             ));
         }
+        let verbalizer = verbalizer.unwrap_or("off");
 
         let meta = StreamMeta {
             verbalizer,
             vb_ms,
-            chunks: chunks.len(),
+            chunks: plan.len(),
         };
         if !on_ready(&meta) {
             return Err(SynthError::Cancelled);
         }
 
         let mut audio_ms = 0u64;
-        for chunk in &chunks {
-            let keep =
-                self.stream_verbalized_f32(chunk, &voice_vector, speed, raw_stress, |samples| {
+        'stream: for chunk in &plan {
+            if chunk.pause_before_ms > 0 {
+                let count = samples_for_ms(chunk.pause_before_ms);
+                audio_ms += samples_to_ms(count);
+                let silence = vec![0i16; count];
+                if !on_chunk(&pcm16_bytes(&silence)) {
+                    break 'stream;
+                }
+            }
+            let keep = self.stream_verbalized_f32(
+                &chunk.spoken,
+                &voice_vector,
+                chunk.rate,
+                raw_stress,
+                |samples| {
                     let pcm = float_to_pcm16(samples);
                     audio_ms += pcm.len() as u64 * 1000 / SAMPLE_RATE as u64;
                     on_chunk(&pcm16_bytes(&pcm))
-                })?;
+                },
+            )?;
             if !keep {
                 break;
             }
+        }
+        // Пауза в кінці тексту не губиться.
+        if pending_pause_ms > 0 {
+            let count = samples_for_ms(pending_pause_ms);
+            audio_ms += samples_to_ms(count);
+            let silence = vec![0i16; count];
+            let _ = on_chunk(&pcm16_bytes(&silence));
         }
 
         Ok(StreamSummary {
             verbalizer,
             vb_ms,
-            chunks: chunks.len(),
+            chunks: plan.len(),
             audio_ms,
         })
     }
@@ -1733,6 +1852,46 @@ fn timing_texts(original: &str, spoken: &[String], max_chars: usize) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn planned(spoken: &str) -> PlannedChunk {
+        PlannedChunk {
+            voice: None,
+            spoken: spoken.to_string(),
+            timing: spoken.to_string(),
+            role: None,
+            pause_before_ms: 0,
+            pause_after_ms: 0,
+            rate: None,
+        }
+    }
+
+    #[test]
+    fn pause_attaches_to_previous_chunk() {
+        let mut plan = vec![planned("перше")];
+        let mut next = planned("друге");
+        let mut pending = 500;
+        take_pending_pause(&mut plan, &mut next, &mut pending);
+        assert_eq!(plan[0].pause_after_ms, 500);
+        assert_eq!(next.pause_before_ms, 0);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn pause_before_first_chunk_stays_leading() {
+        let mut plan = Vec::new();
+        let mut first = planned("перше");
+        let mut pending = 250;
+        take_pending_pause(&mut plan, &mut first, &mut pending);
+        assert_eq!(first.pause_before_ms, 250);
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn pause_samples_match_rate() {
+        assert_eq!(samples_for_ms(1_000), SAMPLE_RATE as usize);
+        assert_eq!(samples_for_ms(500), SAMPLE_RATE as usize / 2);
+        assert_eq!(samples_for_ms(0), 0);
+    }
 
     #[test]
     fn parses_valid_voices() {
