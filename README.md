@@ -243,6 +243,54 @@ HTTP 503 із переліком відсутніх файлів; синтез �
 Для повторного завантаження після обриву використовується той самий
 `.part`-механізм із HTTP Range.
 
+### Експорт бандла з PyTorch
+
+`tools/export_holos_bundle.py` збирає `holos-onnx` з ваг
+[`patriotyk/HolosTTS`](https://github.com/patriotyk/HolosTTS): токенізує
+приклад, трасує кожен етап в ONNX (opset 18, динамічні довжини), пише
+`voices.npz` і маніфест, а потім перевіряє граф у ONNX Runtime проти
+PyTorch-еталону. Потрібні `torch`, `numpy`, `onnx` і `onnxruntime`; решта
+залежностей upstream (`torchaudio`, `transformers`, `librosa`, `soundfile`)
+заглушується автоматично, якщо їх немає.
+
+```bash
+python -m venv .venv-export
+. .venv-export/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install numpy onnx onnxruntime
+
+git clone --depth 1 https://github.com/patriotyk/HolosTTS /tmp/HolosTTS
+# holos.pt і voices.pt — з HF-репозиторію patriotyk/HolosTTS
+
+python tools/export_holos_bundle.py \
+  --repo /tmp/HolosTTS \
+  --weights /tmp/HolosTTS/holos.pt \
+  --voices /tmp/HolosTTS/voices.pt \
+  --out models/holos-onnx \
+  --report /tmp/export-report.json
+```
+
+| Прапорець | Типово | Опис |
+|---|---|---|
+| `--repo` | `$HOLOS_REPO` | Код HolosTTS (каталог із `holos/`) |
+| `--weights` | `$HOLOS_WEIGHTS` | `holos.pt` |
+| `--voices` | `$HOLOS_VOICES` | `voices.pt` |
+| `--out` | `holos-onnx` | Каталог бандла |
+| `--opset` | `18` | Версія ONNX-опсету |
+| `--max-frames` | `20000` | Ліміт кадрів у маніфесті (40 кадрів = 1 с) |
+| `--chunk-frames` | `10` | Стрімінговий чанк, кадрів (10 = 250 мс) |
+| `--context-frames` | `2` | Контекст обабіч чанка, кадрів |
+| `--skip-streaming` | — | Не експортувати `source.onnx` / `decoder_window.onnx` |
+| `--no-validate` | — | Пропустити перевірку в ONNX Runtime |
+| `--report` | — | Записати JSON-звіт із метриками паритету |
+
+Перевірка порівнює `encoder`/`prosody` з PyTorch за `allclose`, декодер — за
+довжиною, RMS і косинусною схожістю (генератор має стохастичний шум, тому
+біт-у-біт збігу немає), а `decoder_window` — точно, бо він споживає готовий
+`source`. Додатково декодер проганяється на довжинах 1, 2, 7, 37 і 101 кадр,
+яких не було при трасуванні. FP32-бандл важить ~750 МБ; `decoder.onnx` і
+`decoder_window.onnx` — по ~210 МБ.
+
 ## Швидкий старт (Docker)
 
 ```bash
