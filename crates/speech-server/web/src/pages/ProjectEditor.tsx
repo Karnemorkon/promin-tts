@@ -768,7 +768,14 @@ export default function ProjectEditor() {
       if (queued > 0) {
         setNotice(`Заплановано глав: ${queued}`);
       } else if (result.errors.length > 0) {
-        setError(result.errors.map((e) => e.error).join('; '));
+        const emptyChapters = result.errors.filter(
+          (e) => e.error.toLowerCase().includes('empty')
+        );
+        if (emptyChapters.length === result.errors.length) {
+          setNotice('Всі вибрані глави порожні — нічого не синтезувати');
+        } else {
+          setError(result.errors.map((e) => e.error).join('; '));
+        }
       } else if (result.skipped.length > 0) {
         setNotice('Усі вибрані глави вже готові');
       }
