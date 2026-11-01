@@ -1198,29 +1198,66 @@ impl SynthService {
             Some(reference) => Some(self.encode_reference(reference)?),
             None => None,
         };
-        let (verbalized, verbalizer, vb_ms) = self.apply_verbalizer(text, mode, pronunciation);
-        tracing::debug!(verbalizer, vb_ms, "chapter text verbalized");
-
-        let chunks = sentence_chunks(&verbalized, max_chars);
-        if chunks.is_empty() {
+        let units = parse_markup(text).map_err(|error| {
+            SynthError::BadRequest(format!("invalid markup: {error}"))
+        })?;
+        let mut plan = Vec::new();
+        let mut verbalizer: Option<&'static str> = None;
+        let mut vb_ms = 0u64;
+        let mut pending_pause_ms: u64 = 0;
+        let mut current_rate: Option<f32> = None;
+        for unit in units {
+            match unit {
+                MarkupUnit::Pause(ms) => {
+                    pending_pause_ms = pending_pause_ms.saturating_add(ms);
+                }
+                MarkupUnit::Rate(rate) => current_rate = Some(rate),
+                MarkupUnit::Text(segment_text) => {
+                    let (verbalized, label, segment_vb_ms) =
+                        self.apply_verbalizer(&segment_text, mode, pronunciation);
+                    vb_ms = vb_ms.saturating_add(segment_vb_ms);
+                    verbalizer = Some(match verbalizer {
+                        None => label,
+                        Some(previous) if previous == label => previous,
+                        Some(_) => "mixed",
+                    });
+                    let chunks = sentence_chunks(&verbalized, max_chars);
+                    if chunks.is_empty() {
+                        continue;
+                    }
+                    let timing_texts = timing_texts(&segment_text, &chunks, max_chars);
+                    for (index, (spoken, timing)) in
+                        chunks.into_iter().zip(timing_texts).enumerate()
+                    {
+                        plan.push(PlannedChunk {
+                            voice: voice.map(str::to_string),
+                            spoken,
+                            timing,
+                            role: None,
+                            pause_before_ms: if index == 0 {
+                                std::mem::take(&mut pending_pause_ms)
+                            } else {
+                                0
+                            },
+                            pause_after_ms: 0,
+                            rate: current_rate,
+                        });
+                    }
+                }
+            }
+        }
+        if pending_pause_ms > 0 {
+            if let Some(last) = plan.last_mut() {
+                last.pause_after_ms = last.pause_after_ms.saturating_add(pending_pause_ms);
+            }
+        }
+        if plan.is_empty() {
             return Err(SynthError::BadRequest(
                 "text contains no speakable content".into(),
             ));
         }
-        let timing_texts = timing_texts(text, &chunks, max_chars);
-        let plan: Vec<PlannedChunk> = chunks
-            .into_iter()
-            .zip(timing_texts)
-            .map(|(spoken, timing)| PlannedChunk {
-                voice: voice.map(str::to_string),
-                spoken,
-                timing,
-                role: None,
-                pause_before_ms: 0,
-                pause_after_ms: 0,
-                rate: None,
-            })
-            .collect();
+        let verbalizer = verbalizer.unwrap_or("off");
+        tracing::debug!(verbalizer, vb_ms, "chapter text verbalized");
 
         let audio = self.synthesize_planned_chunks(
             &plan,

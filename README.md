@@ -1,6 +1,6 @@
 # Promin TTS
 
-> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, roles, export and Back-ASR QC. v0.15 adds a **takes editor** to that UI: per-sentence A/B playback, regeneration with another voice/speed/text, activation and deletion of versions. v0.16 adds **role management** with inline dialogue markup. v0.17 adds **voice previews** before applying a voice, **local voice aliases** for friendlier names, a **collapsible sidebar**, an inline chapter-creation form that does not depend on browser prompts, and **chapter deletion** with automatic reindexing of audio and takes. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
+> **English summary:** native Ukrainian text-to-speech studio service written in **Rust** (Axum + ONNX Runtime, no Python at runtime). Hybrid deployment: local all-in-one desktop mode or thin client + remote server. Target hardware includes **CPU-only servers with baseline AVX** (no AVX2 required). v0.10 adds the multi-stage **HolosTTS** ONNX bundle (encoder → prosody → decoder) with windowed streaming that emits audio before a sentence finishes, plus model-identity tracking that invalidates cached takes when the model changes. v0.11 extends audiobook export with lossless **FLAC**, **ASS** karaoke subtitles with per-word timing, and per-chapter **audio diagnostics** (clipping, long pauses, DC offset, level). v0.12 adds **Back-ASR quality control**: a compact Ukrainian W2V-BERT CTC model transcribes finished chapters, aligns the transcript with the spoken script and reports **WER/CER** with per-word errors, segment windows and audio diagnostics. v0.13 adds **per-chapter export**: any completed chapters can be rendered into separate M4B/MP3/OGG/FLAC files with per-file SRT/VTT/ASS subtitles, as restart-safe asynchronous jobs. v0.14 adds an **embedded web UI**: a React + TypeScript SPA served by the same binary, covering projects, chapter editing, synthesis, roles, export and Back-ASR QC. v0.15 adds a **takes editor** to that UI: per-sentence A/B playback, regeneration with another voice/speed/text, activation and deletion of versions. v0.16 adds **role management** with inline dialogue markup. v0.17 adds **voice previews** before applying a voice, **local voice aliases** for friendlier names, a **collapsible sidebar**, an inline chapter-creation form that does not depend on browser prompts, and **chapter deletion** with automatic reindexing of audio and takes. v0.18 adds **voice cloning** from a WAV sample, a **pronunciation dictionary** editor (project and global), **cover image and audiobook metadata** in exports, **SSE-based job progress** in the UI, and inline **`[pause]`/`[rate]` markup**. It builds on v0.9 per-sentence takes, v0.8 dialogue roles and v0.7 PDF import, with export to **M4B**, **MP3**, **OGG/Opus** and **FLAC** plus combined SRT/VTT/ASS subtitles.
 
 Нативний (Rust) сервіс синтезу мовлення та озвучення довгого контенту (аудіокниги, підкасти) з гібридною архітектурою «клієнт — сервер», Docker-розгортанням та інтеграціями (Home Assistant / Wyoming, n8n, MCP).
 
@@ -75,6 +75,8 @@ W2V-BERT CTC-модель (ONNX + SentencePiece) транскрибує ауді
   скорочень, ініціалів, дробів і лапок.
 - `speech-text::dialogue` — розмітка діалогів `Ім'я: репліка` та `[Ім'я] репліка`
   для зареєстрованих ролей; невідомі префікси лишаються нарацією.
+- `speech-text::markup` — інлайн-директиви `[pause 500ms]` (пауза) та
+  `[rate:1.2]` (швидкість подальшого тексту); невідомі директиви — помилка.
 - `speech-inference::accentor` — accentor-lite (ONNX LSTM, 1.2 MB): наголос для
   OOV-слів; словник має пріоритет. Golden-тест 54/54 проти C++ `holos::Accentor`.
 - `speech-inference::voice_encoder` — ONNX voice encoder: wave float32 `[1,N]` @24 кГц
@@ -334,13 +336,16 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 - прослуховування готового WAV глави;
 - тейки речень: A/B-прослуховування, перегенерація з іншим голосом,
   темпом або текстом, активація та видалення версій;
-- ролі діалогу, голос нарації та швидкість;
-- експорт книги й окремих глав у `M4B`/`MP3`/`OGG`/`FLAC` із субтитрами;
+- ролі діалогу, голос нарації та швидкість; клонування голосу з WAV-зразка
+  та керування клонованими голосами;
+- словник вимови: проєктні та глобальні правила (підрядок/regex);
+- експорт книги й окремих глав у `M4B`/`MP3`/`OGG`/`FLAC` із субтитрами,
+  обкладинкою та метаданими (назва, автор, альбом, диктор, рік, опис);
 - запуск і перегляд Back-ASR QC (WER/CER, проблемні сегменти).
 
-Статуси job-ів оновлюються опитуванням кожні 3 секунди: SSE-ендпоінт
-`/v1/jobs/{id}/events` існує, але браузерний `EventSource` не передає
-заголовок `Authorization`, тому UI поки не використовує його.
+Статуси job-ів оновлюються через SSE (`/v1/jobs/{id}/events`). Браузерний
+`EventSource` не передає заголовок `Authorization`, тому UI використовує
+fetch-стрімінг із тим самим API-ключем.
 
 Збірка фронтенду (потрібен Node.js 20+):
 
@@ -419,6 +424,8 @@ npm run dev   # http://localhost:5173, проксі на 127.0.0.1:8010
 | `DELETE` | `/v1/jobs/{id}` | Скасувати: 204, 404 або 409 (уже завершено) |
 | `GET` | `/v1/jobs/{id}/audio` | Готовий WAV; 409, якщо завдання не завершене |
 | `GET` | `/v1/jobs/{id}/events` | SSE-потік подій `job` |
+| `GET` | `/v1/pronunciation` | Глобальний словник вимови |
+| `PUT` | `/v1/pronunciation` | Замінити глобальний словник `{rules: [...]}` |
 | `POST` | `/v1/audio/speech` | OpenAI-сумісний синтез (`wav`/`pcm`) |
 | `GET` | `/v1/audio/voices` | Голоси у форматі OpenAI-подібного списку |
 | `GET` | `/v1/models` | OpenAI-сумісний список моделей |
@@ -448,6 +455,20 @@ npm run dev   # http://localhost:5173, проксі на 127.0.0.1:8010
   `X-Promin-Vb-Ms`, `X-Promin-Chunks`, `X-Promin-Audio-Ms`.
 - Потоковий WAV: PCM16 24 кГц mono, кожен чанк нормалізується окремо;
   заголовок WAV містить `u32::MAX` замість невідомих розмірів.
+
+### Інлайн-розмітка
+
+У тексті глав і запитів синтезу можна керувати паузами та швидкістю:
+
+```text
+Перше речення. [pause 500ms] Друге речення. [rate:1.2] Це швидше.
+[rate:0.8] А це повільніше.
+```
+
+- `[pause 500ms]` — вставити паузу мовчання (також `[pause 1s]`).
+- `[rate:1.2]` — змінити швидкість для всього подальшого тексту до наступної
+  директиви `rate` (0.5–2.0).
+- Невідомі директиви повертають `400` із поясненням.
 
 ### Довгі тексти та job-и
 

@@ -59,6 +59,7 @@ import {
   putProjectPronunciation,
 } from '../services/api';
 import type { PerChapterExportJob } from '../services/api';
+import type { JobEventStream } from '../services/api';
 import type {
   Chapter,
   ChapterTakes,
@@ -192,19 +193,19 @@ export default function ProjectEditor() {
 
   // Job-и та експорти оновлюються через SSE замість пулінгу.
   // Відкриваємо одне SSE-з’єднання на кожен активний job і оновлюємо його в стані.
-  const jobSourcesRef = useRef<Map<string, EventSource>>(new Map());
+  const jobSourcesRef = useRef<Map<string, JobEventStream>>(new Map());
 
   function closeJobSource(jobId: string) {
-    const es = jobSourcesRef.current.get(jobId);
-    if (es) {
-      es.close();
+    const stream = jobSourcesRef.current.get(jobId);
+    if (stream) {
+      stream.close();
       jobSourcesRef.current.delete(jobId);
     }
   }
 
   function openJobSource(jobId: string) {
     if (jobSourcesRef.current.has(jobId)) return;
-    const es = jobEvents(jobId, (event) => {
+    const stream = jobEvents(jobId, (event) => {
       try {
         const data = JSON.parse(event.data) as JobStatus;
         setJobs((jobs) =>
@@ -219,10 +220,10 @@ export default function ProjectEditor() {
           void loadProject();
         }
       } catch {
-        /* некоректне поділю події — ігноруємо */
+        /* некоректна подія — ігноруємо */
       }
     });
-    jobSourcesRef.current.set(jobId, es);
+    jobSourcesRef.current.set(jobId, stream);
   }
 
   useEffect(() => {
@@ -238,11 +239,16 @@ export default function ProjectEditor() {
     for (const jobId of activeIds) {
       openJobSource(jobId);
     }
-    return () => {
-      for (const es of jobSourcesRef.current.values()) es.close();
-      jobSourcesRef.current.clear();
-    };
   }, [jobs]);
+
+  // Закриваємо всі SSE-з’єднання при розмонтуванні.
+  useEffect(() => {
+    const sources = jobSourcesRef.current;
+    return () => {
+      for (const stream of sources.values()) stream.close();
+      sources.clear();
+    };
+  }, []);
 
   // Початкове завантаження (із повторним оновленням, якщо щось активне).
   useEffect(() => {
@@ -1291,6 +1297,11 @@ export default function ProjectEditor() {
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-gray-900 font-mono text-sm leading-relaxed"
                       rows={24}
                     />
+                    <p className="mt-1 text-xs text-gray-500">
+                      Розмітка: <code className="font-mono">[pause 500ms]</code>{' '}
+                      — пауза, <code className="font-mono">[rate:1.2]</code> —
+                      швидкість для подальшого тексту.
+                    </p>
                   </div>
                   <div className="p-3 bg-blue-50 border border-blue-100 rounded-lg">
                     <p className="text-xs font-medium text-blue-900 mb-2">

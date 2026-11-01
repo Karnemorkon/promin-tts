@@ -293,13 +293,60 @@ export function cancelJob(id: string) {
   return request<void>(`/v1/jobs/${id}`, { method: 'DELETE' });
 }
 
+/** SSE-клієнт на базі fetch: передає Authorization і працює з API-ключем. */
+export interface JobEventStream {
+  close: () => void;
+}
+
 export function jobEvents(
   id: string,
   onEvent: (event: MessageEvent) => void
-): EventSource {
-  const es = new EventSource(`${getBaseUrl()}/v1/jobs/${id}/events`);
-  es.addEventListener('job', (event) => onEvent(event as MessageEvent));
-  return es;
+): JobEventStream {
+  const controller = new AbortController();
+  const url = `${getBaseUrl()}/v1/jobs/${encodeURIComponent(id)}/events`;
+
+  void (async () => {
+    try {
+      const res = await fetch(url, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) return;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE-події розділяються порожнім рядком.
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary !== -1) {
+          const raw = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          let eventName = 'message';
+          let data = '';
+          for (const line of raw.split('\n')) {
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              data += (data ? '\n' : '') + line.slice(5).trim();
+            }
+          }
+          if (eventName === 'job' && data) {
+            onEvent(new MessageEvent('job', { data }));
+          }
+          boundary = buffer.indexOf('\n\n');
+        }
+      }
+    } catch {
+      /* з’єднання закрито або мережева помилка */
+    }
+  })();
+
+  return { close: () => controller.abort() };
 }
 
 /* ---------- Exports ---------- */
