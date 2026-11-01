@@ -779,6 +779,11 @@ export default function ProjectEditor() {
       } else if (result.skipped.length > 0) {
         setNotice('Усі вибрані глави вже готові');
       }
+      // Відразу відкриваємо SSE-потоки для нових jobів, не чекаючи на loadJobs(),
+      // щоб не пропустити зміну статусу, якщо завдання виконається швидко.
+      for (const job of result.jobs) {
+        openJobSource(job.job_id);
+      }
       await loadJobs();
       await loadProject();
     } catch (err: unknown) {
