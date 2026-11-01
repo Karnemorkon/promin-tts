@@ -132,11 +132,13 @@ pub fn speakable_text(units: &[MarkupUnit]) -> String {
 
 /// Загальна тривалість усіх пауз у мілісекундах.
 pub fn total_pause_ms(units: &[MarkupUnit]) -> u64 {
-    units.iter().filter_map(|u| match u {
-        MarkupUnit::Pause(ms) => Some(*ms),
-        _ => None,
-    })
-    .sum()
+    units
+        .iter()
+        .filter_map(|u| match u {
+            MarkupUnit::Pause(ms) => Some(*ms),
+            _ => None,
+        })
+        .sum()
 }
 
 #[cfg(test)]

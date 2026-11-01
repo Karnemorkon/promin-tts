@@ -1198,9 +1198,8 @@ impl SynthService {
             Some(reference) => Some(self.encode_reference(reference)?),
             None => None,
         };
-        let units = parse_markup(text).map_err(|error| {
-            SynthError::BadRequest(format!("invalid markup: {error}"))
-        })?;
+        let units = parse_markup(text)
+            .map_err(|error| SynthError::BadRequest(format!("invalid markup: {error}")))?;
         let mut plan = Vec::new();
         let mut verbalizer: Option<&'static str> = None;
         let mut vb_ms = 0u64;
@@ -1226,22 +1225,18 @@ impl SynthService {
                         continue;
                     }
                     let timing_texts = timing_texts(&segment_text, &chunks, max_chars);
-                    for (index, (spoken, timing)) in
-                        chunks.into_iter().zip(timing_texts).enumerate()
-                    {
-                        plan.push(PlannedChunk {
+                    for (spoken, timing) in chunks.into_iter().zip(timing_texts) {
+                        let mut chunk = PlannedChunk {
                             voice: voice.map(str::to_string),
                             spoken,
                             timing,
                             role: None,
-                            pause_before_ms: if index == 0 {
-                                std::mem::take(&mut pending_pause_ms)
-                            } else {
-                                0
-                            },
+                            pause_before_ms: 0,
                             pause_after_ms: 0,
                             rate: current_rate,
-                        });
+                        };
+                        take_pending_pause(&mut plan, &mut chunk, &mut pending_pause_ms);
+                        plan.push(chunk);
                     }
                 }
             }
@@ -1325,9 +1320,8 @@ impl SynthService {
         let mut vb_ms = 0u64;
         let mut pending_pause_ms: u64 = 0;
         for segment in segments {
-            let units = parse_markup(&segment.text).map_err(|error| {
-                SynthError::BadRequest(format!("invalid markup: {error}"))
-            })?;
+            let units = parse_markup(&segment.text)
+                .map_err(|error| SynthError::BadRequest(format!("invalid markup: {error}")))?;
             let voice = segment
                 .role
                 .as_ref()
@@ -1359,22 +1353,18 @@ impl SynthService {
                             continue;
                         }
                         let timing_texts = timing_texts(&text, &chunks, max_chars);
-                        for (index, (spoken, timing)) in
-                            chunks.into_iter().zip(timing_texts).enumerate()
-                        {
-                            plan.push(PlannedChunk {
+                        for (spoken, timing) in chunks.into_iter().zip(timing_texts) {
+                            let mut chunk = PlannedChunk {
                                 voice: voice.clone(),
                                 spoken,
                                 timing,
                                 role: segment.role.clone(),
-                                pause_before_ms: if index == 0 {
-                                    std::mem::take(&mut pending_pause_ms)
-                                } else {
-                                    0
-                                },
+                                pause_before_ms: 0,
                                 pause_after_ms: 0,
                                 rate: current_rate,
-                            });
+                            };
+                            take_pending_pause(&mut plan, &mut chunk, &mut pending_pause_ms);
+                            plan.push(chunk);
                         }
                     }
                 }
@@ -1479,7 +1469,7 @@ impl SynthService {
             }
             if chunk.pause_after_ms > 0 {
                 let count = samples_for_ms(chunk.pause_after_ms);
-                samples.extend(std::iter::repeat(0.0f32).take(count));
+                samples.extend(std::iter::repeat_n(0.0f32, count));
             }
             audio_chunks.push(samples);
             if let Some(cb) = progress.as_deref_mut() {
@@ -1585,6 +1575,25 @@ fn samples_to_ms(samples: usize) -> u64 {
 /// Кількість семплів для паузи заданої тривалості.
 fn samples_for_ms(ms: u64) -> usize {
     (ms as f64 / 1000.0 * SAMPLE_RATE as f64).round() as usize
+}
+
+/// Прикріпити накопичену паузу до попереднього чанка, а якщо його ще немає —
+/// перед наступним. Так пауза не потрапляє в таймінги субтитрів наступного
+/// речення.
+fn take_pending_pause(
+    plan: &mut [PlannedChunk],
+    chunk: &mut PlannedChunk,
+    pending_pause_ms: &mut u64,
+) {
+    if *pending_pause_ms == 0 {
+        return;
+    }
+    if let Some(previous) = plan.last_mut() {
+        previous.pause_after_ms = previous.pause_after_ms.saturating_add(*pending_pause_ms);
+    } else {
+        chunk.pause_before_ms = *pending_pause_ms;
+    }
+    *pending_pause_ms = 0;
 }
 
 /// Склеїти сирі чанки у PCM глави: кросфейд, таймінги та LUFS.
