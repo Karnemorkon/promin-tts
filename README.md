@@ -184,6 +184,14 @@ models/
                               #        + exports/ (книга, per-chapter/)
 ```
 
+> **Голоси HolosTTS.** Вбудовані пресети `voices.npz` (бандл) і `voices.json`
+> (legacy) походять із HolosTTS. Автор HolosTTS зазначає, що диктори не
+> надавали згоди на синтез їхніх голосів і що домовлятися з ними потрібно
+> окремо ([discussion #5](https://huggingface.co/patriotyk/HolosTTS/discussions/5)).
+> MIT-ліцензія моделі не є дозволом на використання голосу людини; не
+> використовуйте ці пресети для публікації або монетизації синтезованого
+> мовлення без окремого дозволу диктора.
+
 Бандл шукається в корені `models/`, а також у `tts/`, `onnx/` і `holos-onnx/`.
 У режимі `auto` він має пріоритет над старим графом. Якщо локальних моделей
 немає зовсім, сервіс перевіряє наявність `holos_onnx.json` у HF: знайдений
@@ -1002,4 +1010,5 @@ cargo test -p speech-asr --release -- --ignored --nocapture
 
 - Код: [MIT](LICENSE).
 - Back-ASR: модель [`speech-uk/w2v-bert-v3-onnx`](https://huggingface.co/speech-uk/w2v-bert-v3-onnx) — Apache-2.0; крейт `asr-features` — MIT.
+- Голоси HolosTTS: вбудовані пресети походять із HolosTTS; автор HolosTTS зазначає, що диктори не надавали згоди на синтез їхніх голосів ([discussion #5](https://huggingface.co/patriotyk/HolosTTS/discussions/5)). MIT-ліцензія моделі не є дозволом на використання голосу людини; комерційне використання потребує окремого дозволу диктора.
 - Ваги нейромереж належать їхнім авторам (див. [Morkon/holos-native-models](https://huggingface.co/Morkon/holos-native-models), [patriotyk/HolosTTS](https://github.com/patriotyk/HolosTTS)); проєкт не афілійований з авторами моделей і надається «як є».
