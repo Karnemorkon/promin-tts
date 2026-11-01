@@ -1,6 +1,6 @@
 //! Синтез-сервіс: моделі, голоси, повний ланцюжок текст -> WAV.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -475,6 +475,17 @@ impl Engine {
         }
     }
 
+    /// Жорсткий ліміт кадрів декодера, якщо бандл його оголошує.
+    ///
+    /// Нові офіційні графи HolosTTS мають статичний `seq_length=1000`:
+    /// довший вхід падає в ORT, тому сервіс ріже довгі фонемні частини.
+    fn max_frames(&self) -> Option<usize> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Holos(pipeline) => Some(pipeline.max_frames()),
+        }
+    }
+
     fn is_streaming(&self) -> bool {
         match self {
             Self::Legacy(_) => false,
@@ -503,6 +514,92 @@ impl Engine {
             }
         }
     }
+}
+
+/// Чи помилка рушія — перевищення `max_frames` бандла.
+fn is_frame_limit_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("exceeding max_frames")
+}
+
+/// Комбіновані діакритики, які не можна відривати від базової літери.
+fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
+}
+
+/// Розбити занадто довгий фонемний рядок на шматки без розриву слів.
+///
+/// Спершу ріжемо по пробілах; якщо одне «слово» саме не влізає в бюджет,
+/// ділимо його по codepoint, не відриваючи комбіновані діакритики.
+fn split_phoneme_text(text: &str, max_tokens: usize, tokenizer: &CharTokenizer) -> Vec<String> {
+    let max_tokens = max_tokens.max(1);
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut current_tokens = 0usize;
+
+    for segment in text.split_inclusive(' ') {
+        let segment_tokens = tokenizer.encode(segment).len();
+        if current_tokens + segment_tokens <= max_tokens {
+            current.push_str(segment);
+            current_tokens += segment_tokens;
+            continue;
+        }
+        if !current.is_empty() {
+            pieces.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        if segment_tokens <= max_tokens {
+            current.push_str(segment);
+            current_tokens = segment_tokens;
+        } else {
+            pieces.extend(split_phoneme_segment(segment, max_tokens, tokenizer));
+        }
+    }
+
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
+}
+
+fn split_phoneme_segment(
+    segment: &str,
+    max_tokens: usize,
+    tokenizer: &CharTokenizer,
+) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut current_tokens = 0usize;
+
+    for ch in segment.chars() {
+        if current_tokens >= max_tokens && !is_combining_mark(ch) && !current.is_empty() {
+            pieces.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(ch);
+        if tokenizer.encode(&ch.to_string()).len() > 0 {
+            current_tokens += 1;
+        }
+    }
+
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
+}
+
+/// Початковий бюджет шматка: восьма частина ліміту кадрів із запасом.
+///
+/// Точна кількість кадрів залежить від передбачених тривалостей, тому при
+/// помилці ліміту шматок ділиться навпіл і повторюється.
+fn initial_phoneme_budget(max_frames: usize) -> usize {
+    (max_frames / 8).max(16)
 }
 
 /// Завантажені моделі + стан синтезу.
@@ -920,9 +1017,42 @@ impl SynthService {
             ));
         }
 
+        let max_frames = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .max_frames();
         let mut samples = Vec::new();
         for part in parts {
-            let ids = self.tokenizer.encode(&part);
+            samples.extend(self.synthesize_part(&part, voice_vector, speed, max_frames)?);
+        }
+
+        if samples.is_empty() {
+            return Err(SynthError::Internal(anyhow::anyhow!(
+                "model produced no audio samples"
+            )));
+        }
+        Ok(samples)
+    }
+
+    /// Синтез однієї фонемної частини; довгі частини ріжуться під ліміт кадрів.
+    fn synthesize_part(
+        &self,
+        part: &str,
+        voice_vector: &[f32],
+        speed: f32,
+        max_frames: Option<usize>,
+    ) -> Result<Vec<f32>, SynthError> {
+        let mut samples = Vec::new();
+        let mut queue: VecDeque<String> = match max_frames {
+            Some(limit) => {
+                split_phoneme_text(part, initial_phoneme_budget(limit), &self.tokenizer).into()
+            }
+            None => VecDeque::from([part.to_string()]),
+        };
+
+        while let Some(piece) = queue.pop_front() {
+            let ids = self.tokenizer.encode(&piece);
             if ids.is_empty() {
                 continue;
             }
@@ -931,18 +1061,34 @@ impl SynthService {
                 .engine
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let chunk = engine
-                .generate(&ids, voice_vector, speed)
-                .with_context(|| format!("generate audio for phonemes {part:?}"))?;
-            drop(engine);
-            samples.extend_from_slice(&chunk);
+            match engine.generate(&ids, voice_vector, speed) {
+                Ok(chunk) => samples.extend_from_slice(&chunk),
+                Err(error) if is_frame_limit_error(&error) => {
+                    let budget = ids.len() / 2;
+                    drop(engine);
+                    if budget == 0 {
+                        return Err(SynthError::Internal(error.context(format!(
+                            "generate audio for phonemes {piece:?}"
+                        ))));
+                    }
+                    let pieces = split_phoneme_text(&piece, budget, &self.tokenizer);
+                    if pieces.len() <= 1 {
+                        return Err(SynthError::Internal(error.context(format!(
+                            "generate audio for phonemes {piece:?}"
+                        ))));
+                    }
+                    for piece in pieces.into_iter().rev() {
+                        queue.push_front(piece);
+                    }
+                }
+                Err(error) => {
+                    return Err(SynthError::Internal(error.context(format!(
+                        "generate audio for phonemes {piece:?}"
+                    ))));
+                }
+            }
         }
 
-        if samples.is_empty() {
-            return Err(SynthError::Internal(anyhow::anyhow!(
-                "model produced no audio samples"
-            )));
-        }
         Ok(samples)
     }
 
@@ -968,25 +1114,21 @@ impl SynthService {
             ));
         }
 
+        let max_frames = self
+            .engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .max_frames();
         let mut produced = false;
         for part in parts {
-            let ids = self.tokenizer.encode(&part);
-            if ids.is_empty() {
-                continue;
-            }
-            // Один важкий ONNX-виклик за раз: модель int8 і так вантажить усі ядра.
-            let engine = self
-                .engine
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let keep = engine
-                .stream(&ids, voice_vector, speed, |samples| {
-                    produced = true;
-                    on_samples(samples)
-                })
-                .with_context(|| format!("stream audio for phonemes {part:?}"))?;
-            drop(engine);
-            if !keep {
+            if !self.stream_part(
+                &part,
+                voice_vector,
+                speed,
+                max_frames,
+                &mut produced,
+                &mut on_samples,
+            )? {
                 return Ok(false);
             }
         }
@@ -996,6 +1138,72 @@ impl SynthService {
                 "model produced no audio samples"
             )));
         }
+        Ok(true)
+    }
+
+    /// Стрімінг однієї фонемної частини; довгі частини ріжуться під ліміт кадрів.
+    fn stream_part<G>(
+        &self,
+        part: &str,
+        voice_vector: &[f32],
+        speed: f32,
+        max_frames: Option<usize>,
+        produced: &mut bool,
+        on_samples: &mut G,
+    ) -> Result<bool, SynthError>
+    where
+        G: FnMut(&[f32]) -> bool,
+    {
+        let mut queue: VecDeque<String> = match max_frames {
+            Some(limit) => {
+                split_phoneme_text(part, initial_phoneme_budget(limit), &self.tokenizer).into()
+            }
+            None => VecDeque::from([part.to_string()]),
+        };
+
+        while let Some(piece) = queue.pop_front() {
+            let ids = self.tokenizer.encode(&piece);
+            if ids.is_empty() {
+                continue;
+            }
+            // Один важкий ONNX-виклик за раз: модель int8 і так вантажить усі ядра.
+            let engine = self
+                .engine
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = engine.stream(&ids, voice_vector, speed, |samples| {
+                *produced = true;
+                on_samples(samples)
+            });
+            drop(engine);
+            match result {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) if is_frame_limit_error(&error) => {
+                    let budget = ids.len() / 2;
+                    if budget == 0 {
+                        return Err(SynthError::Internal(error.context(format!(
+                            "stream audio for phonemes {piece:?}"
+                        ))));
+                    }
+                    let pieces = split_phoneme_text(&piece, budget, &self.tokenizer);
+                    if pieces.len() <= 1 {
+                        return Err(SynthError::Internal(error.context(format!(
+                            "stream audio for phonemes {piece:?}"
+                        ))));
+                    }
+                    for piece in pieces.into_iter().rev() {
+                        queue.push_front(piece);
+                    }
+                }
+                Err(error) => {
+                    return Err(SynthError::Internal(error.context(format!(
+                        "stream audio for phonemes {piece:?}"
+                    ))));
+                }
+            }
+        }
+
         Ok(true)
     }
 
