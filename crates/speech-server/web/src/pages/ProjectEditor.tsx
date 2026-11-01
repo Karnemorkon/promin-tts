@@ -50,6 +50,8 @@ import {
   rebuildChapter,
   invalidateTakes,
   unitTakeAudioUrl,
+  cloneVoice,
+  deleteVoice,
 } from '../services/api';
 import type { PerChapterExportJob } from '../services/api';
 import type {
@@ -133,7 +135,16 @@ export default function ProjectEditor() {
   const [newRoleName, setNewRoleName] = useState('');
   const [newRoleVoice, setNewRoleVoice] = useState('');
   const [assignRole, setAssignRole] = useState('');
+  const [cloneName, setCloneName] = useState('');
+  const [cloneFile, setCloneFile] = useState<File | null>(null);
+  const [cloneLoading, setCloneLoading] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
+  const [cloneDeleteConfirm, setCloneDeleteConfirm] = useState<string | null>(
+    null
+  );
+
   const chapterTextRef = useRef<HTMLTextAreaElement>(null);
+  const cloneFileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setTakesChapter('');
@@ -306,6 +317,57 @@ export default function ProjectEditor() {
       ...project,
       settings: { ...project.settings, voice_aliases: aliases },
     });
+  }
+
+  function fileToBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        // Remove data URL prefix.
+        const base64 = result.split(',')[1];
+        resolve(base64);
+      };
+      reader.onerror = (e) => reject(e);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function handleCloneVoice() {
+    if (!cloneName.trim() || !cloneFile) {
+      setCloneError('Введіть назву голосу та виберіть файл');
+      return;
+    }
+    setCloneLoading(true);
+    setCloneError(null);
+    try {
+      const base64 = await fileToBase64(cloneFile);
+      await cloneVoice(cloneName.trim(), base64);
+      setNotice(`Створено клонований голос: ${cloneName.trim()}`);
+      setCloneName('');
+      setCloneFile(null);
+      if (cloneFileInputRef.current) cloneFileInputRef.current.value = '';
+      await loadVoices();
+    } catch (err: unknown) {
+      setCloneError(err instanceof Error ? err.message : 'Не вдалося клонувати голос');
+    } finally {
+      setCloneLoading(false);
+    }
+  }
+
+  async function handleDeleteCustomVoice(name: string) {
+    setLoading(true);
+    setError(null);
+    try {
+      await deleteVoice(name);
+      setNotice(`Голос "${name}" видалено`);
+      setCloneDeleteConfirm(null);
+      await loadVoices();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Не вдалося видалити голос');
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function handleSaveProject() {
@@ -1177,6 +1239,106 @@ export default function ProjectEditor() {
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
                 />
               </div>
+            </div>
+
+            <div className="mb-5 p-3 bg-gray-50 rounded-lg">
+              <p className="text-xs font-medium text-gray-500 mb-2">
+                Клонувати голос
+              </p>
+              <p className="text-xs text-gray-500 mb-3">
+                Завантажте WAV-запис чистої мови (5–30 с). Сервер створить
+                клонований голос, доступний для нарації та ролей.
+              </p>
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="flex-1 min-w-40">
+                  <label className="block text-xs text-gray-500 mb-1">
+                    Назва голосу
+                  </label>
+                  <input
+                    value={cloneName}
+                    onChange={(e) => setCloneName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        void handleCloneVoice();
+                      }
+                    }}
+                    placeholder="Наприклад, Мій голос"
+                    maxLength={40}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                  />
+                </div>
+                <div className="flex-1 min-w-40">
+                  <label className="block text-xs text-gray-500 mb-1">
+                    WAV-файл
+                  </label>
+                  <input
+                    ref={cloneFileInputRef}
+                    type="file"
+                    accept="audio/wav,.wav"
+                    onChange={(e) => setCloneFile(e.target.files?.[0] ?? null)}
+                    className="w-full text-xs text-gray-600 file:mr-2 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                  />
+                </div>
+                <button
+                  onClick={() => void handleCloneVoice()}
+                  disabled={cloneLoading || !cloneName.trim() || !cloneFile}
+                  className="flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {cloneLoading ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Mic className="w-4 h-4" />
+                  )}
+                  {cloneLoading ? 'Клонування…' : 'Клонувати'}
+                </button>
+              </div>
+              {cloneError && (
+                <p className="mt-2 text-xs text-red-600">{cloneError}</p>
+              )}
+              {voices?.custom && voices.custom.length > 0 && (
+                <div className="mt-3">
+                  <p className="text-xs font-medium text-gray-500 mb-1">
+                    Клоновані голоси
+                  </p>
+                  <ul className="divide-y divide-gray-200 rounded-lg border border-gray-200 bg-white">
+                    {voices.custom.map((name) => (
+                      <li
+                        key={name}
+                        className="flex items-center justify-between gap-2 px-3 py-2"
+                      >
+                        <span className="text-sm text-gray-700 truncate">
+                          {voiceLabel(name, true)}
+                        </span>
+                        {cloneDeleteConfirm === name ? (
+                          <span className="flex items-center gap-2 shrink-0">
+                            <button
+                              onClick={() => void handleDeleteCustomVoice(name)}
+                              className="text-xs px-2 py-1 rounded bg-red-600 text-white hover:bg-red-700"
+                            >
+                              Видалити
+                            </button>
+                            <button
+                              onClick={() => setCloneDeleteConfirm(null)}
+                              className="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+                            >
+                              Скасувати
+                            </button>
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => setCloneDeleteConfirm(name)}
+                            title={`Видалити ${name}`}
+                            className="p-1.5 text-gray-400 hover:text-red-600 rounded-lg hover:bg-red-50 shrink-0"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
 
             <div className="mb-5 p-3 bg-blue-50 border border-blue-100 rounded-lg">

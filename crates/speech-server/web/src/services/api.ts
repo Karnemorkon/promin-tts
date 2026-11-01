@@ -460,6 +460,19 @@ export function listVoices() {
   return request<VoicesResponse>('/api/voices');
 }
 
+export function cloneVoice(name: string, audioBase64: string) {
+  return request<{ name: string; dim: number }>('/api/voices', {
+    method: 'POST',
+    body: JSON.stringify({ name, audio_base64: audioBase64 }),
+  });
+}
+
+export function deleteVoice(name: string) {
+  return request<void>(`/api/voices/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
 export function listModels() {
   return request<{ object: string; data: ModelInfo[] }>('/v1/models');
 }
