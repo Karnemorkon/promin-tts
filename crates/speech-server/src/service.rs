@@ -1023,8 +1023,12 @@ impl SynthService {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .max_frames();
         let mut samples = Vec::new();
-        for part in parts {
-            samples.extend(self.synthesize_part(&part, voice_vector, speed, max_frames)?);
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                let silence = samples_for_ms(150);
+                samples.extend(std::iter::repeat_n(0.0f32, silence));
+            }
+            samples.extend(self.synthesize_part(part, voice_vector, speed, max_frames)?);
         }
 
         if samples.is_empty() {
@@ -1067,24 +1071,24 @@ impl SynthService {
                     let budget = ids.len() / 2;
                     drop(engine);
                     if budget == 0 {
-                        return Err(SynthError::Internal(error.context(format!(
-                            "generate audio for phonemes {piece:?}"
-                        ))));
+                        return Err(SynthError::Internal(
+                            error.context(format!("generate audio for phonemes {piece:?}")),
+                        ));
                     }
                     let pieces = split_phoneme_text(&piece, budget, &self.tokenizer);
                     if pieces.len() <= 1 {
-                        return Err(SynthError::Internal(error.context(format!(
-                            "generate audio for phonemes {piece:?}"
-                        ))));
+                        return Err(SynthError::Internal(
+                            error.context(format!("generate audio for phonemes {piece:?}")),
+                        ));
                     }
                     for piece in pieces.into_iter().rev() {
                         queue.push_front(piece);
                     }
                 }
                 Err(error) => {
-                    return Err(SynthError::Internal(error.context(format!(
-                        "generate audio for phonemes {piece:?}"
-                    ))));
+                    return Err(SynthError::Internal(
+                        error.context(format!("generate audio for phonemes {piece:?}")),
+                    ));
                 }
             }
         }
@@ -1182,24 +1186,24 @@ impl SynthService {
                 Err(error) if is_frame_limit_error(&error) => {
                     let budget = ids.len() / 2;
                     if budget == 0 {
-                        return Err(SynthError::Internal(error.context(format!(
-                            "stream audio for phonemes {piece:?}"
-                        ))));
+                        return Err(SynthError::Internal(
+                            error.context(format!("stream audio for phonemes {piece:?}")),
+                        ));
                     }
                     let pieces = split_phoneme_text(&piece, budget, &self.tokenizer);
                     if pieces.len() <= 1 {
-                        return Err(SynthError::Internal(error.context(format!(
-                            "stream audio for phonemes {piece:?}"
-                        ))));
+                        return Err(SynthError::Internal(
+                            error.context(format!("stream audio for phonemes {piece:?}")),
+                        ));
                     }
                     for piece in pieces.into_iter().rev() {
                         queue.push_front(piece);
                     }
                 }
                 Err(error) => {
-                    return Err(SynthError::Internal(error.context(format!(
-                        "stream audio for phonemes {piece:?}"
-                    ))));
+                    return Err(SynthError::Internal(
+                        error.context(format!("stream audio for phonemes {piece:?}")),
+                    ));
                 }
             }
         }
