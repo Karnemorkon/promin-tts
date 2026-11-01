@@ -6,13 +6,14 @@ import {
   MousePointerClick,
   PanelLeftClose,
   PanelLeftOpen,
+  Cpu,
 } from 'lucide-react';
 import { useConnection } from '../stores/connection';
 
 const COLLAPSE_KEY = 'promin_navbar_collapsed';
 
 export default function Navbar({ onDisconnect }: { onDisconnect: () => void }) {
-  const { state } = useConnection();
+  const { state, setState } = useConnection();
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem(COLLAPSE_KEY) === '1';
@@ -81,11 +82,30 @@ export default function Navbar({ onDisconnect }: { onDisconnect: () => void }) {
         } border-t border-gray-200 space-y-2`}
       >
         {!collapsed && (
-          <div className="text-xs text-gray-500">
+          <div className="text-xs text-gray-500 space-y-2">
             <div className="font-medium text-gray-700">
               {state.mode === 'local' ? 'Локальний сервер' : 'Віддалений сервер'}
             </div>
             <div className="truncate">{state.baseUrl || window.location.origin}</div>
+            <div className="flex items-center gap-2 mt-1 pt-2 border-t border-gray-100">
+              <Cpu className={`w-4 h-4 ${state.bundleType === 'fp32' ? 'text-blue-600' : 'text-gray-500'}`} />
+              <span className="text-sm">
+                {state.bundleType === 'fp32' ? 'Бандл fp32' : 'Бандл int8'}
+              </span>
+              <select
+                value={state.bundleType}
+                onChange={(e) => {
+                  // Heuristic: notify server via healthz is not needed;
+                  // the client just marks preference. Server-side
+                  // selection is handled by PROMIN_HF_BUNDLE_PREFIX env.
+                  setState({ bundleType: e.target.value as 'fp32' | 'int8' });
+                }}
+                className="ml-2 text-xs border border-gray-300 rounded px-1 py-0.5 bg-white"
+              >
+                <option value="fp32">fp32</option>
+                <option value="int8">int8</option>
+              </select>
+            </div>
           </div>
         )}
         <button

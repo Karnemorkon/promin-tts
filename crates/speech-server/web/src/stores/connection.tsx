@@ -13,6 +13,7 @@ export interface ConnectionState {
   baseUrl: string;
   apiKey: string | null;
   connected: boolean;
+  bundleType: 'fp32' | 'int8';
 }
 
 const STORAGE_KEY = 'promin_connection';
@@ -22,6 +23,7 @@ const initial: ConnectionState = {
   baseUrl: '',
   apiKey: null,
   connected: false,
+  bundleType: 'fp32',
 };
 
 /** Відновлює режим/URL із localStorage (API-ключ зберігається окремо). */
@@ -36,6 +38,7 @@ function loadInitial(): ConnectionState {
       baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '',
       apiKey: loadApiKey(),
       connected: parsed.connected === true,
+      bundleType: parsed.bundleType === 'int8' ? 'int8' : 'fp32',
     };
   } catch {
     return initial;
@@ -63,6 +66,7 @@ export function ConnectionProvider({ children }: { children: ReactNode }) {
           mode: state.mode,
           baseUrl: state.baseUrl,
           connected: state.connected,
+          bundleType: state.bundleType,
         })
       );
     } catch {

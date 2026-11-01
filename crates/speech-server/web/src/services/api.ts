@@ -123,7 +123,8 @@ export function getProject(id: string) {
 export async function synthesizeVoiceSample(
   text: string,
   voice?: string,
-  speed = 1
+  speed = 1,
+  bundleType?: 'fp32' | 'int8'
 ): Promise<Blob> {
   const res = await fetch(`${getBaseUrl()}/api/synthesize`, {
     method: 'POST',
@@ -132,6 +133,7 @@ export async function synthesizeVoiceSample(
       text,
       voice: voice || undefined,
       speed,
+      bundle_type: bundleType,
     }),
   });
   if (!res.ok) {
@@ -217,11 +219,12 @@ export interface GenerateResult {
 export function generateChapters(
   id: string,
   chapters?: number[],
-  force: boolean = false
+  force: boolean = false,
+  bundleType?: 'fp32' | 'int8'
 ) {
   return request<GenerateResult>(`/v1/projects/${id}/generate`, {
     method: 'POST',
-    body: JSON.stringify({ chapters, force }),
+    body: JSON.stringify({ chapters, force, bundle_type: bundleType }),
   });
 }
 

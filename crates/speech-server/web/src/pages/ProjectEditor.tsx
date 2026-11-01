@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { useConnection } from '../stores/connection';
 import {
   ArrowLeft,
   Play,
@@ -755,11 +756,13 @@ export default function ProjectEditor() {
     if (!id) return;
     setError(null);
     setNotice(null);
+    const { state } = useConnection();
     try {
       const result = await generateChapters(
         id,
         chapterIndex === undefined ? undefined : [chapterIndex],
-        false
+        false,
+        state.bundleType
       );
       const queued = result.jobs.length;
       if (queued > 0) {
