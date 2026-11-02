@@ -1,4 +1,5 @@
-//! Аудіо-хелпери: float32 -> PCM16, WAV (PCM16 mono), декодування та ресемплінг.
+//! Аудіо-хелпери: float32 -> PCM16, WAV (PCM16 mono), декодування,
+//! ресемплінг, кросфейд, LUFS та DSP-ефекти (Pitch/Reverb/Compression).
 //!
 //! Порт `audio.cpp` з holos-tts-core: пікова нормалізація на весь масив,
 //! clip у [-1, 1], округлення `lround(x * 32767)`, WAV 24 кГц mono.
@@ -6,6 +7,7 @@
 pub mod crossfade;
 pub mod decode;
 pub mod diagnostics;
+pub mod effects;
 pub mod loudness;
 pub mod resample;
 
