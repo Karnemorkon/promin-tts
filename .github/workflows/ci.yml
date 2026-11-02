@@ -143,6 +143,8 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev \
             patchelf desktop-file-utils
       - name: Pre-extract linuxdeploy + appimage plugin to tauri cache (avoids FUSE)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
           mkdir -p ~/.cache/tauri
           cd ~/.cache/tauri
