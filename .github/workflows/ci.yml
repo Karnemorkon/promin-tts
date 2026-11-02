@@ -134,12 +134,19 @@ jobs:
           echo "staging $so"
           cp "$so" \
             desktop/src-tauri/bin/libonnxruntime.so.1-x86_64-unknown-linux-gnu
-      - name: Install FUSE (for AppImage)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fuse libfuse2
+      - name: Install FUSE + AppImage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fuse libfuse2 \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            patchelf desktop-file-utils
       - name: Build installers (deb + AppImage)
         working-directory: desktop/src-tauri
         env:
           TAURI_LOG: debug
+          LINUXDEPLOY_VERBOSE: 1
         run: npx --yes "@tauri-apps/cli@^2" build
       - uses: actions/upload-artifact@v4
         with:
