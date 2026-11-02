@@ -83,12 +83,7 @@ impl HolosPipeline {
         let dir = dir.as_ref();
         let bundle = Bundle::open(dir, VOICE_DIM)
             .with_context(|| format!("open Holos bundle {}", dir.display()))?;
-        let env = Arc::new(
-            Environment::builder()
-                .with_name("promin-tts-holos")
-                .build()
-                .context("create ONNX Runtime environment (holos bundle)")?,
-        );
+        let env = Arc::new(crate::runtime::build_environment("promin-tts-holos")?);
         let threads = intra_threads.max(1);
 
         let encoder = load_stage(&env, &bundle.stage(&bundle.manifest.encoder), threads)?;

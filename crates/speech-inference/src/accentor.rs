@@ -93,12 +93,7 @@ pub struct Accentor {
 impl Accentor {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let env = Arc::new(
-            Environment::builder()
-                .with_name("promin-tts-accentor")
-                .build()
-                .context("create ONNX Runtime environment (accentor)")?,
-        );
+        let env = Arc::new(crate::runtime::build_environment("promin-tts-accentor")?);
         let session = SessionBuilder::new(&env)?
             .with_intra_threads(1)?
             .with_inter_threads(1)?

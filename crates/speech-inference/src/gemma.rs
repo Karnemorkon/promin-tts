@@ -73,12 +73,7 @@ impl GemmaVerbalizer {
         let eos_id = special_id(&tokenizer, "<eos>")?;
         let eos_ids = vec![eos_id, end_turn_id];
 
-        let env = Arc::new(
-            Environment::builder()
-                .with_name("promin-tts-gemma")
-                .build()
-                .context("create ONNX Runtime environment (Gemma)")?,
-        );
+        let env = Arc::new(crate::runtime::build_environment("promin-tts-gemma")?);
         let session = SessionBuilder::new(&env)?
             .with_intra_threads(intra_threads.max(1))?
             .with_optimization_level(GraphOptimizationLevel::Level3)?

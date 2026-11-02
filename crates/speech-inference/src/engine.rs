@@ -117,12 +117,7 @@ impl TtsEngine {
         let model_path = model_path.as_ref();
         let intra_threads = intra_threads.max(1);
 
-        let env = Arc::new(
-            Environment::builder()
-                .with_name("promin-tts")
-                .build()
-                .context("create ONNX Runtime environment")?,
-        );
+        let env = Arc::new(crate::runtime::build_environment("promin-tts")?);
         let session = SessionBuilder::new(&env)?
             .with_intra_threads(intra_threads)?
             .with_model_from_file(model_path)

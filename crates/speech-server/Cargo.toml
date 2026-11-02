@@ -42,5 +42,10 @@ clap = { version = "4", features = ["derive", "env"] }
 rust-embed = "8"
 tower-http = { version = "0.5", features = ["cors"] }
 
+[features]
+default = []
+# Прокидає CUDA EP у speech-inference (див. deploy/Dockerfile.gpu).
+gpu = ["speech-inference/gpu"]
+
 [dev-dependencies]
 hound.workspace = true

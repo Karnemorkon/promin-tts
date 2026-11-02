@@ -1233,6 +1233,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
+dependencies = [
+ "cfg-if",
+ "winapi",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1528,6 +1538,7 @@ dependencies = [
  "half",
  "lazy_static",
  "libc",
+ "libloading",
  "ndarray",
  "tar",
  "thiserror 1.0.69",
@@ -2250,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "speech-asr"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "asr-features",
@@ -2264,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "speech-audio"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "ebur128",
@@ -2277,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "speech-core"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2291,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "speech-export"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2313,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "speech-inference"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "ndarray",
@@ -2329,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "speech-server"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2360,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "speech-text"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "encoding_rs",

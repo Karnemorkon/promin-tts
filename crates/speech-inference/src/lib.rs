@@ -1,8 +1,10 @@
 pub mod accentor;
 pub mod bundle;
+pub mod cpu;
 pub mod engine;
 pub mod gemma;
 pub mod pipeline;
+pub mod runtime;
 pub mod voice_encoder;
 
 pub use accentor::Accentor;

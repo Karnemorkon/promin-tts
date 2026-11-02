@@ -1,16 +1,20 @@
 # GPU profile: NVIDIA CUDA (requires NVIDIA Container Toolkit on the host).
 # NOT testable on AVX-only hosts without a discrete GPU.
+# PROMIN_ORT_EP: auto (типово) — CUDA за наявності, інакше CPU;
+# cuda — вимагати CUDA (з попередженням і fallback на CPU, якщо її нема);
+# cpu — примусово CPU. Див. crates/speech-inference/src/runtime.rs.
 services:
   promin-tts:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile
+      dockerfile: deploy/Dockerfile.gpu
     image: morkon06/promin-tts:gpu
     container_name: promin-tts
     ports:
       - "8010:8010"
       - "10200:10200"
     environment:
+      - PROMIN_ORT_EP=${PROMIN_ORT_EP:-auto}
       - PROMIN_HTTP_ADDR=0.0.0.0:8010
       - PROMIN_WYOMING_ADDR=0.0.0.0:10200
       - PROMIN_MODELS_DIR=/data/models

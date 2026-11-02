@@ -392,6 +392,36 @@ curl -X POST http://localhost:8010/api/synthesize \
 Основна цільова платформа — сервери з процесорами, що мають лише **AVX** (без AVX2):
 Intel Xeon E5-2650 тощо. Образ фіксує ONNX Runtime **1.31.0** (офіційний x64 build).
 
+### GPU (CUDA)
+
+Профіль `gpu` (`deploy/Dockerfile.gpu` + `deploy/docker-compose.gpu.yml`)
+збирає бінарник із ознакою `gpu` (CUDA execution provider ONNX Runtime) і
+покладається на офіційний `onnxruntime-linux-x64-gpu_cuda12` 1.31.0
+(450 МБ). На хості обов'язковий NVIDIA Container Toolkit і NVIDIA GPU;
+CPU-бінарні образи GPU-коду не містять узагалі.
+
+Керування виконавцем — `PROMIN_ORT_EP`:
+
+| Значення | Поведінка |
+|---|---|
+| `auto` (типово) | CUDA, якщо ONNX Runtime повідомляє про `CUDAExecutionProvider`, інакше тихий fallback на CPU |
+| `cuda` | Вимагати CUDA; без неї (або без ознаки `gpu`) — попередження в лозі й CPU |
+| `cpu` | Завжди CPU |
+
+Обраний виконавець і рівень SIMD видно в `/healthz` (поля `execution_provider`
+та `cpu.simd`) і в логу старту. CUDA реєструється лише якщо бібліотека ORT
+справді має цей EP; за документацією `ort`, неправильно сконфігурований CUDA
+(немає драйвера/не та версія) може завершити процес при першому інференсі —
+тому GPU-образ призначений лише для хостів із GPU, а `auto` нічого не
+примушує.
+
+**SIMD-детекція.** Власного SIMD-коду в проєкті немає: кернели
+AVX-512 → AVX2 → AVX → SSE4.2 вибирає сам ONNX Runtime при створенні
+сесії за runtime-CPUID (без `SIGILL` на AVX-без AVX2 процесорах). Збірка
+ведеться без `-C target-cpu=native`, тож бінарник запускається на будь-якому
+x86-64. Рівень визначається при запуску (`speech_inference::cpu::detect()`)
+і потрапляє в `/healthz` як `cpu.simd` (`avx512|avx2|avx|sse4.2|neon|baseline`).
+
 ## Локальний запуск
 
 Потрібен ONNX Runtime 1.31.0 (наприклад, у `/opt/ort-1.31.0`), а також `cmake`
@@ -1012,6 +1042,7 @@ MCP audio content (`audio/wav` base64) і текст із метаданими.
 | `PROMIN_PUBLIC_URL` | `http://127.0.0.1:<port>` | База для `audio_url`/webhook |
 | `PROMIN_API_KEYS` | — | Ключі через кому; порожньо = без авторизації |
 | `PROMIN_THREADS` | `4` | ONNX intra-op threads |
+| `PROMIN_ORT_EP` | `auto` | `auto`/`cuda`/`cpu` — виконавець ONNX Runtime (CUDA лише у gpu-збірці) |
 | `PROMIN_AUTO_DOWNLOAD` | `auto` | Автозавантаження моделей |
 | `PROMIN_HF_*` | — | Репозиторій/ревізія/токен/дзеркало |
 | `RUST_LOG` | `info` | Рівень логування |

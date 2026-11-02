@@ -240,6 +240,8 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "engine": "promin-tts",
         "version": env!("CARGO_PKG_VERSION"),
+        "execution_provider": speech_inference::runtime::execution_provider(),
+        "cpu": speech_inference::cpu::detect(),
         "model": state.service.model_identity(),
         "voices": state.service.voice_count(),
         "custom_voices": state.service.custom_voice_count(),
@@ -1097,6 +1099,17 @@ async fn main() -> anyhow::Result<()> {
     let mut service = SynthService::load(&paths, args.threads, speakers_dir)?;
     service.set_pronunciation_store(Arc::clone(&pronunciation));
     let service = Arc::new(service);
+    // EP обирається при першому створенні середовища ORT (SynthService::load),
+    // тут фіксуємо результат і рівень SIMD для діагностики.
+    let cpu = speech_inference::cpu::detect();
+    tracing::info!(
+        execution_provider = speech_inference::runtime::execution_provider(),
+        arch = cpu.arch,
+        simd = cpu.simd,
+        avx2 = cpu.avx2,
+        avx512vnni = cpu.avx512vnni,
+        "ONNX Runtime execution provider and CPU SIMD level"
+    );
 
     let preferred_jobs = args
         .jobs_dir

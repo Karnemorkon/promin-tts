@@ -19,3 +19,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[features]
+default = []
+# CUDA execution provider. Вмикає лише код реєстрації CUDA в `ort` і
+# динамічне завантаження ONNX Runtime (`ort/load-dynamic`): бінарник не
+# лінкується з libonnxruntime на етапі збірки, тому GPU-збірка не потребує
+# CUDA-бібліотек у builder-етапі. Призначено для образу deploy/Dockerfile.gpu
+# (ORT_STRATEGY=system + onnxruntime-linux-x64-gpu_cuda12); у CPU-збірці
+# ознака вимкнена, `PROMIN_ORT_EP` вирішується в `cpu`.
+gpu = ["ort/cuda", "ort/load-dynamic"]

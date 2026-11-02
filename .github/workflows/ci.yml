@@ -31,5 +31,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (gpu feature)
+        run: ORT_STRATEGY=system cargo clippy -p speech-server --features gpu --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace

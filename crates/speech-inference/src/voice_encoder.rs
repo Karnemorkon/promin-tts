@@ -26,12 +26,9 @@ struct EncoderSession {
 
 impl EncoderSession {
     fn load(path: &Path, intra_threads: i16) -> Result<Self> {
-        let env = Arc::new(
-            Environment::builder()
-                .with_name("promin-tts-voice-encoder")
-                .build()
-                .context("create ONNX Runtime environment (voice encoder)")?,
-        );
+        let env = Arc::new(crate::runtime::build_environment(
+            "promin-tts-voice-encoder",
+        )?);
         let session = SessionBuilder::new(&env)?
             .with_intra_threads(intra_threads.max(1))?
             .with_inter_threads(1)?
