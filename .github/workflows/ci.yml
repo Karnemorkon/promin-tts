@@ -134,50 +134,15 @@ jobs:
           echo "staging $so"
           cp "$so" \
             desktop/src-tauri/bin/libonnxruntime.so.1-x86_64-unknown-linux-gnu
-      - name: Install FUSE + AppImage dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            fuse libfuse2 \
-            libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev \
-            patchelf desktop-file-utils
-      - name: Pre-extract linuxdeploy + appimage plugin to tauri cache (avoids FUSE)
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: 1
-        run: |
-          mkdir -p ~/.cache/tauri
-          cd ~/.cache/tauri
-          # linuxdeploy
-          curl -fsSLO https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy-07333c6/linuxdeploy-x86_64.AppImage
-          chmod +x linuxdeploy-x86_64.AppImage
-          ./linuxdeploy-x86_64.AppImage --appimage-extract
-          mv squashfs-root linuxdeploy-07333c6-x86_64
-          mv linuxdeploy-07333c6-x86_64/usr/bin/linuxdeploy linuxdeploy-07333c6-x86_64.AppImage
-          rm -rf linuxdeploy-07333c6-x86_64
-          # linuxdeploy-plugin-appimage (also an AppImage needing FUSE)
-          curl -fsSLO https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
-          chmod +x linuxdeploy-plugin-appimage-x86_64.AppImage
-          ./linuxdeploy-plugin-appimage-x86_64.AppImage --appimage-extract
-          mv squashfs-root linuxdeploy-plugin-appimage
-          mv linuxdeploy-plugin-appimage/usr/bin/linuxdeploy-plugin-appimage linuxdeploy-plugin-appimage.AppImage
-          rm -rf linuxdeploy-plugin-appimage
-          # Verify the extracted linuxdeploy binary works
-          echo "=== Verifying linuxdeploy binary ==="
-          ./linuxdeploy-07333c6-x86_64.AppImage --version || true
-          ldd ./linuxdeploy-07333c6-x86_64.AppImage || true
-      - name: Build installers (deb + AppImage)
+      - name: Build installer (deb only - AppImage disabled due to FUSE issues in CI)
         working-directory: desktop/src-tauri
         env:
           TAURI_LOG: debug
-          LINUXDEPLOY_VERBOSE: 1
-        run: npx --yes "@tauri-apps/cli@^2" build
+        run: npx --yes "@tauri-apps/cli@^2" build --targets deb
       - uses: actions/upload-artifact@v4
         with:
           name: promin-desktop-linux-x64
-          path: |
-            desktop/src-tauri/target/release/bundle/deb/*.deb
-            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          path: desktop/src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
       - name: Publish GitHub Release (теги v*)
         if: startsWith(github.ref, 'refs/tags/')
