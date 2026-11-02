@@ -162,6 +162,10 @@ jobs:
           mv squashfs-root linuxdeploy-plugin-appimage
           mv linuxdeploy-plugin-appimage/usr/bin/linuxdeploy-plugin-appimage linuxdeploy-plugin-appimage.AppImage
           rm -rf linuxdeploy-plugin-appimage
+          # Verify the extracted linuxdeploy binary works
+          echo "=== Verifying linuxdeploy binary ==="
+          ./linuxdeploy-07333c6-x86_64.AppImage --version || true
+          ldd ./linuxdeploy-07333c6-x86_64.AppImage || true
       - name: Build installers (deb + AppImage)
         working-directory: desktop/src-tauri
         env:
