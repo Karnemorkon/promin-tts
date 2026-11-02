@@ -134,6 +134,10 @@ jobs:
           echo "staging $so"
           cp "$so" \
             desktop/src-tauri/bin/libonnxruntime.so.1-x86_64-unknown-linux-gnu
+          # speech-server's DT_NEEDED requires libonnxruntime.so.1.16.0 (ort versioned name),
+          # not just libonnxruntime.so.1. Create the symlink so the bundled .so.1 satisfies it.
+          ln -sf libonnxruntime.so.1-x86_64-unknown-linux-gnu \
+            desktop/src-tauri/bin/libonnxruntime.so.1.16.0-x86_64-unknown-linux-gnu
       - name: Build installer (deb only - AppImage disabled due to FUSE issues in CI)
         working-directory: desktop/src-tauri
         env:
