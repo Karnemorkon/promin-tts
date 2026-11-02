@@ -110,17 +110,29 @@ jobs:
       - name: Stage sidecars (speech-server + libonnxruntime)
         # externalBin вимагає файли з суфіксом target triple; бандлер прибирає
         # суфікс, тож у пакеті вони ляжуть поруч як speech-server і
-        # libonnxruntime.so.1. ort копіює .so поруч із бінарником профілю.
+        # libonnxruntime.so.1. ort (download-стратегія) копіює поруч із
+        # бінарником профілю libonnxruntime.so та версійний .so.X — але не
+        # .so.1, якого вимагає NEEDED speech-server; ім'я створюємо самі.
         run: |
           mkdir -p desktop/src-tauri/bin
           cp target/release/speech-server \
             desktop/src-tauri/bin/speech-server-x86_64-unknown-linux-gnu
           chmod +x desktop/src-tauri/bin/speech-server-x86_64-unknown-linux-gnu
-          if [ ! -f target/release/libonnxruntime.so.1 ]; then
-            echo "target/release/libonnxruntime.so.1 not found (ort copy-dylibs)"
+          so=""
+          for candidate in \
+            target/release/libonnxruntime.so.1 \
+            target/release/libonnxruntime.so \
+            target/release/libonnxruntime.so.*; do
+            if [ -f "$candidate" ]; then so="$candidate"; break; fi
+          done
+          if [ -z "$so" ]; then
+            echo "libonnxruntime not found under target/release:"
+            ls -la target/release/libonnxruntime* || true
+            find target -name 'libonnxruntime.so*' -maxdepth 4 || true
             exit 1
           fi
-          cp target/release/libonnxruntime.so.1 \
+          echo "staging $so"
+          cp "$so" \
             desktop/src-tauri/bin/libonnxruntime.so.1-x86_64-unknown-linux-gnu
       - name: Build installers (deb + AppImage)
         working-directory: desktop/src-tauri
