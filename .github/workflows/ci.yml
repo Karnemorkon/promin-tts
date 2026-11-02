@@ -138,7 +138,7 @@ jobs:
         working-directory: desktop/src-tauri
         env:
           TAURI_LOG: debug
-        run: npx --yes "@tauri-apps/cli@^2" build --targets deb
+        run: npx --yes "@tauri-apps/cli@^2" build --target deb
       - uses: actions/upload-artifact@v4
         with:
           name: promin-desktop-linux-x64
