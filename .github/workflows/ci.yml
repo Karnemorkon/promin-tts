@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -69,3 +70,73 @@ jobs:
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Test (компілює та лінкує бінарник з GTK/WebKit)
         run: cargo test --manifest-path desktop/src-tauri/Cargo.toml
+
+  # Пакування desktop-інсталяторів (deb + AppImage) із вбудованим
+  # speech-server і libonnxruntime.so.1: артефакти на кожен push у main,
+  # GitHub Release — на тегах v*. Збірка на ubuntu-24.04 (glibc 2.39),
+  # щоб пакети запускалися на Debian 13 / Ubuntu 24.04+.
+  package:
+    needs: [test, desktop]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: package
+          workspaces: |
+            .
+            desktop/src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/speech-server/web/package-lock.json
+      - name: Build web UI (вбудовується в desktop-бінарник)
+        run: |
+          cd crates/speech-server/web
+          npm ci
+          npm run build
+      - name: Install Tauri system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Build speech-server (release)
+        run: cargo build --release -p speech-server
+      - name: Stage sidecars (speech-server + libonnxruntime)
+        # externalBin вимагає файли з суфіксом target triple; бандлер прибирає
+        # суфікс, тож у пакеті вони ляжуть поруч як speech-server і
+        # libonnxruntime.so.1. ort копіює .so поруч із бінарником профілю.
+        run: |
+          mkdir -p desktop/src-tauri/bin
+          cp target/release/speech-server \
+            desktop/src-tauri/bin/speech-server-x86_64-unknown-linux-gnu
+          chmod +x desktop/src-tauri/bin/speech-server-x86_64-unknown-linux-gnu
+          if [ ! -f target/release/libonnxruntime.so.1 ]; then
+            echo "target/release/libonnxruntime.so.1 not found (ort copy-dylibs)"
+            exit 1
+          fi
+          cp target/release/libonnxruntime.so.1 \
+            desktop/src-tauri/bin/libonnxruntime.so.1-x86_64-unknown-linux-gnu
+      - name: Build installers (deb + AppImage)
+        working-directory: desktop/src-tauri
+        run: npx --yes "@tauri-apps/cli@^2" build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: promin-desktop-linux-x64
+          path: |
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+      - name: Publish GitHub Release (теги v*)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage

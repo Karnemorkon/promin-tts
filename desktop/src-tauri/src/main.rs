@@ -22,7 +22,7 @@
 //! `libgtk-3-dev`; у CI це джоб `desktop` (web-SPA збирається першим,
 //! бо `generate_context!` вбудовує `web/dist` у бінарник).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
@@ -89,6 +89,31 @@ fn local_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("models"))
 }
 
+/// Додати каталог бінарника сервера в `LD_LIBRARY_PATH`.
+///
+/// У встановленому пакеті (deb/AppImage) `bundle.externalBin` кладе поруч
+/// із `speech-server` його залежність `libonnxruntime.so.1`, а бінарник
+/// зв'язаний з нею динамічно — без цього рядка сервер не стартуватиме на
+/// машині без встановленого ONNX Runtime. Якщо сервер знайдено в `PATH`
+/// (каталог невідомий) — нічого не додається.
+fn set_sidecar_library_path(program: &str, command: &mut Command) -> Result<(), String> {
+    let Some(dir) = Path::new(program)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    let mut entries = vec![dir.to_path_buf()];
+    if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+        if !existing.is_empty() {
+            entries.extend(std::env::split_paths(&existing));
+        }
+    }
+    let value = std::env::join_paths(entries).map_err(|err| format!("LD_LIBRARY_PATH: {err}"))?;
+    command.env("LD_LIBRARY_PATH", value);
+    Ok(())
+}
+
 /// Запустити (або повернути вже запущений) локальний speech-server.
 ///
 /// Дочірній процес успадковує середовище застосунку; явно виставляються
@@ -127,7 +152,9 @@ fn start_local_server(
     // Не фатально: сервер теж створює каталоги при автозавантаженні.
     let _ = std::fs::create_dir_all(&models_dir);
 
-    let child = Command::new(&program)
+    let mut command = Command::new(&program);
+    set_sidecar_library_path(&program, &mut command)?;
+    let child = command
         .env("PROMIN_HTTP_ADDR", format!("127.0.0.1:{port}"))
         .env("PROMIN_WYOMING_ADDR", "off")
         .env("PROMIN_MODELS_DIR", &models_dir)
@@ -194,5 +221,36 @@ mod tests {
     fn resolve_server_program_is_never_empty() {
         let program = resolve_server_program();
         assert!(!program.trim().is_empty());
+    }
+
+    /// Каталог із `libonnxruntime.so.1` (поруч із сервером) має бути
+    /// першим у `LD_LIBRARY_PATH`, решта наявних шляхів — збережені.
+    #[test]
+    fn sidecar_library_path_prepends_server_dir() {
+        let mut command = Command::new("x");
+        set_sidecar_library_path("/usr/bin/speech-server", &mut command).unwrap();
+        let value = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("LD_LIBRARY_PATH"))
+            .and_then(|(_, value)| value)
+            .expect("LD_LIBRARY_PATH має бути виставлений");
+        assert!(
+            value.to_string_lossy().starts_with("/usr/bin"),
+            "каталог сервера має йти першим: {}",
+            value.to_string_lossy()
+        );
+    }
+
+    /// Сервер, знайдений у `PATH` (каталог невідомий) — змінні не чіпаємо.
+    #[test]
+    fn sidecar_library_path_skips_path_lookup() {
+        let mut command = Command::new("x");
+        set_sidecar_library_path("speech-server", &mut command).unwrap();
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key != std::ffi::OsStr::new("LD_LIBRARY_PATH")),
+            "без відомого каталогу LD_LIBRARY_PATH не виставляється"
+        );
     }
 }

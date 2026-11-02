@@ -457,6 +457,28 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 - **Remote** — URL віддаленого Axum-сервера вводиться на сторінці
   Connection (зберігається в localStorage); працює той самий UI.
 
+### Завантаження
+
+Готові пакети збирає CI (джоб `package`, Ubuntu 24.04/glibc 2.39):
+
+- **кожен push у `main`** → запуск Actions → артефакт
+  `promin-desktop-linux-x64` (`.deb` + `.AppImage`);
+- **тег `v*`** → GitHub Releases із тими самими файлами.
+
+`.deb` встановлюється через `sudo dpkg -i` (залежності — `apt-get -f
+install`); `.AppImage` запускається без встановлення (`chmod +x`, а без
+FUSE — з прапорцем `--appimage-extract-and-run`). Потрібен WebKitGTK 4.1
+(у Debian/Ubuntu — пакет `libwebkit2gtk-4.1-0`).
+
+У пакет **вбудовано `speech-server` разом із `libonnxruntime.so.1`**
+(`bundle.externalBin`), тому **Local-режим працює одразу після
+встановлення**: оболонка запускає сервер на `127.0.0.1:8010` і додає його
+каталог у `LD_LIBRARY_PATH`. Моделі сервер завантажує сам (автозавантаження
+увімкнене за замовчуванням, див. `PROMIN_DOWNLOAD_*`) або береться з
+`PROMIN_MODELS_DIR` / `<app data dir>/models`.
+
+### Локальна збірка
+
 Збірка потребує системних бібліотек (`libwebkit2gtk-4.1-dev`,
 `libgtk-3-dev`) і заздалегідь зібраного SPA (Tauri вбудовує `web/dist` у
 бінарник на етапі компіляції):
@@ -466,11 +488,15 @@ cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 cargo build --release --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
+`bin/speech-server-<triple>` та `bin/libonnxruntime.so.1-<triple>` для
+пакування (`npx @tauri-apps/cli build`) треба покласти поруч із крейтом
+(у CI це робить джоб `package`; локально без них `build.rs` створює
+порожні заглушки — `check/clippy/test` працюють, але пакет вийде битим).
+
 `desktop` — окремий workspace: кореневі `cargo build/clippy/test
 --workspace` його не бачать (на серверах без GTK він не збирається).
-CI збирає його окремим джобом `desktop`. Installers (`deb`/`appimage`
-увімкнені в `tauri.conf.json`) пакуються через `tauri build`; для macOS
-потрібно додати `icons/icon.icns`.
+CI збирає його окремим джобом `desktop`, а інсталятори — джобом `package`.
+Для macOS потрібно додати `icons/icon.icns`.
 
 ## Веб-інтерфейс
 

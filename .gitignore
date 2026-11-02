@@ -1,5 +1,6 @@
 /target
 /desktop/src-tauri/target
+/desktop/src-tauri/bin
 **/*.rs.bk
 *.wav
 *.pcm
