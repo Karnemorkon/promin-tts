@@ -27,9 +27,30 @@ export function setBaseUrl(url: string) {
   }
 }
 
+/** Tauri desktop: інтегрований вебв'ю має власний origin (`tauri://…`),
+ * тому same-origin запити до API були б 404. Ознаки рантайму Tauri:
+ * внутрішній об'єкт `__TAURI__*` або кастомна схема. */
+function isTauriRuntime(): boolean {
+  if (typeof window === 'undefined') return false;
+  const w = window as unknown as Record<string, unknown>;
+  return (
+    '__TAURI_INTERNALS__' in w ||
+    '__TAURI__' in w ||
+    window.location.protocol === 'tauri:'
+  );
+}
+
+/** Локальний сервер за замовчуванням (desktop mode «local»). */
+export const DEFAULT_LOCAL_URL = 'http://127.0.0.1:8010';
+
 export function getBaseUrl(): string {
   if (!baseUrl && typeof localStorage !== 'undefined') {
     baseUrl = localStorage.getItem('promin_base_url') ?? '';
+  }
+  // Desktop (Tauri): порожній baseUrl означає «локальний сервер», а не
+  // same-origin (вебв'ю). Явно заданий Remote-URL має пріоритет.
+  if (!baseUrl && isTauriRuntime()) {
+    return DEFAULT_LOCAL_URL;
   }
   return baseUrl;
 }

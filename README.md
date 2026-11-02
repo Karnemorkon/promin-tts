@@ -147,10 +147,12 @@ crates/
 ├── speech-text/        # Препроцесинг, вербалізація, наголоси, IPA, чанки, імпорт, вимова
 ├── speech-inference/   # ONNX Runtime: TTS-генератор, Gemma, accentor, voice encoder
 ├── speech-asr/         # Back-ASR: W2V-BERT CTC, SentencePiece, WER/CER, diff
-├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP, діагностика
+├── speech-audio/       # PCM16, WAV, декодування, ресемплінг, кросфейд, LUFS/TP, діагностика, DSP (pitch/reverb/compress)
 ├── speech-export/      # M4B (AAC), MP3, OGG/Opus, FLAC, глави, обкладинка, SRT/VTT/ASS
 └── speech-server/      # Axum + Wyoming + MCP (HTTP і stdio-проксі promin-mcp)
     └── web/            # React + TypeScript + Vite, вбудовується у бінарник
+desktop/                # Tauri 2 desktop shell: Local speech-server / Remote бекенд
+    └── src-tauri/      # окремий workspace (потрібні GTK/WebKit; CI-джоб `desktop`)
 deploy/                 # Dockerfile, docker-compose (cpu-legacy / cpu-modern / gpu)
 ```
 
@@ -440,6 +442,35 @@ export PROMIN_WYOMING_ADDR=127.0.0.1:10200
 
 cargo run --release -p speech-server -- --http-addr 127.0.0.1:8010
 ```
+
+## Desktop (Tauri 2)
+
+`desktop/src-tauri` — легковажна оболонка навколо того самого SPA
+(`crates/speech-server/web`) із вибором режиму рендерингу за ТЗ:
+
+- **Local** — при підключенні оболонка запускає локальний процес
+  `speech-server` (бінарник поруч із застосунком, `PROMIN_SERVER_BIN` або
+  `PATH`) на `127.0.0.1:8010` і чекає його `/healthz`; дочірній процес
+  зупиняється разом із застосунком. Під Tauri UI за замовчуванням ходить
+  на `http://127.0.0.1:8010` (`services/api.ts`), моделі — у
+  `PROMIN_MODELS_DIR` або `<app data dir>/models`.
+- **Remote** — URL віддаленого Axum-сервера вводиться на сторінці
+  Connection (зберігається в localStorage); працює той самий UI.
+
+Збірка потребує системних бібліотек (`libwebkit2gtk-4.1-dev`,
+`libgtk-3-dev`) і заздалегідь зібраного SPA (Tauri вбудовує `web/dist` у
+бінарник на етапі компіляції):
+
+```bash
+(cd crates/speech-server/web && npm ci && npm run build)
+cargo build --release --manifest-path desktop/src-tauri/Cargo.toml
+```
+
+`desktop` — окремий workspace: кореневі `cargo build/clippy/test
+--workspace` його не бачать (на серверах без GTK він не збирається).
+CI збирає його окремим джобом `desktop`. Installers (`deb`/`appimage`
+увімкнені в `tauri.conf.json`) пакуються через `tauri build`; для macOS
+потрібно додати `icons/icon.icns`.
 
 ## Веб-інтерфейс
 

@@ -1,0 +1,22 @@
+[package]
+name = "promin-desktop"
+version = "0.19.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Karnemorkon/promin-tts"
+rust-version = "1.88"
+description = "Promin TTS desktop shell (Tauri 2): локальний speech-server або віддалений бекенд"
+default-run = "promin-desktop"
+
+# Окремий від кореневого workspace: desktop залежить від системних
+# бібліотек GTK/WebKit, яких немає на серверах без GUI. Кореневі
+# `cargo build/clippy/test --workspace` їх не бачать.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }

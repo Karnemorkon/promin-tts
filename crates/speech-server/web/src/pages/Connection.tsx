@@ -8,6 +8,7 @@ import {
   KeyRound,
 } from 'lucide-react';
 import { healthz, loadApiKey, setApiKey, setBaseUrl } from '../services/api';
+import { ensureLocalBackend } from '../services/desktop';
 import { useConnection } from '../stores/connection';
 
 interface ConnectionProps {
@@ -41,6 +42,11 @@ export default function Connection({ onConnect }: ConnectionProps) {
     setApiKey(apiKey.trim() || null);
 
     try {
+      if (mode === 'local') {
+        // Desktop (Tauri): запустити локальний speech-server і дочекатися
+        // його /healthz. У браузері — no-op.
+        await ensureLocalBackend();
+      }
       await healthz();
       onConnect({
         mode,
