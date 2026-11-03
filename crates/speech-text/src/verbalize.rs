@@ -180,7 +180,21 @@ fn atoi_n(bytes: &[u8], pos: usize, len: usize) -> i32 {
 }
 
 /// Вербалізує числа/дати/час. Якщо цифр немає — повертає текст без змін.
+/// Вербалізує лише дати (`ДД.ММ.РРРР`) і час (`ГГ:ХХ`), залишаючи інші
+/// цифри недоторканими.
+///
+/// Потрібно нейровербалізатору: Gemma ламає саме ці патерни
+/// (`12.10.2026` -> «крапка десять двадцять…», `12:15` -> «сто дванадцять
+/// п'ятнадцять»), тоді як правила справляються коректно.
+pub fn verbalize_date_time(text: &str) -> String {
+    verbalize_impl(text, false)
+}
+
 pub fn verbalize(text: &str) -> String {
+    verbalize_impl(text, true)
+}
+
+fn verbalize_impl(text: &str, with_numbers: bool) -> String {
     if !needs_verbalize(text) {
         return text.to_string();
     }
@@ -254,12 +268,25 @@ pub fn verbalize(text: &str) -> String {
                 out.extend_from_slice(say_int(i64::from(yyyy)).as_bytes());
                 out.extend_from_slice(" року".as_bytes());
                 i += 10;
+                // «25.07.2026 року»: наступне «року» вже сказано —
+                // пропускаємо, щоб не виходило «року року».
+                let mut j = i;
+                while j < n && is_ascii_ws(bytes[j]) {
+                    j += 1;
+                }
+                if bytes[j..].starts_with("року".as_bytes()) {
+                    let k = j + "року".len();
+                    let boundary = k >= n || (bytes[k] < 0x80 && !bytes[k].is_ascii_alphanumeric());
+                    if boundary {
+                        i = k;
+                    }
+                }
                 continue;
             }
         }
 
         // Кардинальне число (обрізка до 12 цифр, як у C++).
-        if bytes[i].is_ascii_digit() {
+        if with_numbers && bytes[i].is_ascii_digit() {
             let mut j = i;
             while j < n && bytes[j].is_ascii_digit() {
                 j += 1;
@@ -516,6 +543,39 @@ mod tests {
         );
         assert_eq!(verbalize("50%"), "п'ятдесят%");
         assert_eq!(verbalize("без цифр"), "без цифр");
+    }
+
+    #[test]
+    fn date_consumes_trailing_roku() {
+        assert_eq!(
+            verbalize("25.07.2026 року"),
+            "двадцять п'ять числа сім місяця дві тисячі двадцять шість року"
+        );
+        assert_eq!(
+            verbalize("до 25.07.2026 року навчання"),
+            "до двадцять п'ять числа сім місяця дві тисячі двадцять шість року навчання"
+        );
+        // Крапка після дати — межа слова, «року» теж споживається.
+        assert_eq!(
+            verbalize("стан на 25.07.2026 року."),
+            "стан на двадцять п'ять числа сім місяця дві тисячі двадцять шість року."
+        );
+        // «рокування» — не межа слова, чіпати не треба.
+        assert_eq!(
+            verbalize("25.07.2026 рокування"),
+            "двадцять п'ять числа сім місяця дві тисячі двадцять шість року рокування"
+        );
+    }
+
+    #[test]
+    fn date_time_only_leaves_other_numbers() {
+        assert_eq!(
+            verbalize_date_time("зустріч 12.10.2026 року о 12:15, 215 грн."),
+            "зустріч дванадцять числа десять місяця дві тисячі двадцять шість року о дванадцять годині п'ятнадцять хвилин, 215 грн."
+        );
+        assert_eq!(verbalize_date_time("сума 215 грн."), "сума 215 грн.");
+        assert_eq!(verbalize_date_time("2026"), "2026");
+        assert_eq!(verbalize_date_time("без цифр"), "без цифр");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use ort::{
 use sentencepiece::SentencePieceProcessor;
 use speech_text::gemma_prep;
 use speech_text::neural::NeuralVerbalizer;
-use speech_text::verbalize::{split_sentences, strip_ws};
+use speech_text::verbalize::{split_sentences, strip_ws, verbalize, verbalize_date_time};
 
 /// Максимум нових токенів на одне речення (як `kMaxNewTokens` у C++).
 const MAX_NEW_TOKENS: usize = 192;
@@ -359,19 +359,30 @@ impl GemmaVerbalizer {
                 results.push(sentence);
                 continue;
             }
-            let prepared = gemma_prep::add_spacing(&sentence);
-            match self.run_sentence(&prepared) {
-                Ok(out) if !out.is_empty() => results.push(out),
-                Ok(_) => results.push(sentence),
+            // Gemma ламає дати й час («12.10.2026» -> «крапка…», «12:15» ->
+            // «1215») — нормалізуємо їх правилами ще до запиту до моделі.
+            let pre = verbalize_date_time(&sentence);
+            if !gemma_prep::has_ascii_digits(&pre) {
+                // У реченні були лише дати/час — модель не потрібна.
+                results.push(pre);
+                continue;
+            }
+            let prepared = gemma_prep::add_spacing(&pre);
+            let out = match self.run_sentence(&prepared) {
+                Ok(out) if !out.is_empty() => out,
+                Ok(_) => verbalize(&pre),
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
                         sentence = %sentence,
-                        "gemma sentence failed, keeping original"
+                        "gemma sentence failed, rule fallback"
                     );
-                    results.push(sentence);
+                    verbalize(&pre)
                 }
-            }
+            };
+            // Give-up моделі (повернула текст із залишками цифр) добиваємо
+            // правилами; без цифр це no-op.
+            results.push(verbalize(&out));
         }
         results.join(" ")
     }
