@@ -104,6 +104,7 @@ const STATUS_STYLES: Record<string, string> = {
 export default function ProjectEditor() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { state } = useConnection();
 
   const [project, setProject] = useState<Project | null>(null);
   const [tab, setTab] = useState<Tab>('editor');
@@ -756,7 +757,6 @@ export default function ProjectEditor() {
     if (!id) return;
     setError(null);
     setNotice(null);
-    const { state } = useConnection();
     try {
       const result = await generateChapters(
         id,
