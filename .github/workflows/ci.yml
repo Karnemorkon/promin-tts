@@ -105,39 +105,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Cache ONNX Runtime
+        id: ort-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ort
+          key: ort-1.31.0-linux-x64
+      - name: Install ONNX Runtime 1.31.0
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz"
+          mkdir -p "$HOME/ort"
+          tar -xzf /tmp/ort.tgz -C "$HOME/ort" --strip-components=1
+          rm /tmp/ort.tgz
       - name: Build speech-server (release)
-        run: cargo build --release -p speech-server
+        # ort v1.16.3 з дефолтною download-стратегією тягне ORT 1.16
+        # (max IR version 9), а моделі Morkon/holos-native-models — IR 10:
+        # сервер падає з "Unsupported model IR version: 10". Лінкуємо
+        # системний ORT 1.31.0 (як deploy/Dockerfile та локальні тести);
+        # SONAME ORT 1.31 = libonnxruntime.so.1 = DT_NEEDED speech-server.
+        run: ORT_STRATEGY=system ORT_LIB_LOCATION="$HOME/ort/lib" cargo build --release -p speech-server
       - name: Stage sidecars (speech-server + libonnxruntime)
         # externalBin вимагає файли з суфіксом target triple; бандлер прибирає
         # суфікс, тож у пакеті вони ляжуть поруч як speech-server і
-        # libonnxruntime.so.1. ort (download-стратегія) копіює поруч із
-        # бінарником профілю libonnxruntime.so та версійний .so.X — але не
-        # .so.1, якого вимагає NEEDED speech-server; ім'я створюємо самі.
+        # libonnxruntime.so.1.
         run: |
           mkdir -p desktop/src-tauri/bin
           cp target/release/speech-server \
             desktop/src-tauri/bin/speech-server-x86_64-unknown-linux-gnu
           chmod +x desktop/src-tauri/bin/speech-server-x86_64-unknown-linux-gnu
-          so=""
-          for candidate in \
-            target/release/libonnxruntime.so.1 \
-            target/release/libonnxruntime.so \
-            target/release/libonnxruntime.so.*; do
-            if [ -f "$candidate" ]; then so="$candidate"; break; fi
-          done
-          if [ -z "$so" ]; then
-            echo "libonnxruntime not found under target/release:"
-            ls -la target/release/libonnxruntime* || true
-            find target -name 'libonnxruntime.so*' -maxdepth 4 || true
+          so="$HOME/ort/lib/libonnxruntime.so.1.31.0"
+          if [ ! -f "$so" ]; then
+            echo "ORT lib not found: $so"
+            ls -la "$HOME/ort/lib" || true
             exit 1
           fi
           echo "staging $so"
           cp "$so" \
             desktop/src-tauri/bin/libonnxruntime.so.1-x86_64-unknown-linux-gnu
-          # speech-server's DT_NEEDED requires libonnxruntime.so.1.16.0 (ort versioned name),
-          # not just libonnxruntime.so.1. Create the symlink so the bundled .so.1 satisfies it.
-          ln -sf libonnxruntime.so.1-x86_64-unknown-linux-gnu \
-            desktop/src-tauri/bin/libonnxruntime.so.1.16.0-x86_64-unknown-linux-gnu
       - name: Build installer (deb only - AppImage disabled due to FUSE issues in CI)
         working-directory: desktop/src-tauri
         env:
