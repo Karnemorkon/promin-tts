@@ -62,9 +62,6 @@ struct SynthState {
     active: Mutex<bool>,
 }
 
-/// Чи застосунок зараз виходить (щоб не приховати вікно в трей замість виходу).
-static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 #[derive(Debug, serde::Serialize)]
 struct ServerInfo {
     running: bool,
