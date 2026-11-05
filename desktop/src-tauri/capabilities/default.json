@@ -3,13 +3,5 @@
   "identifier": "main-capability",
   "description": "Основне вікно Promin TTS desktop",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "core:tray:allow-new",
-    "core:tray:allow-set-icon",
-    "core:tray:allow-set-menu",
-    "core:tray:allow-set-tooltip",
-    "core:tray:allow-set-title",
-    "core:window:allow-set-title"
-  ]
+  "permissions": ["core:default"]
 }
