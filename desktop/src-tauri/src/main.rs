@@ -130,7 +130,7 @@ fn set_sidecar_library_path(program: &str, command: &mut Command) -> Result<(), 
             entries.extend(std::env::split_paths(&existing));
         }
     }
-    let value = std::env::join_paths(entries).map_err(|err| format!("LD_LIBRARY_PATH: {err}")?)?;
+    let value = std::env::join_paths(entries).map_err(|err| format!("LD_LIBRARY_PATH: {err}"))?;
     command.env("LD_LIBRARY_PATH", value);
     Ok(())
 }
@@ -276,11 +276,15 @@ fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                 }
             }
             "quit" => {
+                let menu_id = event.id();
                 {
                     let mut ex = app_clone.state::<Exiting>().flag.lock().unwrap();
                     *ex = true;
                 }
-                app.exit(0);
+                match menu_id.as_ref() {
+                    "quit" => app.exit(0),
+                    _ => {}
+                }
             }
             _ => {}
         })
