@@ -41,7 +41,7 @@ use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::WebviewWindow;
 
@@ -241,11 +241,18 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
 }
 
 fn build_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, String> {
-    let show_i = MenuItem::with_id(app, "show", "Розгорнути вікно", true, None::<&str>)?;
-    let hide_i = MenuItem::with_id(app, "hide", "Приховати вікно", true, None::<&str>)?;
+    let show_i = MenuItemBuilder::new("Розгорнути вікно")
+        .with_id("show")
+        .build(app)?;
+    let hide_i = MenuItemBuilder::new("Приховати вікно")
+        .with_id("hide")
+        .build(app)?;
     let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let quit_i = MenuItem::with_id(app, "quit", "Вийти", true, None::<&str>)?;
-    Menu::with_items(app, &[&show_i, &hide_i, &sep, &quit_i]).map_err(|e| e.to_string())
+    let quit_i = MenuItemBuilder::new("Вийти").with_id("quit").build(app)?;
+    MenuBuilder::new(app)
+        .items(&[&show_i, &hide_i, &sep, &quit_i])
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -314,15 +321,18 @@ fn main() {
             let _ = build_tray(&app_handle);
 
             // Закриття хрестиком — приховати в трей, а не вийти.
-            app_handle.on_window_event(move |_window, event| {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    let is_exiting = *app_handle.state::<Exiting>().flag.lock().unwrap();
-                    if !is_exiting {
-                        api.prevent_close();
-                        let _ = app_handle.get_webview_window("main").unwrap().hide();
+            if let Some(window) = app.get_webview_window("main") {
+                let app_handle_clone = app_handle.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        let is_exiting = *app_handle_clone.state::<Exiting>().flag.lock().unwrap();
+                        if !is_exiting {
+                            api.prevent_close();
+                            let _ = window.hide();
+                        }
                     }
-                }
-            });
+                });
+            }
 
             Ok(())
         })
