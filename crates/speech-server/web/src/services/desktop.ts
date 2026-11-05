@@ -29,6 +29,16 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const LOCAL_SERVER_TIMEOUT_MS = 60_000;
 
 /**
+ * Повідомити оболонку Tauri, чи йде зараз хоча б одне завдання синтезу;
+ * заголовок вікна змінюється відповідно. У браузері — no-op.
+ */
+export async function setSynthActive(active: boolean): Promise<void> {
+  const invoke = tauriInvoke();
+  if (!invoke) return;
+  await invoke('set_synth_active', { active });
+}
+
+/**
  * Local-режим: у Tauri запустити локальний `speech-server` (якщо він ще
  * не працює) і дочекатися його `/healthz`; у браузері — no-op.
  *

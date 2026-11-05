@@ -15,10 +15,23 @@
 //! Default baseUrl для UI під Tauri (`http://127.0.0.1:8010`) задано у
 //! `crates/speech-server/web/src/services/api.ts`.
 //!
+//! ## Системний трей
+//! На Linux лівий клік по іконці трею відкриває контекстне меню
+//! (`show_menu_on_left_click(true)` за замовчуванням);містяться там дії
+//! «Розгорнути вікно», «Приховати вікно», «Вийти». При закритті вікна
+//! хрестиком вікно приховується в трей (замість повного виходу), щоб
+//! synthesis не переривався у тлі.
+//!
+//! ## Динамічний заголовок
+//! frontend викликає команду `set_synth_active(active)`, коли починається
+//! або закінчується хоча б одне завдання синтезу; заголовок вікна змінюється
+//! на «Promin TTS — синтезується…» / «Promin TTS».
+
+//!
 //! ## Побудова
 //! Crate залежить від системних GTK/WebKit-бібліотек, тому навмисно
 //! винесений за кореневий workspace: `cargo build/clippy/test --workspace`
-//! його не бачать. Локальна збірка потребує `libwebkit2gtk-4.1-dev` +
+//! його не бачить. Локальна збірка потребує `libwebkit2gtk-4.1-dev` +
 //! `libgtk-3-dev`; у CI це джоб `desktop` (web-SPA збирається першим,
 //! бо `generate_context!` вбудовує `web/dist` у бінарник).
 
@@ -26,7 +39,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
+
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::WebviewWindow;
 
 /// Типовий порт локального сервера: збігається з `PROMIN_HTTP_ADDR` за
 /// замовчуванням і з дефолтом UI (`DEFAULT_LOCAL_URL` в `api.ts`).
@@ -35,6 +52,16 @@ const DEFAULT_LOCAL_PORT: u16 = 8010;
 /// Локальний дочірній процес `speech-server` (порожньо — не запущено).
 struct LocalServer {
     child: Mutex<Option<Child>>,
+}
+
+/// Чи йде зараз хоча б одне завдання синтезу (для заголовка вікна).
+struct SynthState {
+    active: Mutex<bool>,
+}
+
+/// Чи застосунок зараз виходить (щоб не приховати вікно в трей замість виходу).
+struct Exiting {
+    flag: Mutex<bool>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -90,12 +117,6 @@ fn local_models_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Додати каталог бінарника сервера в `LD_LIBRARY_PATH`.
-///
-/// У встановленому пакеті (deb/AppImage) `bundle.externalBin` кладе поруч
-/// із `speech-server` його залежність `libonnxruntime.so.1`, а бінарник
-/// зв'язаний з нею динамічно — без цього рядка сервер не стартуватиме на
-/// машині без встановленого ONNX Runtime. Якщо сервер знайдено в `PATH`
-/// (каталог невідомий) — нічого не додається.
 fn set_sidecar_library_path(program: &str, command: &mut Command) -> Result<(), String> {
     let Some(dir) = Path::new(program)
         .parent()
@@ -109,17 +130,12 @@ fn set_sidecar_library_path(program: &str, command: &mut Command) -> Result<(), 
             entries.extend(std::env::split_paths(&existing));
         }
     }
-    let value = std::env::join_paths(entries).map_err(|err| format!("LD_LIBRARY_PATH: {err}"))?;
+    let value = std::env::join_paths(entries).map_err(|err| format!("LD_LIBRARY_PATH: {err}")?)?;
     command.env("LD_LIBRARY_PATH", value);
     Ok(())
 }
 
 /// Запустити (або повернути вже запущений) локальний speech-server.
-///
-/// Дочірній процес успадковує середовище застосунку; явно виставляються
-/// лише `PROMIN_HTTP_ADDR` (loopback + порт), `PROMIN_WYOMING_ADDR=off`
-/// (десктопу Wyoming не потрібен і він може конфліктувати зі
-/// systemd-сервісом) і `PROMIN_MODELS_DIR`.
 #[tauri::command]
 fn start_local_server(
     app: tauri::AppHandle,
@@ -130,7 +146,6 @@ fn start_local_server(
     let base_url = format!("http://127.0.0.1:{port}");
     let mut slot = state.child.lock().map_err(|err| err.to_string())?;
 
-    // Уже запущено цим застосунком — не перевантажуємо.
     if let Some(child) = slot.as_mut() {
         match child.try_wait() {
             Ok(None) => {
@@ -142,14 +157,12 @@ fn start_local_server(
                     source: "spawned".to_string(),
                 });
             }
-            // Помер — прибираємо і запускаємо заново.
             Ok(Some(_)) | Err(_) => *slot = None,
         }
     }
 
     let program = resolve_server_program();
     let models_dir = local_models_dir(&app)?;
-    // Не фатально: сервер теж створює каталоги при автозавантаженні.
     let _ = std::fs::create_dir_all(&models_dir);
 
     let mut command = Command::new(&program);
@@ -182,17 +195,143 @@ fn start_local_server(
     })
 }
 
+/// Установити чи йде зараз синтез (викликається з frontend).
+#[tauri::command]
+fn set_synth_active(app: AppHandle, state: State<'_, SynthState>, active: bool) {
+    let mut slot = state.active.lock().unwrap();
+    *slot = active;
+    let _ = set_window_title(&app, active);
+}
+
+/// Перемикає видимість головного вікна (з меню трею).
+#[tauri::command]
+fn toggle_main_window(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let is_visible = win.is_visible().unwrap_or(true);
+        if is_visible {
+            let _ = win.hide();
+        } else {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+}
+
+/// Оновити заголовок головного вікна залежно від стану синтезу.
+fn set_window_title(app: &AppHandle, active: bool) -> Result<(), String> {
+    let title = if active {
+        "Promin TTS — синтезується…"
+    } else {
+        "Promin TTS"
+    };
+    if let Some(win) = app.get_webview_window("main") {
+        win.set_title(title).map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    Ok(())
+}
+
+fn build_tray_menu(app: &AppHandle) -> Result<Menu, String> {
+    let show_i = MenuItem::with_id(app, "show", "Розгорнути вікно", true, None::<&str>)?;
+    let hide_i = MenuItem::with_id(app, "hide", "Приховати вікно", true, None::<&str>)?;
+    let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let quit_i = MenuItem::with_id(app, "quit", "Вийти", true, None::<&str>)?;
+    Menu::with_items(app, &[&show_i, &hide_i, &sep, &quit_i]).map_err(|e| e.to_string())
+}
+
+fn build_tray(app: &AppHandle) -> Result<(), String> {
+    let menu = build_tray_menu(app)?;
+    let app_clone = app.clone();
+    TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "show" => {
+                let _ = show_main_window(app);
+            }
+            "hide" => {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
+            }
+            "quit" => {
+                let _ = app_clone.state::<Exiting>().flag.lock().unwrap();
+                {
+                    let mut ex = app_clone.state::<Exiting>().flag.lock().unwrap();
+                    *ex = true;
+                }
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.unminimize();
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+        })
+        .build(app)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(LocalServer {
             child: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![start_local_server])
+        .manage(SynthState {
+            active: Mutex::new(false),
+        })
+        .manage(Exiting {
+            flag: Mutex::new(false),
+        })
+        .invoke_handler(tauri::generate_handler![
+            start_local_server,
+            set_synth_active,
+            toggle_main_window,
+        ])
+        .setup(|app| {
+            let app_clone = app.handle().clone();
+            // Системний трей.
+            let _ = build_tray(app);
+
+            // Закриття хрестиком — приховати в трей, а не вийти.
+            app.on_window_event(move |_window, event| {
+                if let WindowEvent::CloseRequested { api } = event {
+                    let exiting = app_clone.state::<Exiting>();
+                    let is_exiting = *exiting.flag.lock().unwrap();
+                    if !is_exiting {
+                        api.prevent_close();
+                        let _ = app_clone.get_webview_window("main").unwrap().hide();
+                    }
+                }
+            });
+
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building Promin TTS desktop")
         .run(|app, event| {
-            // Дочірній speech-server не має пережити застосунок.
-            if let tauri::RunEvent::Exit = event {
+            if let RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<LocalServer>() {
                     if let Ok(mut slot) = state.child.lock() {
                         if let Some(mut child) = slot.take() {
@@ -216,7 +355,7 @@ mod tests {
     }
 
     /// Пошук бінарника ніколи не повертає порожнє значення
-    /// (джереро: `PROMIN_SERVER_BIN`, файл поруч із бінарником, PATH).
+    /// (джерело: `PROMIN_SERVER_BIN`, файл поруч із бінарником, PATH).
     #[test]
     fn resolve_server_program_is_never_empty() {
         let program = resolve_server_program();
