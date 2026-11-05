@@ -218,7 +218,7 @@ fn toggle_main_window(app: AppHandle) {
 }
 
 /// Оновити заголовок головного вікна залежно від стану синтезу.
-fn set_window_title(app: &AppHandle, active: bool) -> Result<(), String> {
+fn set_window_title<R: tauri::Runtime>(app: &AppHandle<R>, active: bool) -> Result<(), String> {
     let title = if active {
         "Promin TTS — синтезується…"
     } else {
@@ -231,7 +231,7 @@ fn set_window_title(app: &AppHandle, active: bool) -> Result<(), String> {
     }
 }
 
-fn show_main_window(app: &AppHandle) -> Result<(), String> {
+fn show_main_window<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
