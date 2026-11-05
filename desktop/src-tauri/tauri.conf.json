@@ -20,10 +20,10 @@
     ],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' http: https:; font-src 'self' data:"
-    },
-    "tray-icon": {
-      "iconPath": "icons/32x32.png"
     }
+  },
+  "tray": {
+    "iconPath": "icons/32x32.png"
   },
   "bundle": {
     "active": true,
