@@ -240,7 +240,7 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn build_tray_menu(app: &AppHandle) -> Result<Menu, String> {
+fn build_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, String> {
     let show_i = MenuItem::with_id(app, "show", "Розгорнути вікно", true, None::<&str>)?;
     let hide_i = MenuItem::with_id(app, "hide", "Приховати вікно", true, None::<&str>)?;
     let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
@@ -248,7 +248,7 @@ fn build_tray_menu(app: &AppHandle) -> Result<Menu, String> {
     Menu::with_items(app, &[&show_i, &hide_i, &sep, &quit_i]).map_err(|e| e.to_string())
 }
 
-fn build_tray(app: &AppHandle) -> Result<(), String> {
+fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let menu = build_tray_menu(app)?;
     let app_clone = app.clone();
     TrayIconBuilder::new()
@@ -264,7 +264,6 @@ fn build_tray(app: &AppHandle) -> Result<(), String> {
                 }
             }
             "quit" => {
-                let _ = app_clone.state::<Exiting>().flag.lock().unwrap();
                 {
                     let mut ex = app_clone.state::<Exiting>().flag.lock().unwrap();
                     *ex = true;
@@ -310,18 +309,17 @@ fn main() {
             toggle_main_window,
         ])
         .setup(|app| {
-            let app_clone = app.handle().clone();
+            let app_handle = app.handle().clone();
             // Системний трей.
-            let _ = build_tray(app);
+            let _ = build_tray(&app_handle);
 
             // Закриття хрестиком — приховати в трей, а не вийти.
-            app.on_window_event(move |_window, event| {
-                if let WindowEvent::CloseRequested { api } = event {
-                    let exiting = app_clone.state::<Exiting>();
-                    let is_exiting = *exiting.flag.lock().unwrap();
+            app_handle.on_window_event(move |_window, event| {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    let is_exiting = *app_handle.state::<Exiting>().flag.lock().unwrap();
                     if !is_exiting {
                         api.prevent_close();
-                        let _ = app_clone.get_webview_window("main").unwrap().hide();
+                        let _ = app_handle.get_webview_window("main").unwrap().hide();
                     }
                 }
             });
