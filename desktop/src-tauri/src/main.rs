@@ -37,13 +37,16 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{atomic::Ordering, Mutex};
 
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::WebviewWindow;
+
+/// Чи застосунок зараз виходить (щоб не приховати вікно в трей замість виходу).
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Типовий порт локального сервера: збігається з `PROMIN_HTTP_ADDR` за
 /// замовчуванням і з дефолтом UI (`DEFAULT_LOCAL_URL` в `api.ts`).
@@ -60,9 +63,7 @@ struct SynthState {
 }
 
 /// Чи застосунок зараз виходить (щоб не приховати вікно в трей замість виходу).
-struct Exiting {
-    flag: Mutex<bool>,
-}
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, serde::Serialize)]
 struct ServerInfo {
@@ -277,10 +278,7 @@ fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             }
             "quit" => {
                 let menu_id = event.id();
-                {
-                    let mut ex = app_clone.state::<Exiting>().flag.lock().unwrap();
-                    *ex = true;
-                }
+                EXITING.store(true, Ordering::Relaxed);
                 match menu_id.as_ref() {
                     "quit" => app.exit(0),
                     _ => {}
@@ -315,9 +313,6 @@ fn main() {
         .manage(SynthState {
             active: Mutex::new(false),
         })
-        .manage(Exiting {
-            flag: Mutex::new(false),
-        })
         .invoke_handler(tauri::generate_handler![
             start_local_server,
             set_synth_active,
@@ -333,7 +328,7 @@ fn main() {
                 let app_handle_clone = app_handle.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
-                        let is_exiting = *app_handle_clone.state::<Exiting>().flag.lock().unwrap();
+                        let is_exiting = EXITING.load(Ordering::Relaxed);
                         if !is_exiting {
                             api.prevent_close();
                             let _ = app_handle_clone.get_webview_window("main").unwrap().hide();
