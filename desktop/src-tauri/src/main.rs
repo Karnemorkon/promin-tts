@@ -242,13 +242,18 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
 
 fn build_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, String> {
     let show_i = MenuItemBuilder::new("Розгорнути вікно")
-        .with_id("show")
-        .build(app)?;
+        .id("show")
+        .build(app)
+        .map_err(|e| e.to_string())?;
     let hide_i = MenuItemBuilder::new("Приховати вікно")
-        .with_id("hide")
-        .build(app)?;
+        .id("hide")
+        .build(app)
+        .map_err(|e| e.to_string())?;
     let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
-    let quit_i = MenuItemBuilder::new("Вийти").with_id("quit").build(app)?;
+    let quit_i = MenuItemBuilder::new("Вийти")
+        .id("quit")
+        .build(app)
+        .map_err(|e| e.to_string())?;
     MenuBuilder::new(app)
         .items(&[&show_i, &hide_i, &sep, &quit_i])
         .build()
@@ -328,7 +333,7 @@ fn main() {
                         let is_exiting = *app_handle_clone.state::<Exiting>().flag.lock().unwrap();
                         if !is_exiting {
                             api.prevent_close();
-                            let _ = window.hide();
+                            let _ = app_handle_clone.get_webview_window("main").unwrap().hide();
                         }
                     }
                 });
