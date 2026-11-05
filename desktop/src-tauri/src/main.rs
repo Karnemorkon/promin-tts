@@ -249,7 +249,7 @@ fn build_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Str
         .id("hide")
         .build(app)
         .map_err(|e| e.to_string())?;
-    let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let sep = tauri::menu::PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
     let quit_i = MenuItemBuilder::new("Вийти")
         .id("quit")
         .build(app)
@@ -263,7 +263,7 @@ fn build_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Str
 fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let menu = build_tray_menu(app)?;
     let app_clone = app.clone();
-    TrayIconBuilder::new()
+    let builder = TrayIconBuilder::<R>::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(move |app, event| match event.id().as_ref() {
@@ -298,9 +298,8 @@ fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                     let _ = win.set_focus();
                 }
             }
-        })
-        .build(app)
-        .map_err(|e| e.to_string())?;
+        });
+    builder.build(app).map_err(|e| e.to_string())?;
     Ok(())
 }
 
