@@ -260,7 +260,6 @@ fn build_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Str
 
 fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let menu = build_tray_menu(app)?;
-    let app_clone = app.clone();
     let builder = TrayIconBuilder::<R>::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -274,11 +273,9 @@ fn build_tray<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                 }
             }
             "quit" => {
-                let menu_id = event.id();
                 EXITING.store(true, Ordering::Relaxed);
-                match menu_id.as_ref() {
-                    "quit" => app.exit(0),
-                    _ => {}
+                if event.id().as_ref() == "quit" {
+                    app.exit(0);
                 }
             }
             _ => {}
