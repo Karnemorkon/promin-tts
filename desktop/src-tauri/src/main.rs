@@ -41,9 +41,8 @@ use std::sync::{atomic::Ordering, Mutex};
 
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
-use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri::WebviewWindow;
 
 /// Чи застосунок зараз виходить (щоб не приховати вікно в трей замість виходу).
 static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
